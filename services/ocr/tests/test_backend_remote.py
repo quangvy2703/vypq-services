@@ -134,3 +134,25 @@ async def test_inflight_returns_to_zero_after_failure():
         await backend.infer(b"x", "m1")
     assert hosts[0].inflight == 0
 
+
+@respx.mock
+async def test_non_json_body_pauses_instead_of_dead_lettering():
+    # Trang xen ngrok trả HTML kèm status 200 khi tunnel chết theo kiểu lạ.
+    respx.post(f"{HOST_A}/v1/infer/upload").mock(
+        return_value=httpx.Response(200, content=b"<html>ngrok interstitial</html>")
+    )
+    backend = _backend([_host("a", HOST_A)], max_attempts=1)
+    with pytest.raises(UpstreamError):
+        await backend.infer(b"x", "m1")
+
+
+@respx.mock
+async def test_contract_mismatch_pauses_instead_of_dead_lettering():
+    # model-host phát trường mới, hoặc task lạ, trước khi vypq-contracts được
+    # nâng cấp theo — lệch hợp đồng, không phải dữ liệu request hỏng.
+    bad_body = {"model_id": "m1", "task": "khong-ton-tai", "timing": {}}
+    respx.post(f"{HOST_A}/v1/infer/upload").mock(return_value=httpx.Response(200, json=bad_body))
+    backend = _backend([_host("a", HOST_A)], max_attempts=1)
+    with pytest.raises(UpstreamError):
+        await backend.infer(b"x", "m1")
+

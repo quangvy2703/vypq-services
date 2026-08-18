@@ -105,9 +105,9 @@ async def test_4xx_does_not_trip_the_breaker():
 
 
 @respx.mock
-async def test_4xx_during_half_open_probe_closes_the_circuit():
-    # Host trả 4xx nghĩa là host còn sống. Nếu đường này thoát ra mà không báo
-    # gì cho breaker, probe treo lại và circuit kẹt vĩnh viễn.
+async def test_bad_input_4xx_during_half_open_probe_closes_the_circuit():
+    # Host trả 4xx dữ liệu hỏng nghĩa là host còn sống. Nếu đường này thoát ra
+    # mà không báo gì cho breaker, probe treo lại và circuit kẹt vĩnh viễn.
     respx.get(f"{BASE}/v1/models").mock(side_effect=httpx.ConnectError("chết"))
     clock = _FakeClock()
     breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_s=30.0, clock=clock)
@@ -116,7 +116,7 @@ async def test_4xx_during_half_open_probe_closes_the_circuit():
             await c.request("GET", "/v1/models")
         assert breaker.state is CircuitState.OPEN
 
-        respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(404))
+        respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(422))
         clock.advance(31.0)
         with pytest.raises(ServiceError):
             await c.request("GET", "/v1/models")
@@ -167,11 +167,11 @@ class _CountingBreaker(CircuitBreaker):
 @respx.mock
 async def test_exactly_one_breaker_report_on_every_exit_path():
     respx.get(f"{BASE}/ok").mock(return_value=httpx.Response(200, json={}))
-    respx.get(f"{BASE}/bad").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE}/bad").mock(return_value=httpx.Response(422))
     respx.get(f"{BASE}/redir").mock(return_value=httpx.Response(302, headers={"location": "/z"}))
     respx.get(f"{BASE}/down").mock(side_effect=httpx.ConnectError("x"))
 
-    cases = [("/ok", None), ("/bad", ServiceError), ("/redir", ServiceError),
+    cases = [("/ok", None), ("/bad", ServiceError), ("/redir", UpstreamError),
              ("/down", UpstreamError)]
     for path, expected in cases:
         breaker = _CountingBreaker(failure_threshold=99, recovery_timeout_s=30.0)
@@ -185,17 +185,31 @@ async def test_exactly_one_breaker_report_on_every_exit_path():
 
 
 @respx.mock
-async def test_redirect_is_not_mistaken_for_success():
+@pytest.mark.parametrize("status", [401, 403, 404, 405, 302])
+async def test_infrastructure_statuses_pause_instead_of_dead_lettering(status):
+    # Máy thuê lại đổi token -> 401. Tunnel ngrok chết -> 404 từ edge ngrok.
+    # Đây là hạ tầng, không phải dữ liệu hỏng: phải là UpstreamError để consumer
+    # dừng chờ, và phải mở circuit để /ready báo degraded.
     respx.get(f"{BASE}/v1/models").mock(
-        return_value=httpx.Response(302, headers={"location": "https://x/y"})
+        return_value=httpx.Response(status, headers={"location": "https://x/y"})
     )
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_s=30.0)
+    async with _client(max_attempts=1, breaker=breaker) as c:
+        with pytest.raises(UpstreamError):
+            await c.request("GET", "/v1/models")
+    assert breaker.state is CircuitState.OPEN
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [400, 413, 422])
+async def test_bad_input_statuses_stay_permanent(status):
+    respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(status))
     breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_s=30.0)
     async with _client(max_attempts=1, breaker=breaker) as c:
         with pytest.raises(ServiceError) as exc:
             await c.request("GET", "/v1/models")
-    assert "redirect" in exc.value.message
-    assert exc.value.http_status == 502
-    assert breaker.state is CircuitState.CLOSED       # host vẫn sống
+    assert not isinstance(exc.value, UpstreamError)
+    assert breaker.state is CircuitState.CLOSED      # host vẫn sống
 
 
 @respx.mock

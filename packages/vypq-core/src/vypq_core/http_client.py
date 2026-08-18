@@ -11,9 +11,14 @@ from vypq_core.logging import get_logger
 
 log = get_logger(__name__)
 
-# 408 và 429 là 4xx nhưng nói về tình trạng upstream chứ không phải lỗi của request:
-# hết giờ và quá tải đều đáng thử lại có backoff, giống 5xx.
-_RETRYABLE_STATUS = frozenset({408, 429})
+# Những mã 4xx nói về HẠ TẦNG chứ không phải nội dung request: host còn sống
+# không, token còn đúng không, tunnel còn trỏ đúng chỗ không.
+#   401/403 — máy GPU thuê lại đổi token, hoặc token hết hạn
+#   404/405 — tunnel ngrok chết, edge của ngrok trả 404 thay cho host
+#   408/429 — hết giờ, quá tải
+# Xếp nhầm chúng vào "dữ liệu hỏng" thì đổi một cái token là cả hàng đợi đổ vào
+# DLQ trong vài giây, mà circuit vẫn đóng nên không hề có backpressure.
+_INFRA_STATUS = frozenset({401, 403, 404, 405, 408, 429})
 
 
 class UpstreamError(ServiceError):
@@ -77,26 +82,22 @@ class UpstreamClient:
                 else:
                     if 300 <= response.status_code < 400:
                         # httpx không tự đi theo redirect. Hay gặp khi base_url để
-                        # http:// mà ngrok chuyển sang https:// — coi là thành công
-                        # thì downstream nhận body rỗng và vỡ ở chỗ khó lần ra.
-                        reported = True
-                        self.breaker.record_success()
-                        raise ServiceError(
-                            ErrorCode.BAD_INPUT,
-                            f"upstream trả redirect {response.status_code} tới "
-                            f"{response.headers.get('location', '?')} — kiểm tra base_url",
-                            http_status=502,
+                        # http:// mà ngrok chuyển sang https://. Xếp vào hạ tầng:
+                        # dừng chờ và mở circuit để /ready báo degraded, còn hơn
+                        # đổ hàng đợi vào DLQ vì một dòng cấu hình sai.
+                        last = UpstreamError(
+                            f"{self.base_url} trả redirect {response.status_code} tới "
+                            f"{response.headers.get('location', '?')} — kiểm tra base_url"
                         )
-                    if response.status_code < 400:
+                    elif response.status_code < 400:
                         reported = True
                         self.breaker.record_success()
                         return response
-                    if response.status_code >= 500 or response.status_code in _RETRYABLE_STATUS:
+                    elif response.status_code >= 500 or response.status_code in _INFRA_STATUS:
                         last = UpstreamError(f"{self.base_url} trả {response.status_code}")
                     else:
-                        # 4xx còn lại là lỗi của request, thử lại vẫn sai → không retry.
-                        # Nhưng host phải còn sống mới trả được 4xx, nên record_success:
-                        # thoát ra mà không báo gì sẽ để probe half-open treo.
+                        # 400/413/422 và các 4xx còn lại là lỗi của chính request,
+                        # thử lại vẫn sai → không retry.
                         reported = True
                         self.breaker.record_success()
                         raise ServiceError(
