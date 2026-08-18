@@ -5,10 +5,16 @@ from model_host.registry import ModelRegistry
 from model_host.runners.fake import FakeOcrRunner
 from model_host.settings import ModelHostSettings
 from model_host.spec import HostConfig, ModelSpec
-from vypq_contracts.common import ModelKind, Task
+from vypq_contracts.common import HealthStatus, ModelKind, Task
 from vypq_core.app import create_app
 
 TOKEN = "sekret"
+
+
+async def _gpu_check() -> tuple[HealthStatus, str]:
+    # Chi tiết đặc thù dùng để chứng minh /ready thực sự che (không phải test
+    # ăn may vì _app() chưa từng có readiness check nào).
+    return HealthStatus.OK, "khong duoc lo ra"
 
 
 def _app(**overrides):
@@ -24,7 +30,9 @@ def _app(**overrides):
     return create_app(
         settings,
         routers=[build_router(registry, settings)],
+        readiness={"gpu": _gpu_check},
         expose_docs=settings.expose_docs,
+        expose_ready_detail=False,
     )
 
 
@@ -103,6 +111,16 @@ async def test_file_uri_is_refused_by_default():
         resp = await c.post("/v1/infer", json={"model_id": "m1", "input_uri": "file:///etc/hosts"})
     assert resp.status_code == 400
     assert "file://" in resp.json()["message"]
+
+
+async def test_ready_does_not_disclose_check_details():
+    # /ready mở cho probe nên không qua auth; vì thế không được kể chi tiết.
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app()), base_url="http://t"
+    ) as c:
+        resp = await c.get("/ready")
+    assert resp.status_code == 200
+    assert resp.json()["detail"] == {}
 
 
 async def test_docs_are_not_exposed_by_default():

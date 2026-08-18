@@ -21,6 +21,7 @@ def create_app(
     readiness: Mapping[str, HealthCheck] | None = None,
     lifespan=None,
     expose_docs: bool = True,
+    expose_ready_detail: bool = True,
 ) -> FastAPI:
     setup_logging(settings.log_level)
     # /docs và /openapi.json nằm ngoài mọi router nên không dính dependency auth.
@@ -70,7 +71,10 @@ def create_app(
             status=overall,
             service=settings.service_name,
             version=settings.version,
-            detail=detail,
+            # /ready phải mở để probe hạ tầng gọi được, nên nó không qua auth.
+            # Với service phơi ra Internet thì trạng thái ok/degraded là đủ; tên
+            # check và chuỗi chẩn đoán bên trong không nên phát cho người lạ.
+            detail=detail if expose_ready_detail else {},
         )
         code = 200 if overall is HealthStatus.OK else 503
         return JSONResponse(status_code=code, content=body.model_dump(mode="json"))

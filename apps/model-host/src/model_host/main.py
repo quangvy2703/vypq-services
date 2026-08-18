@@ -12,7 +12,10 @@ def build_app():
     config = load_host_config(settings.models_path)
     registry = ModelRegistry(config, runners=RUNNERS)
     return create_app(
-        settings, routers=[build_router(registry, settings)], expose_docs=settings.expose_docs
+        settings,
+        routers=[build_router(registry, settings)],
+        expose_docs=settings.expose_docs,
+        expose_ready_detail=False,
     )
 
 

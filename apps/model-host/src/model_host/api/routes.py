@@ -1,3 +1,4 @@
+import asyncio
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -15,7 +16,7 @@ from model_host.settings import ModelHostSettings
 _SUPPORTED_SCHEMES = {"http", "https", "file"}
 
 
-async def _fetch(uri: str, *, allow_file: bool, max_bytes: int) -> bytes:
+async def _fetch(uri: str, *, allow_file: bool, max_bytes: int, deadline_s: float) -> bytes:
     scheme = urlparse(uri).scheme
     if scheme not in _SUPPORTED_SCHEMES:
         raise ServiceError(
@@ -35,6 +36,13 @@ async def _fetch(uri: str, *, allow_file: bool, max_bytes: int) -> bytes:
             raise ServiceError(ErrorCode.BAD_INPUT, f"không thấy file {path}", 400)
         return path.read_bytes()
 
+    # timeout của httpx tính theo từng lần đọc, không phải toàn bộ request: một
+    # server nhỏ giọt dưới ngưỡng max_bytes có thể giữ connection vô hạn.
+    async with asyncio.timeout(deadline_s):
+        return await _stream(uri, max_bytes)
+
+
+async def _stream(uri: str, max_bytes: int) -> bytes:
     # Đọc theo luồng và cắt khi vượt hạn: `response.content` nạp nguyên body vào
     # RAM, nên một URI trỏ tới file khổng lồ đủ để hạ cả máy GPU.
     chunks: list[bytes] = []
@@ -83,6 +91,7 @@ def build_router(registry: ModelRegistry, settings: ModelHostSettings) -> APIRou
             request.input_uri,
             allow_file=settings.allow_file_uri,
             max_bytes=settings.max_download_mb * 1024 * 1024,
+            deadline_s=settings.fetch_deadline_s,
         )
         return _run(request.model_id, data, request.params)
 
