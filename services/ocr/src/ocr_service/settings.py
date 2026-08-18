@@ -13,6 +13,9 @@ class OcrSettings(BaseServiceSettings):
     max_side: int = 2000
     timeout_s: float = 60.0
     hosts_path: Path = Path("config.yaml")
+    brokers: str = "localhost:9092"
+    group_prefix: str = "ocr"
+    model_version: str | None = None  # VYPQ_MODEL_VERSION — đặt để bật shadow-run
 
 
 class HostDiscovery(BaseModel):
