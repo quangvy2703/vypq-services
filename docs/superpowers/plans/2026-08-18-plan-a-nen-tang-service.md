@@ -4429,6 +4429,24 @@ async def test_each_host_has_its_own_breaker():
 
 
 @respx.mock
+async def test_client_is_rebuilt_when_the_host_changes_its_url():
+    # Máy thuê lại: cùng tên host, URL ngrok mới. Cache theo tên thôi sẽ gửi
+    # request tới tunnel cũ đã chết mãi mãi.
+    old = respx.post(f"{HOST_A}/v1/infer/upload").mock(return_value=httpx.Response(200, json=OK_BODY))
+    new = respx.post(f"{HOST_B}/v1/infer/upload").mock(return_value=httpx.Response(200, json=OK_BODY))
+    hosts = [_host("gpu-1", HOST_A)]
+    backend = _backend(hosts)
+
+    await backend.infer(b"x", "m1")
+    assert old.called and not new.called
+
+    hosts[0].url = HOST_B                      # thuê lại, URL mới
+    await backend.infer(b"x", "m1")
+    assert new.called
+    await backend.aclose()
+
+
+@respx.mock
 async def test_inflight_returns_to_zero_after_failure():
     respx.post(f"{HOST_A}/v1/infer/upload").mock(side_effect=httpx.ConnectError("chết"))
     hosts = [_host("a", HOST_A)]
@@ -4558,6 +4576,22 @@ async def test_post_ocr_with_broken_file_returns_422_envelope():
     assert resp.json()["code"] == "bad_input"
 
 
+async def test_ready_reports_degraded_when_a_host_circuit_is_open():
+    class _OpenBackend(FakeOcrBackend):
+        def open_circuits(self) -> list[str]:
+            return ["gpu-1"]
+
+    settings = OcrSettings(service_name="ocr", default_model="m1")
+    backend = _OpenBackend(RawOcrOutput())
+    app = build_app_with(
+        OcrHandler(backend, default_model=settings.default_model), settings, backend=backend
+    )
+    async with _client(app) as c:
+        resp = await c.get("/ready")
+    assert resp.status_code == 503
+    assert "gpu-1" in resp.json()["detail"]["model_host"]
+
+
 async def test_trace_id_header_is_echoed_back():
     async with _client(_app(FakeOcrBackend(RawOcrOutput()))) as c:
         resp = await c.post(
@@ -4617,9 +4651,11 @@ import asyncio
 import random
 from collections.abc import Awaitable, Callable
 
+from vypq_contracts.common import ErrorCode
 from vypq_contracts.hosting import InferRequest, InferResponse
 from vypq_contracts.ocr import RawOcrOutput
 from vypq_core.breaker import CircuitBreaker
+from vypq_core.errors import ServiceError
 from vypq_core.host_registry import HostRef, StaticHostRegistry
 from vypq_core.http_client import UpstreamClient
 
@@ -4647,30 +4683,44 @@ class RemoteOcrBackend:
         self._recovery_timeout_s = recovery_timeout_s
         self._sleep = sleep
         self._jitter = jitter
-        self._clients: dict[str, UpstreamClient] = {}
+        # tên host -> ((url, token), client). Xem _client_for để biết vì sao khoá kép.
+        self._clients: dict[str, tuple[tuple[str, str | None], UpstreamClient]] = {}
 
-    def _client_for(self, host: HostRef) -> UpstreamClient:
-        if host.name not in self._clients:
-            self._clients[host.name] = UpstreamClient(
-                host.url,
-                token=host.token,
-                timeout_s=self._timeout_s,
-                max_attempts=self._max_attempts,
-                breaker=CircuitBreaker(
-                    failure_threshold=self._failure_threshold,
-                    recovery_timeout_s=self._recovery_timeout_s,
+    async def _client_for(self, host: HostRef) -> UpstreamClient:
+        # Khoá cache theo (url, token) chứ không chỉ theo tên: máy GPU thuê lại
+        # giữ nguyên tên nhưng ĐỔI URL ngrok mỗi lần thuê. Nhớ theo tên thôi là
+        # ghim service vào tunnel đã chết, không có đường tự khỏi ngoài restart.
+        key = (host.url, host.token)
+        cached = self._clients.get(host.name)
+        if cached is not None and cached[0] != key:
+            await cached[1].aclose()
+            cached = None
+        if cached is None:
+            cached = (
+                key,
+                UpstreamClient(
+                    host.url,
+                    token=host.token,
+                    timeout_s=self._timeout_s,
+                    max_attempts=self._max_attempts,
+                    breaker=CircuitBreaker(
+                        failure_threshold=self._failure_threshold,
+                        recovery_timeout_s=self._recovery_timeout_s,
+                    ),
+                    sleep=self._sleep,
+                    jitter=self._jitter,
                 ),
-                sleep=self._sleep,
-                jitter=self._jitter,
             )
-        return self._clients[host.name]
+            self._clients[host.name] = cached
+        return cached[1]
 
     async def infer(self, image: bytes, model_id: str) -> RawOcrOutput:
         # pick() rồi mới lease(): giữa hai lời gọi không được có await nào, nếu
         # không nhiều coroutine cùng đọc inflight cũ và dồn hết vào một host.
         host = await self._registry.pick(model_id)
+        client = await self._client_for(host)
         async with self._registry.lease(host):
-            response = await self._client_for(host).request(
+            response = await client.request(
                 "POST",
                 "/v1/infer/upload",
                 data={"model_id": model_id},
@@ -4681,8 +4731,9 @@ class RemoteOcrBackend:
     async def infer_uri(self, uri: str, model_id: str) -> RawOcrOutput:
         host = await self._registry.pick(model_id)
         payload = InferRequest(model_id=model_id, input_uri=uri)
+        client = await self._client_for(host)
         async with self._registry.lease(host):
-            response = await self._client_for(host).request(
+            response = await client.request(
                 "POST", "/v1/infer", json=payload.model_dump(mode="json")
             )
         return self._parse(response.json())
@@ -4690,15 +4741,22 @@ class RemoteOcrBackend:
     @staticmethod
     def _parse(body: dict) -> RawOcrOutput:
         parsed = InferResponse.model_validate(body)
-        assert isinstance(parsed.output, RawOcrOutput)
+        if not isinstance(parsed.output, RawOcrOutput):
+            # assert sẽ bị python -O gỡ bỏ; đây là dữ liệu từ máy khác nên phải
+            # kiểm thật và báo lỗi rõ thay vì AssertionError rơi vào handler 500.
+            raise ServiceError(
+                ErrorCode.UPSTREAM_ERROR,
+                f"model-host trả output kiểu {type(parsed.output).__name__} cho task ocr",
+                http_status=502,
+            )
         return parsed.output
 
     def open_circuits(self) -> list[str]:
         """Tên các host đang bị circuit chặn — dùng cho /ready."""
-        return [n for n, c in self._clients.items() if c.breaker.is_open()]
+        return [n for n, (_key, c) in self._clients.items() if c.breaker.is_open()]
 
     async def aclose(self) -> None:
-        for client in self._clients.values():
+        for _key, client in self._clients.values():
             await client.aclose()
         self._clients.clear()
 ```
@@ -4780,6 +4838,8 @@ class OcrHandler:
 
 `services/ocr/src/ocr_service/main.py`:
 ```python
+from contextlib import asynccontextmanager
+
 from fastapi import APIRouter, File, Form, Request, UploadFile
 
 from ocr_service.backend.remote import RemoteOcrBackend
@@ -4792,7 +4852,7 @@ from vypq_core.host_registry import StaticHostRegistry
 from vypq_core.logging import get_trace_id
 
 
-def build_app_with(handler: OcrHandler, settings: OcrSettings, backend=None):
+def build_app_with(handler: OcrHandler, settings: OcrSettings, backend=None, lifespan=None):
     router = APIRouter(prefix="/v1")
 
     @router.post("/ocr", response_model=OcrResponse)
@@ -4812,7 +4872,9 @@ def build_app_with(handler: OcrHandler, settings: OcrSettings, backend=None):
             return HealthStatus.DOWN, f"circuit đang mở: {', '.join(open_hosts)}"
         return HealthStatus.OK, "model-host phản hồi bình thường"
 
-    return create_app(settings, routers=[router], readiness={"model_host": _upstream_ready})
+    return create_app(
+        settings, routers=[router], readiness={"model_host": _upstream_ready}, lifespan=lifespan
+    )
 
 
 def build_app():
@@ -4822,7 +4884,15 @@ def build_app():
     handler = OcrHandler(
         backend, default_model=settings.default_model, max_side=settings.max_side
     )
-    return build_app_with(handler, settings, backend=backend)
+
+    @asynccontextmanager
+    async def _lifespan(_app):
+        yield
+        # Không đóng thì các connection httpx của mỗi host treo tới khi tiến trình
+        # chết — với worker chạy dài (Task 12) đó là rò tài nguyên thật.
+        await backend.aclose()
+
+    return build_app_with(handler, settings, backend=backend, lifespan=_lifespan)
 
 
 app = build_app()
@@ -4862,7 +4932,7 @@ produces: [infer.ocr.results]
 - [ ] **Step 8: Chạy toàn bộ test service ocr**
 
 Chạy: `uv run pytest services/ocr -v`
-Mong đợi: 17 + 7 + 5 + 3 = 32 PASS
+Mong đợi: 17 + 8 + 5 + 4 = 34 PASS
 
 - [ ] **Step 9: Chạy thử end-to-end với model-host fake**
 
