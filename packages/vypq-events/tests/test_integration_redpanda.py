@@ -92,6 +92,11 @@ async def test_retryable_failure_is_redelivered_and_nothing_is_lost():
                     "inference.requested",
                     InferenceRequested(task=Task.OCR, input_uri=uri),
                 ),
+                # Ép cùng partition key: mặc định key là trace_id, mỗi message một
+                # giá trị khác nhau. Assert về thứ tự chỉ đúng khi cả ba nằm chung
+                # một partition — hiện nay đúng nhờ topic tự tạo có 1 partition,
+                # tức là đúng do may chứ không do thiết kế.
+                key="cung-mot-partition",
             )
         for _ in range(40):
             await consumer.run_once()
