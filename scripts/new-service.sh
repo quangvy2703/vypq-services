@@ -56,5 +56,9 @@ if ! grep -q "\"$SLUG-service\"" "$ROOT/pyproject.toml"; then
 fi
 uv sync --project "$ROOT" >/dev/null
 
+# Thứ tự import phụ thuộc tên task (vypq_contracts.$TASK sắp xen giữa các import
+# khác), nên template không thể có sẵn thứ tự đúng cho mọi tên. Để ruff tự sắp.
+uv run --project "$ROOT" ruff check --fix "$DST" >/dev/null 2>&1 || true
+
 echo "đã tạo services/$SLUG (task=$TASK, port=$PORT)"
 echo "bước tiếp: viết pipeline và runner tương ứng, rồi chạy: uv run pytest services/$SLUG"

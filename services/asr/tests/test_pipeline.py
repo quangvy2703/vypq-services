@@ -27,6 +27,21 @@ def test_merge_never_joins_across_different_speakers():
     assert len(merged) == 2
 
 
+def test_merge_sorts_out_of_order_segments_before_joining():
+    # Đoạn tới sai thứ tự thời gian: hiệu ra số âm, lọt ngưỡng, sinh đoạn end < start.
+    merged = merge_segments([_seg(5.0, 6.0, "sau"), _seg(0.0, 1.0, "truoc")])
+    assert [s.text for s in merged] == ["truoc", "sau"]
+    assert all(s.end >= s.start for s in merged)
+
+
+def test_merge_never_produces_a_segment_ending_before_it_starts():
+    merged = merge_segments(
+        [_seg(2.0, 3.0, "b"), _seg(0.0, 1.0, "a"), _seg(1.1, 1.9, "giua")]
+    )
+    assert all(s.end >= s.start for s in merged)
+    assert " ".join(s.text for s in merged).split() == ["a", "giua", "b"]
+
+
 def test_merge_on_empty_input_returns_empty():
     assert merge_segments([]) == []
 
