@@ -1,0 +1,5 @@
+name: ocr
+port: 8001
+capability: {input: image, output: text_boxes}
+consumes: [infer.ocr.requests]
+produces: [infer.ocr.results]

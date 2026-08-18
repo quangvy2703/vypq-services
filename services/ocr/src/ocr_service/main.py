@@ -1,0 +1,46 @@
+from fastapi import APIRouter, File, Form, Request, UploadFile
+from vypq_contracts.common import HealthStatus
+from vypq_contracts.ocr import OcrResponse
+from vypq_core.app import create_app
+from vypq_core.host_registry import StaticHostRegistry
+from vypq_core.logging import get_trace_id
+
+from ocr_service.backend.remote import RemoteOcrBackend
+from ocr_service.handler import OcrHandler
+from ocr_service.settings import OcrSettings, load_hosts
+
+
+def build_app_with(handler: OcrHandler, settings: OcrSettings, backend=None):
+    router = APIRouter(prefix="/v1")
+
+    @router.post("/ocr", response_model=OcrResponse)
+    async def ocr(
+        request: Request,
+        file: UploadFile = File(...),  # noqa: B008
+        model_version: str | None = Form(default=None),
+    ) -> OcrResponse:
+        trace_id = request.headers.get("x-trace-id") or get_trace_id()
+        return await handler.run(await file.read(), model_version, trace_id)
+
+    async def _upstream_ready() -> tuple[HealthStatus, str]:
+        if backend is None:
+            return HealthStatus.OK, "fake backend"
+        open_hosts = backend.open_circuits()
+        if open_hosts:
+            return HealthStatus.DOWN, f"circuit đang mở: {', '.join(open_hosts)}"
+        return HealthStatus.OK, "model-host phản hồi bình thường"
+
+    return create_app(settings, routers=[router], readiness={"model_host": _upstream_ready})
+
+
+def build_app():
+    settings = OcrSettings()
+    registry = StaticHostRegistry(load_hosts(settings.hosts_path))
+    backend = RemoteOcrBackend(registry, timeout_s=settings.timeout_s)
+    handler = OcrHandler(
+        backend, default_model=settings.default_model, max_side=settings.max_side
+    )
+    return build_app_with(handler, settings, backend=backend)
+
+
+app = build_app()
