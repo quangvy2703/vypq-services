@@ -20,3 +20,15 @@ services:
       KAFKA_BROKERS: redpanda:9092
     ports: ["8090:8080"]
     depends_on: [redpanda]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vypq
+      POSTGRES_PASSWORD: vypq
+      POSTGRES_DB: vypq
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vypq"]
+      interval: 5s
+      retries: 20

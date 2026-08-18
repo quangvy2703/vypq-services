@@ -24,8 +24,10 @@ dev = [
     "model-host",
     "ocr-service",
     "asr-service",
+    "gateway",
     # <<< workspace members
     "pillow>=10.4",
+    "aiosqlite>=0.20",
 ]
 
 [tool.uv.sources]
@@ -35,6 +37,7 @@ vypq-events = { workspace = true }
 model-host = { workspace = true }
 ocr-service = { workspace = true }
 asr-service = { workspace = true }
+gateway = { workspace = true }
 # <<< workspace sources
 
 [tool.ruff]
