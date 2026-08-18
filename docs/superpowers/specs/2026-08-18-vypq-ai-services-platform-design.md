@@ -567,6 +567,15 @@ tranh luận lại — và để Plan B, C không vấp phải.
   (`_parse` khi model-host trả sai kiểu output — lỗi cấu hình, retry mãi chỉ kẹt
   partition). Ai "dọn dẹp" cho `default_is_retryable` đọc `ErrorCode` sẽ lật
   ngược cả hai và làm hỏng bảo đảm không-mất-dữ-liệu. Đừng làm.
+- **Giới hạn số lần pause trên cùng một message.** Consumer dừng khi gặp sự cố hạ
+  tầng và tua lại chính message đó, nên trong lúc sự cố **chỉ một message duy nhất**
+  tích luỹ số lần dừng — những cái sau chưa được đụng tới. Vì vậy đặt ngưỡng nhỏ là
+  sai: một sự cố thật kéo dài sẽ bào mòn hàng đợi, cứ N×`pause_seconds` lại mất một
+  message. Ngưỡng mặc định 40 vòng × 30s ≈ **20 phút**: mọi sự cố ngắn hơn thế được
+  chịu đựng trọn vẹn, dài hơn thì mất chậm và alert đã kêu từ lâu.
+  Cách phân biệt đúng hẳn là bỏ qua message nghi vấn rồi thử cái kế tiếp — cái sau
+  chạy được thì cái trước là độc. Không làm vì phá thứ tự xử lý, và vì message độc
+  thật sự (URI sai scheme, URI hỏng) đã vào DLQ ngay từ khâu phân loại.
 - **Cần metric và alert trên `dlq_publish_failed` + `consumer_paused`** trước khi
   chạy không người trông. DLQ hỏng vĩnh viễn sẽ kẹt cả partition, im lặng.
   Đây là bước 10 trong lộ trình Plan B.
