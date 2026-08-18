@@ -14,7 +14,13 @@ dev = [
     "pytest-cov>=5.0",
     "respx>=0.21",
     "ruff>=0.7",
+    "vypq-contracts",
+    # <<< workspace members
 ]
+
+[tool.uv.sources]
+vypq-contracts = { workspace = true }
+# <<< workspace sources
 
 [tool.ruff]
 line-length = 100
