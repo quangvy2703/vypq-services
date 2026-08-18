@@ -21,6 +21,11 @@
 - Truyền file tới model-host mặc định `multipart/form-data` (**không** base64).
 - `model-host` **từ chối khởi động nếu token rỗng**.
 - Chỉ retry lỗi kết nối và HTTP 5xx. **Không bao giờ retry 4xx.**
+- **Mỗi khi tạo một workspace member mới, phải đăng ký nó vào root `pyproject.toml`** ở cả
+  `[dependency-groups] dev` lẫn `[tool.uv.sources]`. `uv sync` chỉ cài những gì được tham
+  chiếu tới; member không ai tham chiếu sẽ không có trong venv và `import` sẽ hỏng. Root
+  `pyproject.toml` có hai dòng đánh dấu `# <<< workspace members` và `# <<< workspace sources`
+  để chèn vào đúng chỗ.
 - Commit sau mỗi task. Message theo Conventional Commits, tiếng Anh cho prefix, mô tả tiếng Việt.
 
 ## File Structure
@@ -102,7 +107,13 @@ dev = [
     "pytest-cov>=5.0",
     "respx>=0.21",
     "ruff>=0.7",
+    "vypq-contracts",
+    # <<< workspace members
 ]
+
+[tool.uv.sources]
+vypq-contracts = { workspace = true }
+# <<< workspace sources
 
 [tool.ruff]
 line-length = 100
@@ -111,6 +122,13 @@ target-version = "py312"
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
 ```
+
+Hai mục cuối của `dev` và cả khối `[tool.uv.sources]` là **bắt buộc**, không phải trang trí:
+`uv sync` chỉ cài những package được tham chiếu tới. Khai báo `vypq-contracts` trong
+`[tool.uv.workspace] members` mới chỉ nói "nó thuộc workspace này", chưa khiến nó được cài vào
+venv — thiếu hai dòng trên thì `import vypq_contracts` hỏng với `ModuleNotFoundError`, dù
+`uv run pytest` chạy đúng cú pháp. Hai dòng `# <<<` là mốc để các task sau chèn member mới
+vào; đừng xoá.
 
 `pytest.ini`:
 ```ini
@@ -563,7 +581,19 @@ packages = ["src/vypq_core"]
 vypq-contracts = { workspace = true }
 ```
 
-Thêm vào `[dependency-groups] dev` của `pyproject.toml` gốc: `"asgi-lifespan>=2.1"`.
+Đăng ký member mới vào root `pyproject.toml` — chèn ngay TRƯỚC dòng đánh dấu tương ứng:
+
+```toml
+# trong [dependency-groups] dev, trước "# <<< workspace members":
+    "asgi-lifespan>=2.1",
+    "vypq-core",
+
+# trong [tool.uv.sources], trước "# <<< workspace sources":
+vypq-core = { workspace = true }
+```
+
+Rồi chạy `uv sync` và xác nhận `uv run python -c "import vypq_core"` không lỗi. Bỏ bước này
+thì mọi test của task hỏng với `ModuleNotFoundError`.
 
 - [ ] **Step 2: Viết test trước**
 
@@ -1572,6 +1602,9 @@ vypq-contracts = { workspace = true }
 vypq-core = { workspace = true }
 ```
 
+Đăng ký vào root `pyproject.toml`: thêm `"vypq-events",` trước `# <<< workspace members`
+và `vypq-events = { workspace = true }` trước `# <<< workspace sources`, rồi `uv sync`.
+
 - [ ] **Step 2: Viết test cho topics và envelope**
 
 `packages/vypq-events/tests/test_topics.py`:
@@ -2289,6 +2322,9 @@ packages = ["src/model_host"]
 vypq-contracts = { workspace = true }
 vypq-core = { workspace = true }
 ```
+
+Đăng ký vào root `pyproject.toml`: thêm `"model-host",` trước `# <<< workspace members`
+và `model-host = { workspace = true }` trước `# <<< workspace sources`, rồi `uv sync`.
 
 `apps/model-host/models.yaml`:
 ```yaml
@@ -3210,6 +3246,9 @@ vypq-contracts = { workspace = true }
 vypq-core = { workspace = true }
 vypq-events = { workspace = true }
 ```
+
+Đăng ký vào root `pyproject.toml`: thêm `"ocr-service",` trước `# <<< workspace members`
+và `ocr-service = { workspace = true }` trước `# <<< workspace sources`, rồi `uv sync`.
 
 - [ ] **Step 2: Viết test trước**
 
@@ -4476,11 +4515,15 @@ SCRIPT = REPO / "scripts" / "new-service.sh"
 @pytest.fixture
 def generated():
     target = REPO / "services" / "tmptest"
+    root_pyproject = REPO / "pyproject.toml"
+    original = root_pyproject.read_text(encoding="utf-8")
     if target.exists():
         shutil.rmtree(target)
     yield target
     if target.exists():
         shutil.rmtree(target)
+    # Script sửa root pyproject — trả lại nguyên trạng để không rác workspace.
+    root_pyproject.write_text(original, encoding="utf-8")
 
 
 def test_script_generates_a_service_that_passes_its_own_tests(generated):
@@ -4510,6 +4553,21 @@ def test_script_leaves_no_unreplaced_tokens(generated):
                 "__RAWOUT__", "__RESP__", "__BACKEND__", "__HANDLER__", "__PORT__",
             ):
                 assert token not in text, f"{path} còn sót {token}"
+
+
+def test_script_registers_the_new_service_in_the_workspace_root(generated):
+    subprocess.run(
+        [str(SCRIPT), "tmptest", "ocr", "8099"], cwd=REPO, check=True, capture_output=True
+    )
+    root = (REPO / "pyproject.toml").read_text(encoding="utf-8")
+    assert '"tmptest-service",' in root
+    assert "tmptest-service = { workspace = true }" in root
+    # Đăng ký rồi thì venv phải import được gói mới.
+    result = subprocess.run(
+        ["uv", "run", "python", "-c", "import tmptest_service"],
+        cwd=REPO, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
 
 
 def test_script_refuses_to_overwrite_existing_service(generated):
@@ -4681,6 +4739,15 @@ find "$DST" -type f -print0 | while IFS= read -r -d '' file; do
     -e "s/__PORT__/$PORT/g" \
     "$file"
 done
+
+# Đăng ký member mới vào workspace root, nếu không venv sẽ không có gói này.
+if ! grep -q "\"$SLUG-service\"" "$ROOT/pyproject.toml"; then
+  sed -i '' \
+    -e "s|^    # <<< workspace members\$|    \"$SLUG-service\",\n    # <<< workspace members|" \
+    -e "s|^# <<< workspace sources\$|$SLUG-service = { workspace = true }\n# <<< workspace sources|" \
+    "$ROOT/pyproject.toml"
+fi
+uv sync --project "$ROOT" >/dev/null
 
 echo "đã tạo services/$SLUG (task=$TASK, port=$PORT)"
 echo "bước tiếp: viết pipeline và runner tương ứng, rồi chạy: uv run pytest services/$SLUG"
