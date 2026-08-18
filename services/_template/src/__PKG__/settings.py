@@ -7,7 +7,7 @@ from vypq_core.host_registry import HostRef
 
 
 class __SETTINGS__(BaseServiceSettings):
-    service_name: str = "__TASK__"
+    service_name: str = "__SLUG__"
     port: int = __PORT__
     default_model: str = "__TASK__-model-v1"
     timeout_s: float = 60.0
