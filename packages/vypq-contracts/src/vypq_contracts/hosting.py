@@ -61,15 +61,25 @@ class InferResponse(BaseModel):
         if not isinstance(data, dict):
             return data
         raw_task, output = data.get("task"), data.get("output")
-        if raw_task is None or not isinstance(output, dict):
+        if raw_task is None:
             return data
         expected = _OUTPUT_BY_TASK[Task(raw_task)]
+        if isinstance(output, BaseModel):
+            # Đường dựng thẳng trong Python: model-host tạo InferResponse với
+            # output=runner.predict(...). Không kiểm ở đây thì runner khai task=ocr
+            # mà trả RawAsrOutput vẫn lọt, vì union nhận cả hai.
+            if not isinstance(output, expected):
+                raise ValueError(
+                    f"output là {type(output).__name__} nhưng task={raw_task!r} "
+                    f"cần {expected.__name__}"
+                )
+            return data
+        if not isinstance(output, dict):
+            return data
         allowed = set(expected.model_fields)
-        unexpected = set(output) - allowed
-        if unexpected:
+        if unexpected := set(output) - allowed:
             # RawOcrOutput/RawAsrOutput mặc định bỏ qua field lạ (extra="ignore"),
-            # nên nếu không chặn ở đây, field của task kia sẽ bị vứt lặng lẽ thay
-            # vì báo lỗi ngay.
+            # nên nếu không chặn ở đây, field của task kia bị vứt lặng lẽ thay vì báo lỗi.
             raise ValueError(
                 f"output có field {sorted(unexpected)} không hợp lệ với "
                 f"task={raw_task!r} (chỉ chấp nhận {sorted(allowed)})"

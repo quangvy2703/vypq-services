@@ -118,6 +118,17 @@ def test_infer_response_does_not_silently_drop_half_of_a_mixed_payload():
         )
 
 
+def test_infer_response_rejects_wrong_output_type_built_in_python():
+    # model-host dựng InferResponse trực tiếp, không qua JSON — đường này cũng phải chặn.
+    with pytest.raises(ValidationError):
+        InferResponse(
+            model_id="m",
+            task=Task.ASR,
+            output=RawOcrOutput(boxes=[]),
+            timing=InferTiming(infer_ms=1),
+        )
+
+
 def test_model_info_defaults():
     info = ModelInfo(id="m1", task=Task.OCR, kind="opensource", runner="fake")
     assert info.loaded is False
