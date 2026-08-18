@@ -75,6 +75,23 @@ def test_static_registry_satisfies_the_protocol():
     assert isinstance(StaticHostRegistry([]), HostRegistry)
 
 
+def test_models_for_task_marks_unavailable_when_only_unhealthy_hosts_have_it():
+    reg = StaticHostRegistry([_host("a", [_model("m1")], healthy=False)])
+    models = reg.models_for_task(Task.OCR)
+    assert len(models) == 1                 # vẫn liệt kê để biết model tồn tại
+    assert models[0].available is False      # nhưng không hứa là dùng được
+
+
+async def test_catalogue_agrees_with_pick():
+    # available=True phải tương đương "pick() sẽ thành công", không hơn không kém.
+    reg = StaticHostRegistry(
+        [_host("a", [_model("m1", available=False)]), _host("b", [_model("m1")], healthy=False)]
+    )
+    assert reg.models_for_task(Task.OCR)[0].available is False
+    with pytest.raises(NoHostAvailableError):
+        await reg.pick("m1")
+
+
 def test_models_for_task_prefers_the_available_copy():
     reg = StaticHostRegistry(
         [_host("a", [_model("m1", available=False)]), _host("b", [_model("m1")])]
