@@ -10,6 +10,12 @@ class ModelHostSettings(BaseServiceSettings):
     token: str = ""
     models_path: Path = Path("models.yaml")
     port: int = 9000
+    # Mặc định TẮT: host này phơi ra Internet qua ngrok. Token rò một lần mà bật
+    # file:// thì kẻ cầm token đọc được mọi file tiến trình đọc được, không chỉ
+    # chạy được inference.
+    allow_file_uri: bool = False
+    expose_docs: bool = False
+    max_download_mb: int = 100
 
     @field_validator("token")
     @classmethod

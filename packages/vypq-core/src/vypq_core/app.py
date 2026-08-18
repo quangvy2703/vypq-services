@@ -20,9 +20,20 @@ def create_app(
     routers: Sequence[APIRouter] = (),
     readiness: Mapping[str, HealthCheck] | None = None,
     lifespan=None,
+    expose_docs: bool = True,
 ) -> FastAPI:
     setup_logging(settings.log_level)
-    app = FastAPI(title=settings.service_name, version=settings.version, lifespan=lifespan)
+    # /docs và /openapi.json nằm ngoài mọi router nên không dính dependency auth.
+    # Service nào phơi ra Internet (model-host qua ngrok) phải tắt, nếu không là
+    # trao không toàn bộ sơ đồ route và schema cho bất kỳ ai dò ra URL.
+    app = FastAPI(
+        title=settings.service_name,
+        version=settings.version,
+        lifespan=lifespan,
+        docs_url="/docs" if expose_docs else None,
+        redoc_url="/redoc" if expose_docs else None,
+        openapi_url="/openapi.json" if expose_docs else None,
+    )
     checks: Mapping[str, HealthCheck] = readiness or {}
 
     @app.middleware("http")

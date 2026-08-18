@@ -11,7 +11,9 @@ def build_app():
     settings = ModelHostSettings()
     config = load_host_config(settings.models_path)
     registry = ModelRegistry(config, runners=RUNNERS)
-    return create_app(settings, routers=[build_router(registry, settings)])
+    return create_app(
+        settings, routers=[build_router(registry, settings)], expose_docs=settings.expose_docs
+    )
 
 
 app = build_app()

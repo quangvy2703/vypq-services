@@ -11,20 +11,26 @@ from vypq_core.app import create_app
 TOKEN = "sekret"
 
 
-def _app():
+def _app(**overrides):
     config = HostConfig(
         host_name="gpu-1", vram_budget_mb=5000,
         models=[ModelSpec(id="m1", task=Task.OCR, kind=ModelKind.OPENSOURCE,
                           runner="fake", vram_mb=1000)],
     )
     registry = ModelRegistry(config, runners={"fake": FakeOcrRunner})
-    settings = ModelHostSettings(service_name="model-host", token=TOKEN, host_name="gpu-1")
-    return create_app(settings, routers=[build_router(registry, settings)])
+    settings = ModelHostSettings(
+        service_name="model-host", token=TOKEN, host_name="gpu-1", **overrides
+    )
+    return create_app(
+        settings,
+        routers=[build_router(registry, settings)],
+        expose_docs=settings.expose_docs,
+    )
 
 
-def _client() -> httpx.AsyncClient:
+def _client(**overrides) -> httpx.AsyncClient:
     return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=_app()),
+        transport=httpx.ASGITransport(app=_app(**overrides)),
         base_url="http://t",
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
@@ -91,10 +97,26 @@ async def test_infer_upload_with_unknown_model_returns_404_envelope():
     assert resp.json()["code"] == "model_unavailable"
 
 
+async def test_file_uri_is_refused_by_default():
+    # Host phơi ra Internet: token rò một lần không được kéo theo quyền đọc file.
+    async with _client() as c:
+        resp = await c.post("/v1/infer", json={"model_id": "m1", "input_uri": "file:///etc/hosts"})
+    assert resp.status_code == 400
+    assert "file://" in resp.json()["message"]
+
+
+async def test_docs_are_not_exposed_by_default():
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app()), base_url="http://t"
+    ) as c:
+        for path in ("/docs", "/openapi.json", "/redoc"):
+            assert (await c.get(path)).status_code == 404, path
+
+
 async def test_infer_by_uri_reads_local_file(tmp_path):
     image = tmp_path / "a.jpg"
     image.write_bytes(b"\xff\xd8fake-jpeg")
-    async with _client() as c:
+    async with _client(allow_file_uri=True) as c:
         resp = await c.post(
             "/v1/infer", json={"model_id": "m1", "input_uri": image.as_uri()}
         )

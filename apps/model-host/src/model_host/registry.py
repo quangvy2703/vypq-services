@@ -22,7 +22,11 @@ class _Loaded:
 
 
 class ModelRegistry:
-    """Lazy load, evict LRU theo vram_budget_mb. Model pinned không bao giờ bị evict."""
+    """Lazy load, evict LRU theo vram_budget_mb. Model pinned không bao giờ bị evict.
+
+    Model bị đánh dấu unavailable (load lỗi) sẽ ở trạng thái đó vĩnh viễn cho tới
+    khi tiến trình khởi động lại — đây là chủ đích, không phải quên retry.
+    """
 
     def __init__(self, config: HostConfig, runners: dict[str, Callable[[], ModelRunner]]) -> None:
         self._config = config

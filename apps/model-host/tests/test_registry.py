@@ -89,3 +89,22 @@ def test_failed_load_marks_model_unavailable_without_killing_host():
     infos = {i.id: i for i in reg.infos()}
     assert infos["m1"].available is False
     assert infos["m2"].available is True     # model khác không bị ảnh hưởng
+
+
+def test_unavailable_model_is_not_retried_on_the_next_request():
+    attempts = []
+
+    class Broken(FakeOcrRunner):
+        def load(self, spec):
+            attempts.append(spec.id)
+            raise RuntimeError("thiếu checkpoint")
+
+    config = HostConfig(
+        host_name="gpu-1", vram_budget_mb=5000, models=[_spec("m1", 1000)]
+    )
+    config.models[0].runner = "broken"
+    reg = ModelRegistry(config, runners={"fake": FakeOcrRunner, "broken": Broken})
+    for _ in range(3):
+        with pytest.raises(ServiceError):
+            reg.acquire("m1")
+    assert attempts == ["m1"]     # chỉ thử load đúng một lần

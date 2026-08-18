@@ -15,7 +15,7 @@ from model_host.settings import ModelHostSettings
 _SUPPORTED_SCHEMES = {"http", "https", "file"}
 
 
-async def _fetch(uri: str) -> bytes:
+async def _fetch(uri: str, *, allow_file: bool, max_bytes: int) -> bytes:
     scheme = urlparse(uri).scheme
     if scheme not in _SUPPORTED_SCHEMES:
         raise ServiceError(
@@ -24,15 +24,35 @@ async def _fetch(uri: str) -> bytes:
             http_status=400,
         )
     if scheme == "file":
+        if not allow_file:
+            raise ServiceError(
+                ErrorCode.BAD_INPUT,
+                "file:// bị tắt trên host này — bật bằng VYPQ_ALLOW_FILE_URI nếu chạy local",
+                http_status=400,
+            )
         path = Path(urlparse(uri).path)
         if not path.is_file():
             raise ServiceError(ErrorCode.BAD_INPUT, f"không thấy file {path}", 400)
         return path.read_bytes()
+
+    # Đọc theo luồng và cắt khi vượt hạn: `response.content` nạp nguyên body vào
+    # RAM, nên một URI trỏ tới file khổng lồ đủ để hạ cả máy GPU.
+    chunks: list[bytes] = []
+    total = 0
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(uri)
-    if response.status_code >= 400:
-        raise ServiceError(ErrorCode.BAD_INPUT, f"tải {uri} thất bại", 400)
-    return response.content
+        async with client.stream("GET", uri) as response:
+            if response.status_code >= 400:
+                raise ServiceError(ErrorCode.BAD_INPUT, f"tải {uri} thất bại", 400)
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ServiceError(
+                        ErrorCode.BAD_INPUT,
+                        f"input vượt quá {max_bytes // 1024 // 1024}MB",
+                        http_status=413,
+                    )
+                chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def build_router(registry: ModelRegistry, settings: ModelHostSettings) -> APIRouter:
@@ -59,7 +79,11 @@ def build_router(registry: ModelRegistry, settings: ModelHostSettings) -> APIRou
     async def infer(request: InferRequest) -> InferResponse:
         if not request.input_uri:
             raise ServiceError(ErrorCode.BAD_INPUT, "thiếu input_uri", 400)
-        data = await _fetch(request.input_uri)
+        data = await _fetch(
+            request.input_uri,
+            allow_file=settings.allow_file_uri,
+            max_bytes=settings.max_download_mb * 1024 * 1024,
+        )
         return _run(request.model_id, data, request.params)
 
     @router.post("/infer/upload", response_model=InferResponse)
