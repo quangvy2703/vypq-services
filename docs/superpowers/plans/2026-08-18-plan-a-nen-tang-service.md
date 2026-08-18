@@ -3655,7 +3655,15 @@ class PaddleOcrRunner:
         self._engine = None
 
     def load(self, spec: ModelSpec) -> None:
-        from paddleocr import PaddleOCR  # import muộn: chỉ máy GPU mới có gói này
+        try:
+            # Import muộn: chỉ máy GPU mới có gói này, module vẫn phải import
+            # được ở mọi nơi để registry liệt kê được model.
+            from paddleocr import PaddleOCR
+        except ImportError as exc:
+            raise RuntimeError(
+                "thiếu extra 'gpu': chạy `uv sync --extra gpu` trên máy có CUDA. "
+                "Trên máy dev không GPU, dùng runner 'fake' trong models.dev.yaml."
+            ) from exc
 
         self._engine = PaddleOCR(
             lang=spec.params.get("lang", "vi"),
@@ -3698,8 +3706,18 @@ RUNNERS: dict[str, type] = {
 
 
 def _register_optional() -> None:
-    # Runner thật cần thư viện nặng, chỉ có trên máy GPU. Vắng mặt thì bỏ qua
-    # để host vẫn chạy được ở chế độ fake trên máy dev.
+    """Đăng ký các runner thật.
+
+    Chúng LUÔN được đăng ký, kể cả khi thư viện ML vắng mặt: import nặng nằm
+    trong `load()` nên module này import được ở mọi máy. Đó là chủ ý — thiếu thư
+    viện thì `load()` ném, registry cô lập model đó, đánh dấu unavailable và trả
+    503 rõ ràng, trong khi các model khác chạy bình thường. Nếu ngược lại, không
+    đăng ký runner, thì `acquire()` trả 500 "không biết runner", lặp lại mãi và
+    không bao giờ đánh dấu unavailable — tệ hơn hẳn.
+
+    `try/except ImportError` dưới đây chỉ phòng trường hợp chính file runner
+    hỏng (ví dụ ai đó thêm import nặng lên top level).
+    """
     try:
         from model_host.runners.paddle import PaddleOcrRunner
     except ImportError:
@@ -3766,12 +3784,62 @@ services:
     depends_on: [model-host-0]
 ```
 
-- [ ] **Step 5: Chạy test nhanh xác nhận không vỡ gì**
+- [ ] **Step 5: Thêm test cho đường thiếu thư viện (chạy được trên máy không GPU)**
+
+`apps/model-host/tests/test_missing_ml_lib.py`:
+```python
+import pytest
+
+from model_host.registry import ModelRegistry
+from model_host.runners import RUNNERS
+from model_host.spec import HostConfig, ModelSpec
+from vypq_contracts.common import ModelKind, Task
+from vypq_core.errors import ServiceError
+
+
+def _spec(mid: str, runner: str) -> ModelSpec:
+    return ModelSpec(
+        id=mid, task=Task.OCR, kind=ModelKind.OPENSOURCE, runner=runner, vram_mb=100
+    )
+
+
+def test_paddle_runner_is_registered_even_without_the_library():
+    # Đăng ký luôn là chủ ý: nhờ vậy lỗi thiếu thư viện đi qua đường cô lập của
+    # registry (503 + unavailable) thay vì đường "không biết runner" (500, lặp mãi).
+    assert "paddle" in RUNNERS
+
+
+def test_missing_library_isolates_one_model_and_says_how_to_fix_it():
+    pytest.importorskip  # noqa: B018 - chỉ để rõ ý: test này chạy KHI paddleocr vắng mặt
+    try:
+        import paddleocr  # noqa: F401
+    except ImportError:
+        pass
+    else:
+        pytest.skip("máy này có paddleocr, đường lỗi không tái hiện được")
+
+    config = HostConfig(
+        host_name="gpu-1",
+        vram_budget_mb=5000,
+        models=[_spec("p", "paddle"), _spec("f", "fake")],
+    )
+    registry = ModelRegistry(config, runners=RUNNERS)
+
+    with pytest.raises(ServiceError) as exc:
+        registry.acquire("p")
+    assert exc.value.http_status == 503
+    assert "uv sync --extra gpu" in exc.value.message   # phải nói cách sửa
+
+    registry.acquire("f")                                # model khác không bị vạ lây
+    assert {i.id: i.available for i in registry.infos()} == {"p": False, "f": True}
+```
+
+- [ ] **Step 6: Chạy test nhanh xác nhận không vỡ gì**
 
 Chạy: `uv run pytest apps/model-host -v`
-Mong đợi: 17 PASS, 1 skipped (test paddle bị loại vì marker `slow`)
+Mong đợi: 23 PASS, 1 deselected (test paddle bị loại vì marker `slow`)
 
-- [ ] **Step 6: Chạy test paddle trên máy GPU**
+- [ ] **Step 7: Chạy test paddle trên máy GPU**
 
 ```bash
 docker compose -f apps/model-host/docker-compose.yml up -d --build
@@ -3781,7 +3849,7 @@ curl -s localhost:4040/api/tunnels | grep -o 'https://[a-z0-9-]*\.ngrok[^"]*' | 
 ```
 Mong đợi: 1 PASS, và lệnh cuối in ra URL ngrok công khai của host.
 
-- [ ] **Step 7: Commit**
+- [ ] **Step 8: Commit**
 
 ```bash
 git add apps/model-host
