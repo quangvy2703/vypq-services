@@ -9,7 +9,9 @@ from vypq_contracts.gateway import (
     HostState,
     InvokeMode,
     InvokeRequest,
+    InvokeResponse,
     RunRecord,
+    RunsResponse,
     RunStatus,
     ServiceInfo,
     ServiceState,
@@ -103,6 +105,42 @@ def test_invoke_defaults_to_sync():
 def test_invoke_mode_is_a_string_enum():
     assert InvokeMode.ASYNC == "async"
     assert f"{InvokeMode.ASYNC}" == "async"
+
+
+def test_empty_model_version_reads_back_as_none():
+    # Tầng DB lưu "" thay cho NULL để khoá duy nhất còn hiệu lực. Đọc lên phải
+    # về None, nếu không mọi chỗ kiểm `is None` sẽ trượt đúng những dòng đó.
+    run = RunRecord(
+        id="r1", trace_id="t1", service="ocr", model_version="",
+        mode=InvokeMode.ASYNC, status=RunStatus.PENDING, created_at=datetime.now(UTC),
+    )
+    assert run.model_version is None
+
+
+def test_async_invoke_response_has_no_run_id_yet():
+    # Đường async chưa tạo dòng runs: kết quả có thể về từ nhiều model version,
+    # mỗi cái một dòng. Người gọi tra lại bằng trace_id.
+    resp = InvokeResponse(trace_id="t1", mode=InvokeMode.ASYNC)
+    assert resp.run_id is None
+    assert resp.result is None
+
+
+def test_sync_invoke_response_carries_run_id_and_result():
+    resp = InvokeResponse(
+        trace_id="t1", mode=InvokeMode.SYNC, run_id="r1", result={"full_text": "a"}
+    )
+    assert resp.run_id == "r1"
+    assert resp.result["full_text"] == "a"
+
+
+def test_run_status_is_a_string_enum():
+    assert RunStatus.FAILED == "failed"
+    assert f"{RunStatus.FAILED}" == "failed"
+
+
+def test_runs_response_defaults_to_empty():
+    assert RunsResponse().runs == []
+    assert RunsResponse().total == 0
 
 
 def test_run_record_roundtrip():

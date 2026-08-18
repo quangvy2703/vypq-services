@@ -2,7 +2,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from vypq_contracts.common import HealthStatus, Task
 from vypq_contracts.hosting import ModelInfo
@@ -100,6 +100,18 @@ class RunRecord(BaseModel):
     latency_ms: int | None = None
     error: str | None = None
     created_at: datetime
+
+    @field_validator("model_version", mode="before")
+    @classmethod
+    def _empty_means_unknown(cls, value: str | None) -> str | None:
+        """Chuỗi rỗng và None là cùng một ý: chưa biết model nào.
+
+        Tầng DB buộc phải lưu "" chứ không NULL, vì SQL coi mọi NULL là khác
+        nhau nên khoá duy nhất (trace_id, model_version) sẽ không chặn được gì.
+        Không chuẩn hoá ở đây thì code phía sau kiểm `is None` sẽ trượt với
+        đúng những dòng đọc lên từ DB.
+        """
+        return value or None
 
 
 class RunsResponse(BaseModel):
