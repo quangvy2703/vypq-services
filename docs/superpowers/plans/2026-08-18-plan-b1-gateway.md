@@ -385,6 +385,7 @@ Gateway cần biết service làm được gì mà không phải đọc file tr�
 - Create: `packages/vypq-core/src/vypq_core/service_info.py`
 - Modify: `services/ocr/src/ocr_service/main.py`, `services/asr/src/asr_service/main.py`
 - Modify: `services/_template/src/__PKG__/main.py`
+- Delete: `services/ocr/service.yaml`, `services/asr/service.yaml`, `services/_template/service.yaml`
 - Test: `packages/vypq-core/tests/test_service_info.py`, bổ sung `services/ocr/tests/test_api.py`
 
 **Interfaces:**

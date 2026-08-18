@@ -247,19 +247,23 @@ không cần JVM/ZooKeeper.
   vì khác consumer group. Đây là chế độ shadow-run và là cách `evaluator` chạy benchmark —
   không cần code riêng cho việc so model.
 
-### 3.8 Service manifest
+### 3.8 Service tự mô tả qua `/v1/info`
 
-```yaml
-# services/ocr/service.yaml
-name: ocr
-port: 8001
-capability: {input: image, output: text_boxes}
-consumes: [infer.ocr.requests]
-produces: [infer.ocr.results]
+```json
+{"name": "ocr", "task": "ocr", "capability_input": "image",
+ "capability_output": "text_boxes", "version": "0.1.0",
+ "invoke_path": "/v1/ocr", "default_model": "paddleocr-v4-vi"}
 ```
 
 Dashboard đọc capability từ gateway rồi tự chọn uploader và viewer. Service thứ ba
-(NER, TTS...) chỉ cần khai báo manifest, không sửa code dashboard.
+(NER, TTS...) chỉ cần trả đúng `/v1/info`, không sửa code dashboard.
+
+**Ghi chú lịch sử:** Plan A để manifest trong `services/*/service.yaml`. Cách đó
+chỉ đọc được khi đứng cùng máy, mà gateway ở máy khác — nên Plan B1 thay bằng
+endpoint HTTP và **xoá hẳn file YAML**. Giữ lại cả hai sẽ thành hai nguồn sự thật,
+và cái không ai đọc sẽ lặng lẽ trôi khỏi cái đang chạy: lúc phát hiện thì
+`service.yaml` của asr đã ghi `bytes/json` trong khi service thật trả
+`audio/transcript`.
 
 ## 4. Định dạng dataset có nhãn
 
