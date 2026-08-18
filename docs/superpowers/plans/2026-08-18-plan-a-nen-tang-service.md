@@ -2552,17 +2552,25 @@ class EventConsumer:
             timeout_ms=self._poll_ms, max_records=self._max_records
         )
         processed = 0
+        # Offset chưa xử lý đầu tiên của TỪNG partition trong batch.
+        pending = {tp: msgs[0].offset for tp, msgs in batch.items() if msgs}
         for tp, messages in batch.items():
             for message in messages:
                 try:
                     await self._process(message)
                 except _PauseSignal:
-                    # Tua về đúng message đang dở rồi commit: mọi thứ trước nó
-                    # coi như xong, còn nó sẽ được giao lại khi resume.
-                    self._consumer.seek(tp, message.offset)
+                    # Tua lại MỌI partition trong batch, không chỉ cái đang lỗi:
+                    # commit() không tham số commit vị trí của TẤT CẢ partition
+                    # được gán, kể cả những partition mà getmany() đã trả record
+                    # nhưng vòng lặp này chưa chạy tới. Chỉ tua một partition thì
+                    # số record kia bị commit qua và mất vĩnh viễn — đo được 7/9
+                    # message biến mất trên topic 3 partition.
+                    for other_tp, offset in pending.items():
+                        self._consumer.seek(other_tp, offset)
                     await self._consumer.commit()
                     self._pause()
                     return processed
+                pending[tp] = message.offset + 1
                 processed += 1
         if processed:
             await self._consumer.commit()
