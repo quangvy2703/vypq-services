@@ -969,9 +969,20 @@ def create_app(
     routers: Sequence[APIRouter] = (),
     readiness: Mapping[str, HealthCheck] | None = None,
     lifespan=None,
+    expose_docs: bool = True,
 ) -> FastAPI:
     setup_logging(settings.log_level)
-    app = FastAPI(title=settings.service_name, version=settings.version, lifespan=lifespan)
+    # /docs và /openapi.json nằm ngoài mọi router nên không dính dependency auth.
+    # Service nào phơi ra Internet (model-host qua ngrok) phải tắt, nếu không là
+    # trao không toàn bộ sơ đồ route và schema cho bất kỳ ai dò ra URL.
+    app = FastAPI(
+        title=settings.service_name,
+        version=settings.version,
+        lifespan=lifespan,
+        docs_url="/docs" if expose_docs else None,
+        redoc_url="/redoc" if expose_docs else None,
+        openapi_url="/openapi.json" if expose_docs else None,
+    )
     checks: Mapping[str, HealthCheck] = readiness or {}
 
     @app.middleware("http")
@@ -3194,20 +3205,26 @@ from vypq_core.app import create_app
 TOKEN = "sekret"
 
 
-def _app():
+def _app(**overrides):
     config = HostConfig(
         host_name="gpu-1", vram_budget_mb=5000,
         models=[ModelSpec(id="m1", task=Task.OCR, kind=ModelKind.OPENSOURCE,
                           runner="fake", vram_mb=1000)],
     )
     registry = ModelRegistry(config, runners={"fake": FakeOcrRunner})
-    settings = ModelHostSettings(service_name="model-host", token=TOKEN, host_name="gpu-1")
-    return create_app(settings, routers=[build_router(registry, settings)])
+    settings = ModelHostSettings(
+        service_name="model-host", token=TOKEN, host_name="gpu-1", **overrides
+    )
+    return create_app(
+        settings,
+        routers=[build_router(registry, settings)],
+        expose_docs=settings.expose_docs,
+    )
 
 
-def _client() -> httpx.AsyncClient:
+def _client(**overrides) -> httpx.AsyncClient:
     return httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=_app()),
+        transport=httpx.ASGITransport(app=_app(**overrides)),
         base_url="http://t",
         headers={"Authorization": f"Bearer {TOKEN}"},
     )
@@ -3274,10 +3291,26 @@ async def test_infer_upload_with_unknown_model_returns_404_envelope():
     assert resp.json()["code"] == "model_unavailable"
 
 
+async def test_file_uri_is_refused_by_default():
+    # Host phơi ra Internet: token rò một lần không được kéo theo quyền đọc file.
+    async with _client() as c:
+        resp = await c.post("/v1/infer", json={"model_id": "m1", "input_uri": "file:///etc/hosts"})
+    assert resp.status_code == 400
+    assert "file://" in resp.json()["message"]
+
+
+async def test_docs_are_not_exposed_by_default():
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app()), base_url="http://t"
+    ) as c:
+        for path in ("/docs", "/openapi.json", "/redoc"):
+            assert (await c.get(path)).status_code == 404, path
+
+
 async def test_infer_by_uri_reads_local_file(tmp_path):
     image = tmp_path / "a.jpg"
     image.write_bytes(b"\xff\xd8fake-jpeg")
-    async with _client() as c:
+    async with _client(allow_file_uri=True) as c:
         resp = await c.post(
             "/v1/infer", json={"model_id": "m1", "input_uri": image.as_uri()}
         )
@@ -3316,6 +3349,12 @@ class ModelHostSettings(BaseServiceSettings):
     token: str = ""
     models_path: Path = Path("models.yaml")
     port: int = 9000
+    # Mặc định TẮT: host này phơi ra Internet qua ngrok. Token rò một lần mà bật
+    # file:// thì kẻ cầm token đọc được mọi file tiến trình đọc được, không chỉ
+    # chạy được inference.
+    allow_file_uri: bool = False
+    expose_docs: bool = False
+    max_download_mb: int = 100
 
     @field_validator("token")
     @classmethod
@@ -3328,6 +3367,8 @@ class ModelHostSettings(BaseServiceSettings):
 
 `apps/model-host/src/model_host/auth.py`:
 ```python
+import secrets
+
 from fastapi import Header
 
 from vypq_contracts.common import ErrorCode
@@ -3338,7 +3379,10 @@ def make_token_dependency(expected: str):
     async def require_token(authorization: str = Header(default="")) -> None:
         prefix = "Bearer "
         supplied = authorization[len(prefix):] if authorization.startswith(prefix) else ""
-        if supplied != expected:
+        # compare_digest thay vì ==: so sánh chuỗi thường thoát sớm ở byte đầu
+        # khác nhau. Qua ngrok thì jitter mạng che gần hết tín hiệu đó, nhưng
+        # đây là một dòng code cho thứ duy nhất chặn giữa Internet và GPU.
+        if not secrets.compare_digest(supplied, expected):
             raise ServiceError(ErrorCode.BAD_INPUT, "token không hợp lệ", http_status=401)
 
     return require_token
@@ -3363,7 +3407,7 @@ from vypq_core.errors import ServiceError
 _SUPPORTED_SCHEMES = {"http", "https", "file"}
 
 
-async def _fetch(uri: str) -> bytes:
+async def _fetch(uri: str, *, allow_file: bool, max_bytes: int) -> bytes:
     scheme = urlparse(uri).scheme
     if scheme not in _SUPPORTED_SCHEMES:
         raise ServiceError(
@@ -3372,15 +3416,35 @@ async def _fetch(uri: str) -> bytes:
             http_status=400,
         )
     if scheme == "file":
+        if not allow_file:
+            raise ServiceError(
+                ErrorCode.BAD_INPUT,
+                "file:// bị tắt trên host này — bật bằng VYPQ_ALLOW_FILE_URI nếu chạy local",
+                http_status=400,
+            )
         path = Path(urlparse(uri).path)
         if not path.is_file():
             raise ServiceError(ErrorCode.BAD_INPUT, f"không thấy file {path}", 400)
         return path.read_bytes()
+
+    # Đọc theo luồng và cắt khi vượt hạn: `response.content` nạp nguyên body vào
+    # RAM, nên một URI trỏ tới file khổng lồ đủ để hạ cả máy GPU.
+    chunks: list[bytes] = []
+    total = 0
     async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(uri)
-    if response.status_code >= 400:
-        raise ServiceError(ErrorCode.BAD_INPUT, f"tải {uri} thất bại", 400)
-    return response.content
+        async with client.stream("GET", uri) as response:
+            if response.status_code >= 400:
+                raise ServiceError(ErrorCode.BAD_INPUT, f"tải {uri} thất bại", 400)
+            async for chunk in response.aiter_bytes():
+                total += len(chunk)
+                if total > max_bytes:
+                    raise ServiceError(
+                        ErrorCode.BAD_INPUT,
+                        f"input vượt quá {max_bytes // 1024 // 1024}MB",
+                        http_status=413,
+                    )
+                chunks.append(chunk)
+    return b"".join(chunks)
 
 
 def build_router(registry: ModelRegistry, settings: ModelHostSettings) -> APIRouter:
@@ -3407,7 +3471,11 @@ def build_router(registry: ModelRegistry, settings: ModelHostSettings) -> APIRou
     async def infer(request: InferRequest) -> InferResponse:
         if not request.input_uri:
             raise ServiceError(ErrorCode.BAD_INPUT, "thiếu input_uri", 400)
-        data = await _fetch(request.input_uri)
+        data = await _fetch(
+            request.input_uri,
+            allow_file=settings.allow_file_uri,
+            max_bytes=settings.max_download_mb * 1024 * 1024,
+        )
         return _run(request.model_id, data, request.params)
 
     @router.post("/infer/upload", response_model=InferResponse)
@@ -3433,7 +3501,11 @@ def build_app():
     settings = ModelHostSettings()
     config = load_host_config(settings.models_path)
     registry = ModelRegistry(config, runners=RUNNERS)
-    return create_app(settings, routers=[build_router(registry, settings)])
+    return create_app(
+        settings,
+        routers=[build_router(registry, settings)],
+        expose_docs=settings.expose_docs,
+    )
 
 
 app = build_app()
@@ -3447,7 +3519,7 @@ __all__: list[str] = []
 - [ ] **Step 9: Chạy toàn bộ test model-host**
 
 Chạy: `uv run pytest apps/model-host -v`
-Mong đợi: 8 + 9 = 17 PASS
+Mong đợi: 8 + 11 = 19 PASS
 
 - [ ] **Step 10: Chạy thử host thật bằng fake runner**
 
