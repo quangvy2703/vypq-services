@@ -33,8 +33,20 @@ def _height(box: TextBox) -> float:
     return max(ys) - min(ys)
 
 
-def sort_reading_order(boxes: list[TextBox]) -> list[TextBox]:
-    """Gom box thành dòng theo tâm y, rồi sắp trái sang phải trong mỗi dòng."""
+def group_lines(boxes: list[TextBox]) -> list[list[TextBox]]:
+    """Gom box thành dòng theo tâm y, mỗi dòng sắp trái sang phải.
+
+    NGUỒN DUY NHẤT quyết định đâu là một dòng. Trước đây `sort_reading_order` và
+    `build_full_text` mỗi hàm tự gom một kiểu: hàm đầu neo vào box TRÊN CÙNG của
+    dòng, hàm sau neo vào box TRÁI NHẤT. Với chữ hơi nghiêng — đúng thứ xảy ra khi
+    chụp hoá đơn bằng điện thoại — hai mốc đó khác nhau, nên `full_text` ngắt dòng
+    một đằng còn thứ tự `boxes` một nẻo. Kết quả đọc vẫn xuôi tai nhưng chấm CER
+    thì sai, và model bị đổ oan.
+
+    Hạn chế đã biết: thuật toán này gom theo dải ngang, nên tài liệu HAI CỘT sẽ bị
+    trộn xen kẽ trái–phải từng dòng. Với hoá đơn một cột thì đúng; bố cục hai cột
+    cần tách cột trước (XY-cut) — chưa làm ở Plan A, xem test đánh dấu bên dưới.
+    """
     if not boxes:
         return []
     tolerance = statistics.median(_height(b) for b in boxes) * _LINE_TOLERANCE_RATIO
@@ -44,32 +56,33 @@ def sort_reading_order(boxes: list[TextBox]) -> list[TextBox]:
             lines[-1].append(box)
         else:
             lines.append([box])
-    ordered: list[TextBox] = []
-    for line in lines:
-        ordered.extend(sorted(line, key=_min_x))
-    return ordered
+    return [sorted(line, key=_min_x) for line in lines]
+
+
+def sort_reading_order(boxes: list[TextBox]) -> list[TextBox]:
+    return [box for line in group_lines(boxes) for box in line]
+
+
+def text_from_lines(lines: list[list[TextBox]]) -> str:
+    """Ghép theo dòng: cùng dòng nối bằng dấu cách, khác dòng xuống hàng."""
+    rendered = [
+        " ".join(box.text for box in line if not box.ignore) for line in lines
+    ]
+    return normalize_text("\n".join(line for line in rendered if line))
 
 
 def build_full_text(boxes: list[TextBox]) -> str:
-    """Ghép theo dòng: cùng dòng nối bằng dấu cách, khác dòng xuống hàng."""
-    kept = [b for b in boxes if not b.ignore]
-    if not kept:
-        return ""
-    tolerance = statistics.median(_height(b) for b in kept) * _LINE_TOLERANCE_RATIO
-    lines: list[list[str]] = []
-    previous: TextBox | None = None
-    for box in kept:
-        if previous is not None and abs(_y_center(box) - _y_center(previous)) <= tolerance:
-            lines[-1].append(box.text)
-        else:
-            lines.append([box.text])
-            previous = box
-    return normalize_text("\n".join(" ".join(line) for line in lines))
+    return text_from_lines(group_lines(boxes))
 
 
 def to_result(raw: RawOcrOutput, scale: float) -> OcrResult:
     factor = 1.0 / scale if scale else 1.0
     boxes = rescale_boxes(raw.boxes, factor)
     boxes = [b.model_copy(update={"text": normalize_text(b.text)}) for b in boxes]
-    boxes = sort_reading_order(boxes)
-    return OcrResult(full_text=build_full_text(boxes), boxes=boxes)
+    # Gom dòng đúng MỘT lần rồi dùng chung cho cả hai đầu ra: thứ tự box và
+    # full_text không thể lệch nhau nữa vì chúng sinh ra từ cùng một kết quả.
+    lines = group_lines(boxes)
+    return OcrResult(
+        full_text=text_from_lines(lines),
+        boxes=[box for line in lines for box in line],
+    )

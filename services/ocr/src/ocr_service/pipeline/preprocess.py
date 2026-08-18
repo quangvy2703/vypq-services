@@ -14,11 +14,24 @@ class PreparedImage:
     height: int
 
 
-def prepare_image(data: bytes, max_side: int = 2000) -> PreparedImage:
+def prepare_image(
+    data: bytes, max_side: int = 2000, max_pixels: int = 60_000_000
+) -> PreparedImage:
     """Xoay theo EXIF và giới hạn cạnh dài. `scale` để postprocess tính ngược toạ độ."""
     try:
         image = Image.open(io.BytesIO(data))
+        # Chặn TRƯỚC khi decode: Pillow chỉ tự ném khi vượt 2x MAX_IMAGE_PIXELS,
+        # nên một PNG 450KB giãn ra 144 triệu điểm ảnh vẫn lọt qua và ngốn RAM.
+        width, height = image.size
+        if width * height > max_pixels:
+            raise ServiceError(
+                ErrorCode.BAD_INPUT,
+                f"ảnh {width}x{height} vượt giới hạn {max_pixels} điểm ảnh",
+                422,
+            )
         image = ImageOps.exif_transpose(image).convert("RGB")
+    except ServiceError:
+        raise
     except Exception as exc:
         raise ServiceError(ErrorCode.BAD_INPUT, f"không đọc được ảnh: {exc}", 422) from exc
 

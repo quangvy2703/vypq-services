@@ -1,16 +1,20 @@
 import io
 import unicodedata
 
+import pytest
 from ocr_service.pipeline.postprocess import (
     build_full_text,
+    group_lines,
     normalize_text,
     rescale_boxes,
     sort_reading_order,
+    text_from_lines,
     to_result,
 )
 from ocr_service.pipeline.preprocess import prepare_image
 from PIL import Image
 from vypq_contracts.ocr import RawOcrOutput, TextBox
+from vypq_core.errors import ServiceError
 
 
 def _box(id_: int, x: float, y: float, w: float = 50, h: float = 20, text: str = "x") -> TextBox:
@@ -112,6 +116,40 @@ def test_to_result_rescales_sorts_and_normalizes_in_one_pass():
     assert result.full_text == "hóa đơn"
     assert unicodedata.is_normalized("NFC", result.full_text)
     assert result.boxes[0].polygon[0] == (20.0, 12.0)   # 10 / 0.5
+
+
+def test_full_text_never_disagrees_with_box_order_on_jittered_text():
+    # Chữ hơi nghiêng: box trên cùng và box trái nhất của một dòng là hai box khác
+    # nhau. Trước khi gom dòng về một nguồn, hai hàm ngắt dòng khác nhau ở đây.
+    boxes = [_box(0, 200, 0, text="B"), _box(1, 400, 8, text="C"),
+             _box(2, 10, 11, text="A"), _box(3, 250, 14, text="D")]
+    lines = group_lines(boxes)
+    ordered = sort_reading_order(boxes)
+
+    assert ordered == [b for line in lines for b in line]
+    assert build_full_text(ordered) == text_from_lines(lines)
+    # Số dòng trong full_text phải đúng bằng số dòng đã gom.
+    assert build_full_text(ordered).count("\n") + 1 == len(lines)
+
+
+def test_two_column_layout_interleaves_columns_known_limitation():
+    # Hạn chế đã biết, cố ý ghim lại để nó là quyết định chứ không phải bất ngờ:
+    # gom theo dải ngang nên hai cột bị trộn. Tách cột thuộc phạm vi sau.
+    boxes = []
+    for row in range(3):
+        boxes.append(_box(row * 2, 10, row * 60, text=f"T{row}"))
+        boxes.append(_box(row * 2 + 1, 500, row * 60, text=f"P{row}"))
+    assert build_full_text(sort_reading_order(boxes)) == "T0 P0\nT1 P1\nT2 P2"
+
+
+def test_prepare_image_rejects_a_decompression_bomb():
+    bomb = Image.new("RGB", (12000, 12000), "white")
+    buf = io.BytesIO()
+    bomb.save(buf, format="PNG")
+    with pytest.raises(ServiceError) as exc:
+        prepare_image(buf.getvalue(), max_side=2000, max_pixels=1_000_000)
+    assert exc.value.http_status == 422
+    assert "điểm ảnh" in exc.value.message
 
 
 def test_to_result_on_empty_output_gives_empty_text():
