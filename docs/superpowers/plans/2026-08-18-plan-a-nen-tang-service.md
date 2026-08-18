@@ -1323,7 +1323,7 @@ class CircuitBreaker:
 - [ ] **Step 4: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-core/tests/test_breaker.py -v`
-Mong đợi: 12 PASS
+Mong đợi: 15 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -3888,7 +3888,9 @@ OCR ngang với bản thân model, nên phải có test chặt.
   - `PreparedImage(data: bytes, scale: float, width: int, height: int)`
   - `prepare_image(data: bytes, max_side: int = 2000) -> PreparedImage`
   - `rescale_boxes(boxes: list[TextBox], factor: float) -> list[TextBox]`
+  - `group_lines(boxes: list[TextBox]) -> list[list[TextBox]]` — nguồn gom dòng duy nhất
   - `sort_reading_order(boxes: list[TextBox]) -> list[TextBox]`
+  - `text_from_lines(lines: list[list[TextBox]]) -> str`
   - `build_full_text(boxes: list[TextBox]) -> str`
   - `normalize_text(text: str) -> str` — NFC
   - `to_result(raw: RawOcrOutput, scale: float) -> OcrResult`
@@ -3937,15 +3939,20 @@ import unicodedata
 
 from PIL import Image
 
+import pytest
+
 from ocr_service.pipeline.postprocess import (
     build_full_text,
+    group_lines,
     normalize_text,
     rescale_boxes,
     sort_reading_order,
+    text_from_lines,
     to_result,
 )
 from ocr_service.pipeline.preprocess import prepare_image
 from vypq_contracts.ocr import RawOcrOutput, TextBox
+from vypq_core.errors import ServiceError
 
 
 def _box(id_: int, x: float, y: float, w: float = 50, h: float = 20, text: str = "x") -> TextBox:
@@ -4049,6 +4056,40 @@ def test_to_result_rescales_sorts_and_normalizes_in_one_pass():
     assert result.boxes[0].polygon[0] == (20.0, 12.0)   # 10 / 0.5
 
 
+def test_full_text_never_disagrees_with_box_order_on_jittered_text():
+    # Chữ hơi nghiêng: box trên cùng và box trái nhất của một dòng là hai box khác
+    # nhau. Trước khi gom dòng về một nguồn, hai hàm ngắt dòng khác nhau ở đây.
+    boxes = [_box(0, 200, 0, text="B"), _box(1, 400, 8, text="C"),
+             _box(2, 10, 11, text="A"), _box(3, 250, 14, text="D")]
+    lines = group_lines(boxes)
+    ordered = sort_reading_order(boxes)
+
+    assert ordered == [b for line in lines for b in line]
+    assert build_full_text(ordered) == text_from_lines(lines)
+    # Số dòng trong full_text phải đúng bằng số dòng đã gom.
+    assert build_full_text(ordered).count("\n") + 1 == len(lines)
+
+
+def test_two_column_layout_interleaves_columns_known_limitation():
+    # Hạn chế đã biết, cố ý ghim lại để nó là quyết định chứ không phải bất ngờ:
+    # gom theo dải ngang nên hai cột bị trộn. Tách cột thuộc phạm vi sau.
+    boxes = []
+    for row in range(3):
+        boxes.append(_box(row * 2, 10, row * 60, text=f"T{row}"))
+        boxes.append(_box(row * 2 + 1, 500, row * 60, text=f"P{row}"))
+    assert build_full_text(sort_reading_order(boxes)) == "T0 P0\nT1 P1\nT2 P2"
+
+
+def test_prepare_image_rejects_a_decompression_bomb():
+    bomb = Image.new("RGB", (12000, 12000), "white")
+    buf = io.BytesIO()
+    bomb.save(buf, format="PNG")
+    with pytest.raises(ServiceError) as exc:
+        prepare_image(buf.getvalue(), max_side=2000, max_pixels=1_000_000)
+    assert exc.value.http_status == 422
+    assert "điểm ảnh" in exc.value.message
+
+
 def test_to_result_on_empty_output_gives_empty_text():
     result = to_result(RawOcrOutput(boxes=[]), scale=1.0)
     assert result.full_text == ""
@@ -4081,11 +4122,22 @@ class PreparedImage:
     height: int
 
 
-def prepare_image(data: bytes, max_side: int = 2000) -> PreparedImage:
+def prepare_image(data: bytes, max_side: int = 2000, max_pixels: int = 60_000_000) -> PreparedImage:
     """Xoay theo EXIF và giới hạn cạnh dài. `scale` để postprocess tính ngược toạ độ."""
     try:
         image = Image.open(io.BytesIO(data))
+        # Chặn TRƯỚC khi decode: Pillow chỉ tự ném khi vượt 2x MAX_IMAGE_PIXELS,
+        # nên một PNG 450KB giãn ra 144 triệu điểm ảnh vẫn lọt qua và ngốn RAM.
+        width, height = image.size
+        if width * height > max_pixels:
+            raise ServiceError(
+                ErrorCode.BAD_INPUT,
+                f"ảnh {width}x{height} vượt giới hạn {max_pixels} điểm ảnh",
+                422,
+            )
         image = ImageOps.exif_transpose(image).convert("RGB")
+    except ServiceError:
+        raise
     except Exception as exc:
         raise ServiceError(ErrorCode.BAD_INPUT, f"không đọc được ảnh: {exc}", 422) from exc
 
@@ -4143,8 +4195,20 @@ def _height(box: TextBox) -> float:
     return max(ys) - min(ys)
 
 
-def sort_reading_order(boxes: list[TextBox]) -> list[TextBox]:
-    """Gom box thành dòng theo tâm y, rồi sắp trái sang phải trong mỗi dòng."""
+def group_lines(boxes: list[TextBox]) -> list[list[TextBox]]:
+    """Gom box thành dòng theo tâm y, mỗi dòng sắp trái sang phải.
+
+    NGUỒN DUY NHẤT quyết định đâu là một dòng. Trước đây `sort_reading_order` và
+    `build_full_text` mỗi hàm tự gom một kiểu: hàm đầu neo vào box TRÊN CÙNG của
+    dòng, hàm sau neo vào box TRÁI NHẤT. Với chữ hơi nghiêng — đúng thứ xảy ra khi
+    chụp hoá đơn bằng điện thoại — hai mốc đó khác nhau, nên `full_text` ngắt dòng
+    một đằng còn thứ tự `boxes` một nẻo. Kết quả đọc vẫn xuôi tai nhưng chấm CER
+    thì sai, và model bị đổ oan.
+
+    Hạn chế đã biết: thuật toán này gom theo dải ngang, nên tài liệu HAI CỘT sẽ bị
+    trộn xen kẽ trái–phải từng dòng. Với hoá đơn một cột thì đúng; bố cục hai cột
+    cần tách cột trước (XY-cut) — chưa làm ở Plan A, xem test đánh dấu bên dưới.
+    """
     if not boxes:
         return []
     tolerance = statistics.median(_height(b) for b in boxes) * _LINE_TOLERANCE_RATIO
@@ -4154,35 +4218,36 @@ def sort_reading_order(boxes: list[TextBox]) -> list[TextBox]:
             lines[-1].append(box)
         else:
             lines.append([box])
-    ordered: list[TextBox] = []
-    for line in lines:
-        ordered.extend(sorted(line, key=_min_x))
-    return ordered
+    return [sorted(line, key=_min_x) for line in lines]
+
+
+def sort_reading_order(boxes: list[TextBox]) -> list[TextBox]:
+    return [box for line in group_lines(boxes) for box in line]
+
+
+def text_from_lines(lines: list[list[TextBox]]) -> str:
+    """Ghép theo dòng: cùng dòng nối bằng dấu cách, khác dòng xuống hàng."""
+    rendered = [
+        " ".join(box.text for box in line if not box.ignore) for line in lines
+    ]
+    return normalize_text("\n".join(line for line in rendered if line))
 
 
 def build_full_text(boxes: list[TextBox]) -> str:
-    """Ghép theo dòng: cùng dòng nối bằng dấu cách, khác dòng xuống hàng."""
-    kept = [b for b in boxes if not b.ignore]
-    if not kept:
-        return ""
-    tolerance = statistics.median(_height(b) for b in kept) * _LINE_TOLERANCE_RATIO
-    lines: list[list[str]] = []
-    previous: TextBox | None = None
-    for box in kept:
-        if previous is not None and abs(_y_center(box) - _y_center(previous)) <= tolerance:
-            lines[-1].append(box.text)
-        else:
-            lines.append([box.text])
-            previous = box
-    return normalize_text("\n".join(" ".join(line) for line in lines))
+    return text_from_lines(group_lines(boxes))
 
 
 def to_result(raw: RawOcrOutput, scale: float) -> OcrResult:
     factor = 1.0 / scale if scale else 1.0
     boxes = rescale_boxes(raw.boxes, factor)
     boxes = [b.model_copy(update={"text": normalize_text(b.text)}) for b in boxes]
-    boxes = sort_reading_order(boxes)
-    return OcrResult(full_text=build_full_text(boxes), boxes=boxes)
+    # Gom dòng đúng MỘT lần rồi dùng chung cho cả hai đầu ra: thứ tự box và
+    # full_text không thể lệch nhau nữa vì chúng sinh ra từ cùng một kết quả.
+    lines = group_lines(boxes)
+    return OcrResult(
+        full_text=text_from_lines(lines),
+        boxes=[box for line in lines for box in line],
+    )
 ```
 
 `services/ocr/src/ocr_service/pipeline/__init__.py` và `services/ocr/src/ocr_service/__init__.py`:
