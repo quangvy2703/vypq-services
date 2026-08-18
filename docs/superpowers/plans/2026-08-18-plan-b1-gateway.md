@@ -2752,7 +2752,16 @@ class SyncProxy:
         self._client = httpx.AsyncClient(timeout=timeout_s)
 
     async def fetch(self, uri: str) -> bytes:
-        response = await self._client.get(uri)
+        try:
+            response = await self._client.get(uri)
+        except (httpx.UnsupportedProtocol, httpx.InvalidURL) as exc:
+            # PHẢI bắt TRƯỚC TransportError: UnsupportedProtocol kế thừa từ nó.
+            # URI sai scheme hay sai định dạng thì thử lại bao nhiêu lần cũng
+            # hỏng y hệt — xếp vào hạ tầng sẽ làm consumer pause vô hạn và kẹt
+            # cả partition sau một URI hỏng, trong khi DLQ vẫn rỗng.
+            raise ServiceError(
+                ErrorCode.BAD_INPUT, f"URI không dùng được: {uri} ({exc})", 422
+            ) from exc
         if response.status_code >= 400:
             raise ServiceError(
                 ErrorCode.BAD_INPUT, f"tải {uri} thất bại ({response.status_code})", 422
