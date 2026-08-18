@@ -1,0 +1,11 @@
+host_name: gpu-1
+vram_budget_mb: 20000
+models:
+  - id: paddleocr-v4-vi
+    task: ocr
+    kind: opensource
+    runner: paddle
+    vram_mb: 2500
+    pinned: true
+    source: {type: hf, repo: PaddlePaddle/PP-OCRv4}
+    params: {lang: vi, use_angle_cls: true}

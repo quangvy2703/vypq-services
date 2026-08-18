@@ -1,0 +1,48 @@
+[project]
+name = "vypq-services"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["packages/*", "apps/*", "services/*"]
+# _template không phải service thật (token chưa thay thế) — loại khỏi workspace
+# để "uv sync" không cố build nó như một package thật.
+exclude = ["services/_template"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "respx>=0.21",
+    "ruff>=0.7",
+    "vypq-contracts",
+    "asgi-lifespan>=2.1",
+    "vypq-core",
+    "vypq-events",
+    "model-host",
+    "ocr-service",
+    "asr-service",
+    # <<< workspace members
+    "pillow>=10.4",
+]
+
+[tool.uv.sources]
+vypq-contracts = { workspace = true }
+vypq-core = { workspace = true }
+vypq-events = { workspace = true }
+model-host = { workspace = true }
+ocr-service = { workspace = true }
+asr-service = { workspace = true }
+# <<< workspace sources
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+# _template chứa token __XXX__ chưa thay thế — không phải Python thật (vd.
+# "port: int = __PORT__" là undefined-name), nên loại khỏi lint thay vì sửa nó.
+extend-exclude = ["services/_template"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]

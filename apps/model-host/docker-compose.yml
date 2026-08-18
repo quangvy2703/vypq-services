@@ -1,0 +1,25 @@
+services:
+  model-host-0:
+    build: {context: ../.., dockerfile: apps/model-host/Dockerfile}
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      VYPQ_HOST_NAME: gpu-0
+      VYPQ_TOKEN: ${VYPQ_TOKEN:?bat buoc dat VYPQ_TOKEN}
+    ports: ["9001:9000"]
+    deploy:
+      resources:
+        reservations:
+          # device_ids chứ không phải count: all — mỗi container phải thấy đúng
+          # một GPU. Nhân bản service này cho GPU thứ hai thì đổi thành ["1"].
+          devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    command: http model-host-0:9000
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:?bat buoc dat NGROK_AUTHTOKEN}
+    # Chỉ mở inspector cho localhost: cổng 4040 không có xác thực và hiện toàn bộ
+    # nội dung request đi qua tunnel — mở ra ngoài trên máy thuê là phát không
+    # ảnh và kết quả OCR cho bất kỳ ai quét cổng.
+    ports: ["127.0.0.1:4040:4040"]
+    depends_on: [model-host-0]

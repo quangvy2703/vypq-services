@@ -526,5 +526,46 @@ Làm trọn Plan A trước vì nó định ra contract mà B, C, D đều xây 
   thì dùng luôn, không cần viết thêm.
 - **Ngưỡng `vram_budget_mb`** đặt sau khi đo trên máy GPU thật. Không chặn việc triển khai:
   giá trị khởi đầu lấy 80% VRAM khả dụng, chỉnh sau bằng config.
+### Ghi nhận từ review tổng Plan A
+
+Những điểm dưới đây đã được cân nhắc và quyết định, ghi lại ở đây để không phải
+tranh luận lại — và để Plan B, C không vấp phải.
+
+- **`InferenceFailed` chưa ai publish.** Schema có sẵn, mang `eval_job_id` và
+  `dataset_item_id`, nhưng không chỗ nào dựng nó. Evaluator ở Plan C nộp N item
+  rồi chờ N sự kiện kết thúc sẽ **treo vĩnh viễn** khi có item hỏng, vì đường
+  DLQ chỉ chứa JSON thô. Plan C phải bổ sung: `EventConsumer` nhận thêm callback
+  `on_dead_letter`, worker dùng nó để phát `InferenceFailed` sang topic kết quả.
+- **Chấm điểm OCR phải tách hai tầng.** `OcrResult.boxes` giữ đủ box đã rescale
+  và chuẩn hoá NFC, nên detection (IoU/HMean) và recognition (CER từng box) chấm
+  được trực tiếp từ đó. Còn `full_text` đi qua heuristic gom dòng của service —
+  chấm CER trên nó là chỉ số **end-to-end**, hợp lệ, nhưng không được dùng để
+  kết luận model nào nhận dạng tốt hơn. Model trả box mức từ trên ảnh hơi nghiêng
+  sẽ bị trừ điểm vì cách gom dòng chứ không phải vì nhận dạng kém.
+- **Benchmark phải ghim `max_side` giống nhau giữa các model được so.**
+  `prepare_image` thu nhỏ ảnh xuống `max_side` TRƯỚC khi model nhìn thấy gì. Hai
+  lần chạy với `max_side` khác nhau đưa cho model hai bức ảnh khác nhau, nên
+  chênh lệch điểm không còn nói lên điều gì về model. Đây là biến gây nhiễu im
+  lặng, không có gì trong hệ thống hiện cảnh báo.
+- **`full_text` là chỉ số đường ống, không phải chỉ số nhận dạng** — mạnh hơn mức
+  đã nêu ở trên: `text_from_lines` còn bỏ hẳn dòng toàn box `ignore` và gộp
+  khoảng trắng trong dòng. Chấm nhận dạng thì dùng `boxes`.
+- **Bố cục hai cột bị trộn xen kẽ** (đã ghim bằng test). Cần tách cột kiểu XY-cut.
+  Ảnh hưởng trực tiếp tới CER trên hoá đơn nhiều cột ở Plan C.
+- **`@runtime_checkable` chỉ kiểm method có mặt, không kiểm chữ ký.** Plan B thay
+  `StaticHostRegistry` bằng bản discovery sau cùng Protocol này; một bản cài
+  `lease()` thành hàm sync vẫn lọt `isinstance`. Thêm kiểm tra conformance bằng
+  mypy khi bản đó ra đời.
+- **`HostRef.healthy` chưa từng được ghi ở đâu** — nó mới chỉ là hằng số đọc từ
+  config. Bản discovery của Plan B là chỗ đầu tiên thực sự cập nhật nó.
+- **`default_is_retryable` phân loại theo KIỂU exception, không theo `ErrorCode`.**
+  Có một chỗ `ServiceError(ErrorCode.UPSTREAM_ERROR)` cố ý bị dead-letter
+  (`_parse` khi model-host trả sai kiểu output — lỗi cấu hình, retry mãi chỉ kẹt
+  partition). Ai "dọn dẹp" cho `default_is_retryable` đọc `ErrorCode` sẽ lật
+  ngược cả hai và làm hỏng bảo đảm không-mất-dữ-liệu. Đừng làm.
+- **Cần metric và alert trên `dlq_publish_failed` + `consumer_paused`** trước khi
+  chạy không người trông. DLQ hỏng vĩnh viễn sẽ kẹt cả partition, im lặng.
+  Đây là bước 10 trong lộ trình Plan B.
+
 - **Nhà cung cấp GPU thuê** (Vast.ai, Runpod, ...) chưa chốt. Không ảnh hưởng thiết kế: yêu
   cầu duy nhất là chạy được Docker + có Internet ra ngoài. Chọn khi bắt đầu bước 2.
