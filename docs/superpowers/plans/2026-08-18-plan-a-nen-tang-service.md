@@ -4738,11 +4738,14 @@ class RemoteOcrBackend:
         return cached[1]
 
     async def infer(self, image: bytes, model_id: str) -> RawOcrOutput:
-        # pick() rồi mới lease(): giữa hai lời gọi không được có await nào, nếu
-        # không nhiều coroutine cùng đọc inflight cũ và dồn hết vào một host.
+        # Thứ tự bắt buộc: pick() -> lease() -> mọi thứ khác. `inflight` chỉ tăng
+        # lúc vào lease, nên bất kỳ await nào chen giữa pick và lease đều cho các
+        # coroutine khác đọc lại con số cũ và dồn hết vào cùng một host.
+        # _client_for() có await (đóng client cũ khi host đổi URL) nên phải nằm
+        # TRONG lease, không phải trước.
         host = await self._registry.pick(model_id)
-        client = await self._client_for(host)
         async with self._registry.lease(host):
+            client = await self._client_for(host)
             response = await client.request(
                 "POST",
                 "/v1/infer/upload",
@@ -4754,8 +4757,8 @@ class RemoteOcrBackend:
     async def infer_uri(self, uri: str, model_id: str) -> RawOcrOutput:
         host = await self._registry.pick(model_id)
         payload = InferRequest(model_id=model_id, input_uri=uri)
-        client = await self._client_for(host)
         async with self._registry.lease(host):
+            client = await self._client_for(host)
             response = await client.request(
                 "POST", "/v1/infer", json=payload.model_dump(mode="json")
             )
