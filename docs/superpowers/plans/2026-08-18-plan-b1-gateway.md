@@ -86,7 +86,9 @@ from vypq_contracts.gateway import (
     HostsResponse,
     InvokeMode,
     InvokeRequest,
+    InvokeResponse,
     RunRecord,
+    RunsResponse,
     RunStatus,
     ServiceInfo,
     ServiceState,
@@ -182,6 +184,42 @@ def test_invoke_mode_is_a_string_enum():
     assert f"{InvokeMode.ASYNC}" == "async"
 
 
+def test_empty_model_version_reads_back_as_none():
+    # Tầng DB lưu "" thay cho NULL để khoá duy nhất còn hiệu lực. Đọc lên phải
+    # về None, nếu không mọi chỗ kiểm `is None` sẽ trượt đúng những dòng đó.
+    run = RunRecord(
+        id="r1", trace_id="t1", service="ocr", model_version="",
+        mode=InvokeMode.ASYNC, status=RunStatus.PENDING, created_at=datetime.now(UTC),
+    )
+    assert run.model_version is None
+
+
+def test_async_invoke_response_has_no_run_id_yet():
+    # Đường async chưa tạo dòng runs: kết quả có thể về từ nhiều model version,
+    # mỗi cái một dòng. Người gọi tra lại bằng trace_id.
+    resp = InvokeResponse(trace_id="t1", mode=InvokeMode.ASYNC)
+    assert resp.run_id is None
+    assert resp.result is None
+
+
+def test_sync_invoke_response_carries_run_id_and_result():
+    resp = InvokeResponse(
+        trace_id="t1", mode=InvokeMode.SYNC, run_id="r1", result={"full_text": "a"}
+    )
+    assert resp.run_id == "r1"
+    assert resp.result["full_text"] == "a"
+
+
+def test_run_status_is_a_string_enum():
+    assert RunStatus.FAILED == "failed"
+    assert f"{RunStatus.FAILED}" == "failed"
+
+
+def test_runs_response_defaults_to_empty():
+    assert RunsResponse().runs == []
+    assert RunsResponse().total == 0
+
+
 def test_run_record_roundtrip():
     run = RunRecord(
         id="r1", trace_id="t1", service="ocr", model_version="m1",
@@ -206,7 +244,7 @@ from datetime import datetime
 from enum import StrEnum
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 from vypq_contracts.common import HealthStatus, Task
 from vypq_contracts.hosting import ModelInfo
@@ -297,6 +335,18 @@ class RunRecord(BaseModel):
     trace_id: str
     service: str
     model_version: str | None = None
+
+    @field_validator("model_version", mode="before")
+    @classmethod
+    def _empty_means_unknown(cls, value: str | None) -> str | None:
+        """Chuỗi rỗng và None là cùng một ý: chưa biết model nào.
+
+        Tầng DB buộc phải lưu "" chứ không NULL, vì SQL coi mọi NULL là khác
+        nhau nên khoá duy nhất (trace_id, model_version) sẽ không chặn được gì.
+        Không chuẩn hoá ở đây thì code phía sau kiểm `is None` sẽ trượt với
+        đúng những dòng đọc lên từ DB.
+        """
+        return value or None
     mode: InvokeMode
     status: RunStatus
     input_uri: str | None = None
@@ -314,7 +364,7 @@ class RunsResponse(BaseModel):
 - [ ] **Step 4: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-contracts -v`
-Mong đợi: 11 test mới PASS, toàn bộ test cũ vẫn PASS.
+Mong đợi: 16 test mới PASS, toàn bộ test cũ vẫn PASS.
 
 - [ ] **Step 5: Commit**
 
@@ -2248,7 +2298,7 @@ Mong đợi: tất cả PASS.
 
 **Interfaces:**
 - Consumes: model `Run` từ Task 3
-- Produces: `RunRepo(session)` — `await record(...) -> RunRecord`, `await list_runs(service=None, status=None, limit=50, offset=0) -> tuple[list[RunRecord], int]`, `await get(run_id) -> RunRecord | None`
+- Produces: `RunRepo(session)` — `await record(...) -> RunRecord`, `await list_runs(trace_id=None, service=None, status=None, limit=50, offset=0) -> tuple[list[RunRecord], int]`, `await get(run_id) -> RunRecord | None`
 
 **Vì sao khoá duy nhất là `(trace_id, model_version)`:** Kafka giao ít nhất một
 lần, nên cùng một kết quả có thể tới hai lần. Nhưng shadow-run cố tình cho nhiều
@@ -2321,6 +2371,18 @@ async def test_empty_model_version_still_deduplicates(session):
     await _record(repo, model="")
     _runs, total = await repo.list_runs()
     assert total == 1
+
+
+async def test_filter_by_trace_id_finds_every_model_version(session):
+    # Người gọi async chỉ cầm trace_id. Shadow-run cho nhiều model cùng xử lý,
+    # nên một trace_id phải tra ra đủ các dòng của nó.
+    repo = RunRepo(session)
+    await _record(repo, trace_id="t-chung", model="paddle-v4")
+    await _record(repo, trace_id="t-chung", model="vietocr-ft")
+    await _record(repo, trace_id="t-khac", model="paddle-v4")
+    runs, total = await repo.list_runs(trace_id="t-chung")
+    assert total == 2
+    assert {r.model_version for r in runs} == {"paddle-v4", "vietocr-ft"}
 
 
 async def test_filter_by_service_and_status(session):
@@ -2438,12 +2500,18 @@ class RunRepo:
     async def list_runs(
         self,
         *,
+        trace_id: str | None = None,
         service: str | None = None,
         status: RunStatus | None = None,
         limit: int = 50,
         offset: int = 0,
     ) -> tuple[list[RunRecord], int]:
         filters = []
+        if trace_id is not None:
+            # Đường async chỉ trả về trace_id, không trả run_id (kết quả có thể
+            # về từ nhiều model version). Thiếu bộ lọc này thì người gọi async
+            # không có cách nào tìm lại kết quả của chính mình.
+            filters.append(Run.trace_id == trace_id)
         if service is not None:
             filters.append(Run.service == service)
         if status is not None:
@@ -3139,6 +3207,14 @@ async def test_filter_by_service(ctx):
     assert (await client.get("/v1/runs?service=asr")).json()["total"] == 3
 
 
+async def test_filter_by_trace_id(ctx):
+    # Đây là cách duy nhất người gọi async tìm lại kết quả của mình.
+    client, factory = ctx
+    await _seed(factory, n=2, service="ocr")
+    body = (await client.get("/v1/runs?trace_id=ocr-ok-0")).json()
+    assert body["total"] == 1
+
+
 async def test_filter_by_status(ctx):
     client, factory = ctx
     await _seed(factory, n=2, status=RunStatus.OK)
@@ -3245,6 +3321,7 @@ def build_runs_router(session_factory) -> APIRouter:
 
     @router.get("/runs", response_model=RunsResponse)
     async def list_runs(
+        trace_id: str | None = None,
         service: str | None = None,
         status: RunStatus | None = None,
         limit: int = Query(default=50, ge=1, le=200),
@@ -3252,7 +3329,8 @@ def build_runs_router(session_factory) -> APIRouter:
     ) -> RunsResponse:
         async with session_factory() as session:
             runs, total = await RunRepo(session).list_runs(
-                service=service, status=status, limit=limit, offset=offset
+                trace_id=trace_id, service=service, status=status,
+                limit=limit, offset=offset,
             )
         return RunsResponse(runs=runs, total=total)
 
