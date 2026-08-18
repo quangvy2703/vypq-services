@@ -3877,8 +3877,9 @@ OCR ngang với bản thân model, nên phải có test chặt.
 
 **Files:**
 - Create: `services/ocr/pyproject.toml`
-- Create: `services/ocr/src/ocr_service/{__init__,settings}.py`
+- Create: `services/ocr/src/ocr_service/__init__.py`
 - Create: `services/ocr/src/ocr_service/pipeline/{__init__,preprocess,postprocess}.py`
+  (`settings.py` thuộc Task 11, không tạo ở đây)
 - Test: `services/ocr/tests/test_pipeline.py`
 
 **Interfaces:**
