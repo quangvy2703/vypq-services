@@ -119,10 +119,27 @@ testpaths = tests packages services apps
 asyncio_mode = auto
 markers =
     slow: cần GPU hoặc dịch vụ ngoài, không chạy mặc định
-addopts = -m "not slow" --strict-markers
+addopts = -m "not slow" --strict-markers --import-mode=importlib
 ```
 
-- [ ] **Step 2: Tạo package vypq-contracts rỗng**
+`--import-mode=importlib` là bắt buộc, không phải tuỳ chọn: plan có hai file `test_api.py`
+(`apps/model-host`, `services/ocr`) và hai file `test_pipeline.py` (`services/ocr`,
+`services/asr`). Với import-mode mặc định, pytest sinh tên module từ basename nên hai file
+trùng tên sẽ làm nó dừng với `import file mismatch`. Chế độ importlib sinh tên theo đường dẫn
+đầy đủ nên không va chạm. Đánh đổi: các file test **không** import được lẫn nhau
+(`from conftest import ...` sẽ hỏng), nên helper phải nằm ngay trong file test dùng nó.
+
+`testpaths` liệt kê cả `services` và `apps` — pytest dừng với lỗi nếu một đường dẫn trong đó
+không tồn tại, mà hai thư mục này phải đến Task 8 mới có. Tạo sẵn ở bước sau.
+
+- [ ] **Step 2: Tạo sẵn thư mục cho testpaths**
+
+```bash
+mkdir -p tests packages services apps
+touch services/.gitkeep apps/.gitkeep
+```
+
+- [ ] **Step 3: Tạo package vypq-contracts rỗng**
 
 `packages/vypq-contracts/pyproject.toml`:
 ```toml
@@ -145,7 +162,7 @@ packages = ["src/vypq_contracts"]
 __all__: list[str] = []
 ```
 
-- [ ] **Step 3: Viết test xác nhận workspace hoạt động**
+- [ ] **Step 4: Viết test xác nhận workspace hoạt động**
 
 `tests/test_workspace.py`:
 ```python
@@ -162,12 +179,12 @@ def test_contracts_package_importable():
     assert vypq_contracts.__all__ == []
 ```
 
-- [ ] **Step 4: Chạy test**
+- [ ] **Step 5: Chạy test**
 
 Chạy: `uv run pytest tests/test_workspace.py -v`
 Mong đợi: 2 PASS. Nếu `uv` chưa tải Python 3.12, nó tự tải ở lần chạy đầu.
 
-- [ ] **Step 5: Tạo Makefile**
+- [ ] **Step 6: Tạo Makefile**
 
 `Makefile`:
 ```makefile
@@ -182,10 +199,10 @@ fmt:
 	uv run ruff format .
 ```
 
-- [ ] **Step 6: Commit**
+- [ ] **Step 7: Commit**
 
 ```bash
-git add pyproject.toml .python-version pytest.ini Makefile packages tests
+git add pyproject.toml .python-version pytest.ini Makefile packages tests services apps
 git commit -m "chore: khởi tạo uv workspace và bộ khung test"
 ```
 
@@ -1521,7 +1538,7 @@ worker phải dừng consume, không được đẩy message vào DLQ.** Nếu l
 - Create: `packages/vypq-events/pyproject.toml`
 - Create: `packages/vypq-events/src/vypq_events/{__init__,topics,envelope,producer,consumer}.py`
 - Create: `packages/vypq-events/src/vypq_events/schemas/{__init__,inference}.py`
-- Test: `packages/vypq-events/tests/{conftest,test_topics,test_consumer}.py`
+- Test: `packages/vypq-events/tests/{test_topics,test_consumer}.py`
 
 **Interfaces:**
 - Consumes: `vypq_contracts.common.{ErrorCode, Task}`, `vypq_core.breaker.CircuitOpenError`, `vypq_core.http_client.UpstreamError`
@@ -1704,9 +1721,10 @@ __all__: list[str] = []
 Chạy: `uv run pytest packages/vypq-events/tests/test_topics.py -v`
 Mong đợi: 4 PASS
 
-- [ ] **Step 5: Viết fake Kafka cho test consumer**
+- [ ] **Step 5: Viết fake Kafka — đặt ngay đầu `test_consumer.py`**
 
-`packages/vypq-events/tests/conftest.py`:
+Không dùng `conftest.py`: `--import-mode=importlib` khiến `from conftest import ...` hỏng.
+Phần dưới đây là đầu file `packages/vypq-events/tests/test_consumer.py`:
 ```python
 from dataclasses import dataclass, field
 
@@ -1770,10 +1788,9 @@ class FakeProducer:
 
 - [ ] **Step 6: Viết test cho consumer**
 
-`packages/vypq-events/tests/test_consumer.py`:
+Tiếp nối cùng file `packages/vypq-events/tests/test_consumer.py`:
 ```python
 import pytest
-from conftest import TP, FakeConsumer, FakeMessage, FakeProducer
 
 from vypq_contracts.common import Task
 from vypq_core.breaker import CircuitOpenError
