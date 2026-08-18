@@ -26,6 +26,8 @@
   chiếu tới; member không ai tham chiếu sẽ không có trong venv và `import` sẽ hỏng. Root
   `pyproject.toml` có hai dòng đánh dấu `# <<< workspace members` và `# <<< workspace sources`
   để chèn vào đúng chỗ.
+- **`uv run ruff check .` phải sạch trước khi commit** (chạy `--fix` cho phần tự sửa được).
+  Không để cảnh báo tích lũy sang task sau.
 - Commit sau mỗi task. Message theo Conventional Commits, tiếng Anh cho prefix, mô tả tiếng Việt.
 
 ## File Structure
@@ -698,8 +700,14 @@ from vypq_core.logging import get_trace_id, set_trace_id
 SETTINGS = BaseServiceSettings(service_name="demo", version="9.9.9")
 
 
-def _client(app) -> httpx.AsyncClient:
-    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+def _client(app, *, raise_app_exceptions: bool = True) -> httpx.AsyncClient:
+    # raise_app_exceptions=False cần cho test handler `Exception`: Starlette gửi
+    # response xong vẫn raise lại exception gốc lên ASGI, và ASGITransport mặc
+    # định ném nó cho caller. Production dưới uvicorn không có vấn đề này.
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app, raise_app_exceptions=raise_app_exceptions),
+        base_url="http://t",
+    )
 
 
 async def test_health_is_ok_even_when_dependencies_are_down():
@@ -747,8 +755,14 @@ async def test_service_error_becomes_error_envelope_without_traceback():
     app = create_app(SETTINGS, routers=[router])
     async with _client(app) as c:
         resp = await c.get("/boom")
+    body = resp.json()
     assert resp.status_code == 422
-    assert resp.json() == {"code": "bad_input", "message": "ảnh hỏng", "trace_id": None}
+    assert body["code"] == "bad_input"
+    assert body["message"] == "ảnh hỏng"
+    # Middleware luôn gán trace_id, kể cả khi client không gửi — nếu không thì log
+    # của mọi request bình thường mất khả năng tương quan.
+    assert len(body["trace_id"]) == 32
+    assert resp.headers["x-trace-id"] == body["trace_id"]
 
 
 async def test_unexpected_exception_is_masked_as_internal():
@@ -759,12 +773,41 @@ async def test_unexpected_exception_is_masked_as_internal():
         raise RuntimeError("chi tiết nội bộ không được lộ ra")
 
     app = create_app(SETTINGS, routers=[router])
-    async with _client(app) as c:
+    async with _client(app, raise_app_exceptions=False) as c:
         resp = await c.get("/crash")
     body = resp.json()
     assert resp.status_code == 500
     assert body["code"] == "internal"
     assert "chi tiết nội bộ" not in body["message"]
+
+
+async def test_trace_id_is_generated_when_client_supplies_none():
+    router = APIRouter()
+
+    @router.get("/echo")
+    async def echo():
+        return {"seen": get_trace_id()}
+
+    app = create_app(SETTINGS, routers=[router])
+    async with _client(app) as c:
+        resp = await c.get("/echo")
+    # Cái log nhìn thấy và cái trả về header phải là một, nếu không thì vô dụng.
+    assert resp.json()["seen"] == resp.headers["x-trace-id"]
+    assert len(resp.headers["x-trace-id"]) == 32
+
+
+async def test_incoming_trace_id_header_is_reused_not_replaced():
+    router = APIRouter()
+
+    @router.get("/echo")
+    async def echo():
+        return {"seen": get_trace_id()}
+
+    app = create_app(SETTINGS, routers=[router])
+    async with _client(app) as c:
+        resp = await c.get("/echo", headers={"x-trace-id": "trace-tu-gateway"})
+    assert resp.json()["seen"] == "trace-tu-gateway"
+    assert resp.headers["x-trace-id"] == "trace-tu-gateway"
 
 
 def test_trace_id_defaults_to_dash_and_can_be_set():
@@ -929,6 +972,10 @@ def create_app(
 
     @app.middleware("http")
     async def _trace_middleware(request: Request, call_next):
+        # Luôn gán, kể cả khi client không gửi: log và error envelope đều lấy từ
+        # đây, nên gán có điều kiện sẽ làm mọi request thường mất trace trong log.
+        # Middleware này KHÔNG bắt exception — việc đó thuộc install_error_handlers,
+        # để chỉ có một chỗ dựng error envelope.
         trace = request.headers.get("x-trace-id") or uuid.uuid4().hex
         set_trace_id(trace)
         response = await call_next(request)
@@ -977,7 +1024,7 @@ __all__: list[str] = []
 - [ ] **Step 8: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-core -v`
-Mong đợi: 7 PASS
+Mong đợi: 9 PASS
 
 - [ ] **Step 9: Commit**
 
