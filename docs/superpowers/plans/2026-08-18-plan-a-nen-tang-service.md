@@ -372,6 +372,17 @@ def test_infer_response_does_not_silently_drop_half_of_a_mixed_payload():
         )
 
 
+def test_infer_response_rejects_wrong_output_type_built_in_python():
+    # model-host dựng InferResponse trực tiếp, không qua JSON — đường này cũng phải chặn.
+    with pytest.raises(ValidationError):
+        InferResponse(
+            model_id="m",
+            task=Task.ASR,
+            output=RawOcrOutput(boxes=[]),
+            timing=InferTiming(infer_ms=1),
+        )
+
+
 def test_model_info_defaults():
     info = ModelInfo(id="m1", task=Task.OCR, kind="opensource", runner="fake")
     assert info.loaded is False
@@ -574,16 +585,36 @@ class InferResponse(BaseModel):
         if not isinstance(data, dict):
             return data
         raw_task, output = data.get("task"), data.get("output")
-        if raw_task is None or not isinstance(output, dict):
+        if raw_task is None:
             return data
         expected = _OUTPUT_BY_TASK[Task(raw_task)]
+        if isinstance(output, BaseModel):
+            # Đường dựng thẳng trong Python: model-host tạo InferResponse với
+            # output=runner.predict(...). Không kiểm ở đây thì runner khai task=ocr
+            # mà trả RawAsrOutput vẫn lọt, vì union nhận cả hai.
+            if not isinstance(output, expected):
+                raise ValueError(
+                    f"output là {type(output).__name__} nhưng task={raw_task!r} "
+                    f"cần {expected.__name__}"
+                )
+            return data
+        if not isinstance(output, dict):
+            return data
+        allowed = set(expected.model_fields)
+        if unexpected := set(output) - allowed:
+            # RawOcrOutput/RawAsrOutput mặc định bỏ qua field lạ (extra="ignore"),
+            # nên nếu không chặn ở đây, field của task kia bị vứt lặng lẽ thay vì báo lỗi.
+            raise ValueError(
+                f"output có field {sorted(unexpected)} không hợp lệ với "
+                f"task={raw_task!r} (chỉ chấp nhận {sorted(allowed)})"
+            )
         return {**data, "output": expected.model_validate(output)}
 ```
 
 - [ ] **Step 7: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-contracts -v`
-Mong đợi: 15 PASS
+Mong đợi: 16 PASS
 
 - [ ] **Step 8: Commit**
 
