@@ -203,6 +203,24 @@ async def test_malformed_json_goes_to_dlq():
     assert producer.published[0][0] == "infer.ocr.dlq"
 
 
+async def test_pause_rewinds_every_partition_in_the_batch():
+    # commit() không tham số commit vị trí của MỌI partition được gán. Partition
+    # nào đã được getmany() trả record mà vòng lặp chưa chạy tới sẽ bị commit qua
+    # và mất record vĩnh viễn. Test 1 partition không bao giờ thấy lỗi này.
+    tp_a = TP("infer.ocr.requests", 0)
+    tp_b = TP("infer.ocr.requests", 1)
+
+    async def handler(_env):
+        raise UpstreamError("gpu chết")
+
+    kafka = FakeConsumer(batches=[{tp_a: [_msg(10)], tp_b: [_msg(20), _msg(21)]}])
+    c = _consumer(kafka, FakeProducer(), handler, max_attempts=1)
+    await c.run_once()
+
+    # Cả hai partition phải được tua về record chưa xử lý đầu tiên của chính nó.
+    assert dict(kafka.seeks) == {tp_a: 10, tp_b: 20}
+
+
 async def test_dlq_publish_failure_pauses_instead_of_killing_the_consumer():
     class BrokenProducer(FakeProducer):
         async def publish(self, topic, envelope, key=None):
