@@ -74,14 +74,10 @@ class EventConsumer:
             await self.run_once()
 
     async def run_once(self) -> int:
-        was_paused = self._paused_until is not None
+        # Vẫn gọi getmany() khi đang pause, không bỏ qua: consumer thật trả rỗng
+        # sau timeout_ms nên vòng lặp tự có nhịp, và aiokafka giữ được heartbeat
+        # với group. Bỏ poll đi thì run() quay tít không nghỉ.
         self._maybe_resume()
-        if was_paused:
-            # Đã (hoặc vừa) tạm dừng: không poll — một partition bị pause thật sự
-            # sẽ không nhận message nào từ Kafka. Lần gọi kế tiếp mới thật sự lấy
-            # batch mới, tránh xử lý lại ngay message vừa được resume xong.
-            await self._sleep(self._poll_ms / 1000)
-            return 0
         batch = await self._consumer.getmany(
             timeout_ms=self._poll_ms, max_records=self._max_records
         )

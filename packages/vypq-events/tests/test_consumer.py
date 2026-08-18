@@ -38,7 +38,10 @@ class FakeConsumer:
     _tp: TP = field(default_factory=lambda: TP("infer.ocr.requests", 0))
 
     async def getmany(self, timeout_ms: int = 1000, max_records: int | None = None):
-        if not self.batches:
+        # Consumer thật trả rỗng cho partition đang pause. Fake phải giống, nếu
+        # không test sẽ thấy message vẫn chảy vào lúc đang dừng, và ta sẽ đi sửa
+        # nhầm production code cho khớp một cái fake sai.
+        if self.paused_tps or not self.batches:
             return {}
         return self.batches.pop(0)
 
@@ -190,22 +193,30 @@ async def test_malformed_json_goes_to_dlq():
     assert producer.published[0][0] == "infer.ocr.dlq"
 
 
-async def test_stays_paused_until_pause_window_elapses():
+async def test_pause_stops_fetching_then_resumes_and_carries_on():
+    gpu_down = [True]
+
     async def handler(_env):
-        raise UpstreamError("gpu chết")
+        if gpu_down[0]:
+            raise UpstreamError("gpu chết")
 
     clock = Clock()
     producer = FakeProducer()
-    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]}, {TOPIC_TP: [_msg(0)]}])
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]}, {TOPIC_TP: [_msg(1)]}])
     c = _consumer(kafka, producer, handler, clock=clock, max_attempts=1, pause_seconds=10.0)
 
     await c.run_once()
     assert TOPIC_TP in kafka.paused_tps
+    assert len(kafka.batches) == 1            # batch sau chưa bị đụng tới
 
     clock.advance(5.0)
     await c.run_once()
     assert TOPIC_TP in kafka.paused_tps       # chưa hết cửa sổ chờ, vẫn dừng
+    assert len(kafka.batches) == 1            # và tuyệt đối không lấy thêm gì
 
+    gpu_down[0] = False
     clock.advance(6.0)
-    await c.run_once()
-    assert kafka.paused_tps == set()          # hết cửa sổ → tự resume để thử lại
+    processed = await c.run_once()
+    assert kafka.paused_tps == set()          # hết cửa sổ → resume
+    assert processed == 1                     # và tiêu thụ tiếp được
+    assert producer.published == []           # suốt quá trình không DLQ cái nào
