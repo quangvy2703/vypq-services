@@ -245,7 +245,8 @@ git commit -m "chore: khởi tạo uv workspace và bộ khung test"
   - `OcrResponse(trace_id, model_version, result: OcrResult, latency_ms)`
   - `Segment(start, end, text, speaker)`, `RawAsrOutput(segments)`, `AsrResult(text, segments)`, `AsrResponse(trace_id, model_version, result, latency_ms)`
   - `ModelInfo(id, task, kind, runner, loaded, available, vram_mb, base, trained_on)`, `ModelsResponse(host_name, models)`
-  - `InferRequest(model_id, input_uri, params)`, `InferTiming(load_ms, infer_ms)`, `InferResponse(model_id, task, output, timing)`
+  - `InferRequest(model_id, input_uri, params)`, `InferTiming(load_ms, infer_ms)`
+  - `InferResponse(model_id, task, output, timing)` — có `model_validator(mode="before")` chọn kiểu `output` theo `task`; wire format không đổi
 
 - [ ] **Step 1: Viết test trước cho common và ocr**
 
@@ -336,6 +337,39 @@ def test_infer_response_discriminates_asr_output():
     )
     parsed = InferResponse.model_validate_json(resp.model_dump_json())
     assert isinstance(parsed.output, RawAsrOutput)
+
+
+def test_infer_response_uses_task_when_output_is_empty():
+    # Payload rỗng khớp cả hai member của union; chỉ `task` mới phân biệt được.
+    resp = InferResponse.model_validate(
+        {"model_id": "m", "task": "asr", "output": {}, "timing": {"infer_ms": 1}}
+    )
+    assert isinstance(resp.output, RawAsrOutput)
+
+
+def test_infer_response_rejects_output_that_contradicts_task():
+    with pytest.raises(ValidationError):
+        InferResponse.model_validate(
+            {
+                "model_id": "m",
+                "task": "asr",
+                "output": {"boxes": [{"id": 0, "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                                      "text": "a"}]},
+                "timing": {"infer_ms": 1},
+            }
+        )
+
+
+def test_infer_response_does_not_silently_drop_half_of_a_mixed_payload():
+    with pytest.raises(ValidationError):
+        InferResponse.model_validate(
+            {
+                "model_id": "m",
+                "task": "asr",
+                "output": {"boxes": [], "segments": [{"start": 0, "end": 1, "text": "a"}]},
+                "timing": {"infer_ms": 1},
+            }
+        )
 
 
 def test_model_info_defaults():
@@ -479,15 +513,18 @@ class AsrResponse(BaseModel):
 ```python
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from vypq_contracts.asr import RawAsrOutput
 from vypq_contracts.common import ModelKind, Task
 from vypq_contracts.ocr import RawOcrOutput
 
-# Union thường: RawOcrOutput có 'boxes', RawAsrOutput có 'segments' — hai
-# trường rời nhau nên pydantic phân biệt được mà không cần discriminator.
 RawOutput = RawOcrOutput | RawAsrOutput
+
+_OUTPUT_BY_TASK: dict[Task, type[BaseModel]] = {
+    Task.OCR: RawOcrOutput,
+    Task.ASR: RawAsrOutput,
+}
 
 
 class ModelInfo(BaseModel):
@@ -523,12 +560,30 @@ class InferResponse(BaseModel):
     task: Task
     output: RawOutput
     timing: InferTiming
+
+    @model_validator(mode="before")
+    @classmethod
+    def _resolve_output_by_task(cls, data: Any) -> Any:
+        """Chọn kiểu output theo `task`, không để pydantic tự đoán.
+
+        RawOcrOutput và RawAsrOutput đều có field mặc định rỗng, nên payload `{}`
+        khớp member đầu tiên của union bất kể task là gì — model trả rỗng (ảnh
+        không có chữ) sẽ âm thầm ra RawOcrOutput ngay cả khi task=ASR. Payload
+        mang cả 'boxes' lẫn 'segments' còn tệ hơn: một nửa dữ liệu bị vứt lặng lẽ.
+        """
+        if not isinstance(data, dict):
+            return data
+        raw_task, output = data.get("task"), data.get("output")
+        if raw_task is None or not isinstance(output, dict):
+            return data
+        expected = _OUTPUT_BY_TASK[Task(raw_task)]
+        return {**data, "output": expected.model_validate(output)}
 ```
 
 - [ ] **Step 7: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-contracts -v`
-Mong đợi: 11 PASS
+Mong đợi: 15 PASS
 
 - [ ] **Step 8: Commit**
 
