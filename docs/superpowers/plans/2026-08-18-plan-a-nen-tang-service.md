@@ -1740,7 +1740,12 @@ import pytest
 
 from vypq_contracts.common import ModelKind, Task
 from vypq_contracts.hosting import ModelInfo
-from vypq_core.host_registry import HostRef, NoHostAvailableError, StaticHostRegistry
+from vypq_core.host_registry import (
+    HostRef,
+    HostRegistry,
+    NoHostAvailableError,
+    StaticHostRegistry,
+)
 
 
 def _model(mid: str, task: Task = Task.OCR, available: bool = True) -> ModelInfo:
@@ -1804,6 +1809,20 @@ async def test_lease_decrements_even_when_body_raises():
     assert host.inflight == 0
 
 
+def test_static_registry_satisfies_the_protocol():
+    # Nếu Protocol thiếu lease(), bản discovery ở Plan B có thể quên mà không ai biết.
+    assert isinstance(StaticHostRegistry([]), HostRegistry)
+
+
+def test_models_for_task_prefers_the_available_copy():
+    reg = StaticHostRegistry(
+        [_host("a", [_model("m1", available=False)]), _host("b", [_model("m1")])]
+    )
+    models = reg.models_for_task(Task.OCR)
+    assert len(models) == 1
+    assert models[0].available is True
+
+
 async def test_models_for_task_filters_and_dedupes():
     reg = StaticHostRegistry(
         [
@@ -1824,8 +1843,8 @@ Mong đợi: FAIL với `ModuleNotFoundError: No module named 'vypq_core.host_re
 
 `packages/vypq-core/src/vypq_core/host_registry.py`:
 ```python
-from contextlib import asynccontextmanager
-from typing import Protocol
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 
@@ -1855,10 +1874,14 @@ class HostRef(BaseModel):
         return any(m.id == model_id and m.available for m in self.models)
 
 
+@runtime_checkable
 class HostRegistry(Protocol):
     async def hosts(self) -> list[HostRef]: ...
     async def pick(self, model_id: str) -> HostRef: ...
     def models_for_task(self, task: Task) -> list[ModelInfo]: ...
+    # lease() phải nằm trong Protocol: Plan B thay bằng bản discovery, thiếu khai
+    # báo ở đây thì bản đó quên cài mà type checker không kêu, chỉ vỡ lúc chạy.
+    def lease(self, host: HostRef) -> AbstractAsyncContextManager[HostRef]: ...
 
 
 class StaticHostRegistry:
@@ -1880,7 +1903,13 @@ class StaticHostRegistry:
         seen: dict[str, ModelInfo] = {}
         for host in self._hosts:
             for model in host.models:
-                if model.task is task and model.id not in seen:
+                if model.task is not task:
+                    continue
+                current = seen.get(model.id)
+                # Ưu tiên bản available. Lấy host đầu tiên gặp sẽ báo model là
+                # unavailable chỉ vì nó tắt trên một host, trong khi host khác
+                # vẫn chạy được — tức là giấu mất năng lực đang có.
+                if current is None or (not current.available and model.available):
                     seen[model.id] = model
         return list(seen.values())
 
@@ -1896,7 +1925,7 @@ class StaticHostRegistry:
 - [ ] **Step 4: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-core/tests/test_host_registry.py -v`
-Mong đợi: 8 PASS
+Mong đợi: 10 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -4241,6 +4270,8 @@ class RemoteOcrBackend:
         return self._clients[host.name]
 
     async def infer(self, image: bytes, model_id: str) -> RawOcrOutput:
+        # pick() rồi mới lease(): giữa hai lời gọi không được có await nào, nếu
+        # không nhiều coroutine cùng đọc inflight cũ và dồn hết vào một host.
         host = await self._registry.pick(model_id)
         async with self._registry.lease(host):
             response = await self._client_for(host).request(
