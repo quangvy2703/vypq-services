@@ -4997,6 +4997,7 @@ from ocr_service.handler import OcrHandler
 from ocr_service.worker import OcrWorkerHandler, group_id
 from vypq_contracts.common import Task
 from vypq_contracts.ocr import RawOcrOutput, TextBox
+from vypq_core.errors import ServiceError
 from vypq_core.http_client import UpstreamError
 from vypq_events.envelope import EventEnvelope, RawEnvelope
 from vypq_events.schemas.inference import InferenceRequested
@@ -5104,6 +5105,45 @@ async def test_upstream_error_is_not_swallowed():
         await worker(_envelope())
 
 
+async def test_input_fetch_connection_error_is_retryable_not_dead_letter():
+    # Kho đối tượng chập chờn KHÔNG được làm cả hàng đợi rơi vào DLQ.
+    import httpx
+    import respx
+
+    from ocr_service.worker import fetch_bytes
+
+    with respx.mock:
+        respx.get("http://minio/a.png").mock(side_effect=httpx.ConnectError("mat ket noi"))
+        with pytest.raises(UpstreamError):
+            await fetch_bytes("http://minio/a.png")
+
+
+async def test_input_fetch_500_is_retryable():
+    import httpx
+    import respx
+
+    from ocr_service.worker import fetch_bytes
+
+    with respx.mock:
+        respx.get("http://minio/a.png").mock(return_value=httpx.Response(503))
+        with pytest.raises(UpstreamError):
+            await fetch_bytes("http://minio/a.png")
+
+
+async def test_input_fetch_404_is_permanent_and_goes_to_dlq():
+    # URI trỏ vào chỗ không tồn tại là dữ liệu hỏng thật, retry mãi vẫn hỏng.
+    import httpx
+    import respx
+
+    from ocr_service.worker import fetch_bytes
+
+    with respx.mock:
+        respx.get("http://minio/a.png").mock(return_value=httpx.Response(404))
+        with pytest.raises(ServiceError) as exc:
+            await fetch_bytes("http://minio/a.png")
+    assert not isinstance(exc.value, UpstreamError)
+
+
 async def test_nothing_is_published_when_inference_fails():
     producer = FakeProducer()
     worker = OcrWorkerHandler(
@@ -5143,8 +5183,10 @@ import httpx
 from ocr_service.backend.remote import RemoteOcrBackend
 from ocr_service.handler import OcrHandler
 from ocr_service.settings import OcrSettings, load_hosts
-from vypq_contracts.common import Task
+from vypq_contracts.common import ErrorCode, Task
+from vypq_core.errors import ServiceError
 from vypq_core.host_registry import StaticHostRegistry
+from vypq_core.http_client import UpstreamError
 from vypq_core.logging import get_logger, setup_logging
 from vypq_events.consumer import EventConsumer
 from vypq_events.envelope import EventEnvelope, RawEnvelope
@@ -5162,9 +5204,25 @@ def group_id(prefix: str, model_version: str | None) -> str:
 
 
 async def fetch_bytes(uri: str) -> bytes:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(uri)
-    response.raise_for_status()
+    """Tải input, PHÂN LOẠI ĐÚNG lỗi tải.
+
+    httpx trần ném ConnectError/TimeoutException — những lỗi này không phải
+    UpstreamError nên EventConsumer coi là dữ liệu hỏng và dead-letter ngay.
+    Hậu quả đo được: MinIO/R2 chập chờn vài giây là cả hàng đợi rơi vào DLQ,
+    dù chẳng có gì sai với dữ liệu. Kết nối hỏng và 5xx là sự cố hạ tầng →
+    UpstreamError → consumer dừng chờ. Chỉ 4xx mới thật sự là URI hỏng.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(uri)
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        raise UpstreamError(f"không tải được {uri}: {exc}") from exc
+    if response.status_code >= 500:
+        raise UpstreamError(f"{uri} trả {response.status_code}")
+    if response.status_code >= 400:
+        raise ServiceError(
+            ErrorCode.BAD_INPUT, f"{uri} trả {response.status_code}", http_status=422
+        )
     return response.content
 
 
@@ -5245,7 +5303,7 @@ if __name__ == "__main__":
 - [ ] **Step 5: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest services/ocr -v`
-Mong đợi: 27 + 7 = 34 PASS
+Mong đợi: 34 + 10 = 44 PASS
 
 - [ ] **Step 6: Viết Dockerfile cho service**
 
