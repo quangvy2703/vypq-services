@@ -4946,7 +4946,9 @@ host_discovery:
         - {id: paddleocr-v4-vi, task: ocr, kind: opensource, runner: paddle}
 ```
 
-`services/ocr/service.yaml`:
+`services/ocr/service.yaml` — `name` là SLUG chứ không phải task: hai service cùng
+task (ví dụ `ocr` và `ocr-handwriting`) phải có tên khác nhau, nếu không chúng
+trùng nhau trong registry của gateway. Topic thì đúng là theo task.
 ```yaml
 name: ocr
 port: 8001
@@ -5428,7 +5430,7 @@ thì service `asr` sinh ra sẽ import sai kiểu:
 
 | Token | Với `asr` | Với `ocr` |
 |---|---|---|
-| `__SLUG__` | `asr` | `ocr` |
+| `__SLUG__` | `asr` | `ocr` | ← tên service, KHÁC task khi có nhiều service cùng task |
 | `__PKG__` | `asr_service` | `ocr_service` |
 | `__TASK__` | `asr` | `ocr` |
 | `__TASKUPPER__` | `ASR` | `OCR` |
