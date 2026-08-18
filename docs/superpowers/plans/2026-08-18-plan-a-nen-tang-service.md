@@ -2254,6 +2254,7 @@ import pytest
 
 from vypq_contracts.common import Task
 from vypq_core.breaker import CircuitOpenError
+from vypq_core.host_registry import NoHostAvailableError
 from vypq_core.http_client import UpstreamError
 from vypq_events.consumer import EventConsumer
 from vypq_events.envelope import EventEnvelope
@@ -2332,7 +2333,15 @@ async def test_permanent_error_goes_to_dlq_and_processing_continues():
     assert kafka.seeks == []
 
 
-@pytest.mark.parametrize("exc", [CircuitOpenError("gpu"), UpstreamError("gpu chết")])
+@pytest.mark.parametrize(
+    "exc",
+    [
+        CircuitOpenError("gpu"),
+        UpstreamError("gpu chết"),
+        # Chưa đăng ký máy thuê, hoặc máy vừa tắt — hạ tầng, không phải dữ liệu.
+        NoHostAvailableError("m1"),
+    ],
+)
 async def test_retryable_exhaustion_pauses_and_seeks_back_without_dlq(exc):
     async def handler(_env):
         raise exc
@@ -2420,6 +2429,7 @@ Mong đợi: FAIL với `ModuleNotFoundError: No module named 'vypq_events.consu
 ```python
 from aiokafka import AIOKafkaProducer
 
+from vypq_core.http_client import UpstreamError
 from vypq_events.envelope import EventEnvelope
 
 
@@ -2436,9 +2446,15 @@ class EventProducer:
     async def publish(self, topic: str, envelope: EventEnvelope, key: str | None = None) -> None:
         # Partition key mặc định là trace_id → mọi event của một request cùng partition.
         partition_key = (key or envelope.trace_id).encode()
-        await self._producer.send_and_wait(
-            topic, envelope.model_dump_json().encode(), key=partition_key
-        )
+        try:
+            await self._producer.send_and_wait(
+                topic, envelope.model_dump_json().encode(), key=partition_key
+            )
+        except Exception as exc:
+            # aiokafka ném exception riêng của nó, không phải UpstreamError. Không
+            # bọc lại thì consumer coi là dữ liệu hỏng và dead-letter — mất luôn
+            # kết quả inference ĐÃ CHẠY XONG, tức là vứt đi thời gian GPU đã trả tiền.
+            raise UpstreamError(f"không publish được vào {topic}: {exc}") from exc
 ```
 
 - [ ] **Step 9: Viết consumer.py**
@@ -2452,6 +2468,7 @@ from collections.abc import Awaitable, Callable
 from aiokafka import AIOKafkaConsumer
 
 from vypq_core.breaker import CircuitOpenError
+from vypq_core.host_registry import NoHostAvailableError
 from vypq_core.http_client import UpstreamError
 from vypq_core.logging import get_logger, set_trace_id
 from vypq_events.envelope import EventEnvelope, RawEnvelope
@@ -2462,8 +2479,14 @@ Handler = Callable[[RawEnvelope], Awaitable[None]]
 
 
 def default_is_retryable(exc: Exception) -> bool:
-    """Lỗi của upstream thì đáng chờ; lỗi của dữ liệu thì không."""
-    return isinstance(exc, (CircuitOpenError, UpstreamError))
+    """Lỗi của upstream thì đáng chờ; lỗi của dữ liệu thì không.
+
+    NoHostAvailableError nằm ở đây vì "chưa có host khoẻ nào" là tình trạng hạ
+    tầng, không phải dữ liệu hỏng: máy GPU thuê chưa đăng ký xong, hoặc vừa hết
+    giờ và tắt. Xếp nhầm nó vào nhóm dữ liệu hỏng thì cả hàng đợi rơi vào DLQ
+    đúng lúc không có máy nào chạy — chính thảm hoạ mà cơ chế pause sinh ra để ngăn.
+    """
+    return isinstance(exc, (CircuitOpenError, UpstreamError, NoHostAvailableError))
 
 
 class _PauseSignal(Exception):
