@@ -18,6 +18,7 @@ dev = [
     "asgi-lifespan>=2.1",
     "vypq-core",
     "vypq-events",
+    "model-host",
     # <<< workspace members
 ]
 
@@ -25,6 +26,7 @@ dev = [
 vypq-contracts = { workspace = true }
 vypq-core = { workspace = true }
 vypq-events = { workspace = true }
+model-host = { workspace = true }
 # <<< workspace sources
 
 [tool.ruff]
