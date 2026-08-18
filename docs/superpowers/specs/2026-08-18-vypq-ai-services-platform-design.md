@@ -65,6 +65,10 @@ không GPU, và scale service = thêm container, không đụng đến VRAM.
 
 ### 3.2 model-host — nguồn sự thật về model
 
+**Máy GPU là tài nguyên thuê theo giờ, không phải hạ tầng cố định.** Nó sinh ra rồi biến mất,
+URL đổi mỗi lần thuê, và có thể có nhiều máy hoặc nhiều GPU cùng lúc. Toàn bộ thiết kế phía
+dưới coi "host biến mất" là sự kiện bình thường, không phải lỗi.
+
 `apps/model-host/models.yaml` là **nơi duy nhất** khai báo model nào tồn tại:
 
 ```yaml
@@ -98,6 +102,17 @@ model-host/models.yaml → GET /v1/models → services → gateway GET /info
 `model-host` quản lí VRAM: lazy load khi có request đầu tiên, evict LRU khi vượt
 `vram_budget_mb`, model `pinned` miễn trừ. Đây là nơi duy nhất trong hệ thống biết đến VRAM.
 
+**Hai kho lưu trữ tách biệt.** Máy thuê có Internet ra ngoài nhưng không với vào được MinIO
+trong mạng nội bộ, mà mỗi lần thuê máy mới nó phải tải lại vài GB weights:
+
+| Kho | Nội dung | Ai đọc |
+|---|---|---|
+| MinIO nội bộ | ảnh, audio, output, dataset | máy ứng dụng |
+| Object store ngoài (Cloudflare R2) | checkpoint fine-tune | máy GPU thuê |
+
+Chọn R2 vì egress miễn phí — tải weights lặp lại mỗi lần thuê máy chính là egress, S3 sẽ tính
+tiền đúng vào chỗ đó. Model open-source kéo thẳng từ HuggingFace, không cần kho riêng.
+
 API:
 
 - `POST /v1/infer` → `{model_id, input: {uri | b64}, params}` → `{model_id, output, timing}`
@@ -119,24 +134,71 @@ class OcrBackend(Protocol):
 - `RemoteBackend` — HTTP tới `model-host`. Dùng trong mọi môi trường thật.
 - `FakeBackend` — trả output cố định. Dùng cho unit test, chạy trong CI không cần GPU.
 
-`services/ocr/config.yaml` chỉ khai báo host, không khai báo model (model do host tự công bố):
+`services/ocr/config.yaml` **không khai báo host cố định** — host thuê theo giờ nên danh sách
+là động, lấy từ gateway (mục 3.4):
 
 ```yaml
-model_hosts:
-  - name: gpu-box-1
-    url: http://gpu-box:9001
-    timeout_s: 30
+host_discovery:
+  source: gateway              # gateway | static
+  url: http://gateway:8080/v1/hosts
+  refresh_s: 15
+  fallback_static: []          # dùng khi dev offline
 default_model: paddleocr-v4-vi
+transfer: inline               # inline | uri
+timeout_s: 60
+max_inline_mb: 25
 ```
 
-Service poll `GET /v1/models` của từng host và **lọc theo `task` khớp với capability của
-mình** — `services/ocr` chỉ nhận model có `task: ocr`. Nhờ vậy một model-host phục vụ được
-nhiều service mà không cần cấu hình chéo.
+`vypq_core.host_registry` cung cấp hai nguồn (`static`, `discovery`) sau cùng một interface,
+nên service không phụ thuộc vào sự tồn tại của gateway — chỉ là một URL trong config.
+
+Service lọc model **theo `task` khớp capability của mình** — `services/ocr` chỉ nhận model có
+`task: ocr`. Nhờ vậy một model-host phục vụ được nhiều service mà không cần cấu hình chéo.
+
+**Truyền dữ liệu tới model-host** có hai chế độ:
+
+- **`inline` (mặc định)** — gửi file qua `multipart/form-data`. Chạy được ở mọi topology, kể
+  cả khi máy GPU không với tới MinIO nội bộ. Dùng multipart chứ không base64: multipart gửi
+  binary nguyên vẹn, base64 phình 33%. Trường `b64` chỉ giữ để debug bằng `curl`.
+- **`uri`** — model-host tự tải từ MinIO. Chỉ dùng khi máy GPU cùng mạng với máy ứng dụng.
 
 Phần pre/post-processing (deskew, resize, gộp box, sắp thứ tự đọc, chuẩn hoá Unicode) nằm
 trong service — có test, có version. Đây là phần quyết định chất lượng OCR không kém model.
 
-### 3.4 Chịu lỗi khi model-host ở máy khác
+### 3.4 Host registry — máy GPU thuê theo giờ
+
+Gateway giữ danh sách host đang sống. Đăng ký lúc chạy, không nằm trong file config:
+
+```bash
+curl -X POST localhost:8080/v1/hosts -d '{
+  "name": "gpu-1", "url": "https://a1b2.ngrok.app", "token": "..."}'
+```
+
+Hoặc dán URL + token vào trang **Model Hosts** trên dashboard.
+
+**Chiều gọi:** gateway *poll ra* model-host (`GET /v1/models` và `/health`, mỗi 15s).
+Model-host **không** tự đăng ký ngược về. Lý do: máy ứng dụng cũng nằm sau NAT, còn ngrok chỉ
+mở một chiều vào máy GPU — poll ra là chiều duy nhất chạy được mà không phải phơi thêm gì
+ra Internet.
+
+- Host quá 45s không phản hồi → `offline`, gỡ khỏi bảng định tuyến.
+- Bảng định tuyến: `model_id → [host khoẻ]`. Chọn host **ít request đang chạy nhất**.
+- URL ngrok đổi mỗi lần thuê → đăng ký lại, không sửa file, không restart service.
+
+**Nhiều GPU: một container cho mỗi GPU.** Không viết code chia GPU trong `model-host`:
+
+```yaml
+model-host-0: {environment: [CUDA_VISIBLE_DEVICES=0], ports: ["9001:9000"]}
+model-host-1: {environment: [CUDA_VISIBLE_DEVICES=1], ports: ["9002:9000"]}
+```
+
+Mỗi container đăng ký là một host riêng, dùng lại đúng registry vốn đã cần cho nhiều máy.
+Một máy 4 GPU và bốn máy 1 GPU trông giống hệt nhau với gateway — không thêm dòng code nào.
+
+**Bảo mật.** ngrok đưa endpoint ra Internet công cộng và URL ngrok bị quét tự động rất nhanh.
+`model-host` bắt buộc kiểm bearer token ở middleware và **từ chối khởi động nếu token rỗng**.
+
+### 3.5 Chịu lỗi khi model-host ở máy khác
 
 Máy khác nghĩa là sẽ có lúc mạng đứt hoặc GPU quá tải. Thiết kế bắt buộc có:
 
@@ -150,7 +212,7 @@ Máy khác nghĩa là sẽ có lúc mạng đứt hoặc GPU quá tải. Thiết
   Nếu không, một lần GPU sập sẽ đổ toàn bộ hàng đợi vào DLQ và phải xử lý tay hàng nghìn item.
   Worker pause, chờ circuit đóng lại, rồi consume tiếp — message vẫn nằm nguyên trong topic.
 
-### 3.5 Hai transport, một lõi
+### 3.6 Hai transport, một lõi
 
 Mỗi service có hai entrypoint gọi chung một hàm xử lý:
 
@@ -159,7 +221,7 @@ Mỗi service có hai entrypoint gọi chung một hàm xử lý:
 
 Cả hai gọi `handler.handle(request) -> response`. Thêm transport mới không đụng vào backend.
 
-### 3.6 Event bus
+### 3.7 Event bus
 
 Broker: **Redpanda** (tương thích Kafka API, client `aiokafka`). Chọn vì 1 binary,
 không cần JVM/ZooKeeper.
@@ -185,7 +247,7 @@ không cần JVM/ZooKeeper.
   vì khác consumer group. Đây là chế độ shadow-run và là cách `evaluator` chạy benchmark —
   không cần code riêng cho việc so model.
 
-### 3.7 Service manifest
+### 3.8 Service manifest
 
 ```yaml
 # services/ocr/service.yaml
@@ -318,7 +380,7 @@ vypq-services/
 │   │       ├── metrics/            # text (CER/WER), detection (IoU/HMean), perf
 │   │       ├── runner.py  scoring.py  cli.py  api/
 │   └── dashboard/          # Next.js + TS + Tailwind + shadcn
-│       ├── app/            # services, playground/[slug], models,
+│       ├── app/            # services, hosts, playground/[slug], models,
 │       │                   # benchmarks + benchmarks/[evalId], history, metrics
 │       └── components/viewers/     # OcrViewer, AsrViewer, DiffViewer
 │
@@ -332,9 +394,12 @@ vypq-services/
 ```
 services(id, slug, base_url, capability, status, last_seen_at)
 
+model_hosts(id, name, url, token_enc, status, gpu_info_json,
+            registered_at, last_seen_at)          -- máy thuê: sinh ra rồi mất
+
 model_versions(id, service_slug, model_id, kind, runner, base_model_id,
-               source_uri, host_name, params_json, trained_on_dataset_id, registered_at)
-  UNIQUE(service_slug, model_id)
+               source_uri, host_id, params_json, trained_on_dataset_id, registered_at)
+  UNIQUE(service_slug, model_id, host_id)
 
 datasets(id, slug, task, size, storage_uri, scoring_json, created_at)
 dataset_items(id, dataset_id, item_id, input_uri, ground_truth_json)
@@ -359,11 +424,16 @@ nhiều so với một con số CER tổng hợp.
 `coverage` trên `eval_results` để không so nhầm model chạy đủ 500 item với model chỉ chạy
 được 430 vì lỗi.
 
+**Eval chạy tiếp được.** Máy GPU thuê theo giờ có thể tắt giữa chừng. `runner` bỏ qua mọi
+item đã có bản ghi trong `eval_item_results` cho cặp `(model_version_id, dataset_item_id)`,
+nên thuê máy mới rồi chạy lại đúng lệnh cũ là nó tiếp từ chỗ dừng. Thay đổi nhỏ về code
+nhưng đáng kể về chi phí: không trả tiền GPU để tính lại thứ đã tính.
+
 ## 7. Xử lý lỗi
 
 - Service trả error envelope thống nhất; lỗi 5xx không lộ traceback ra ngoài.
 - model-host không với tới được → circuit breaker mở → service `/ready` degraded →
-  gateway trả 503 rõ ràng; Kafka worker pause thay vì đổ DLQ (mục 3.4).
+  gateway trả 503 rõ ràng; Kafka worker pause thay vì đổ DLQ (mục 3.5).
 - Model không load được (thiếu checkpoint, hết VRAM) → model-host vẫn start, model đó
   đánh dấu `unavailable` trong `/v1/models`, không làm sập cả host.
 - Worker lỗi thật (input hỏng) → retry backoff → DLQ kèm nguyên nhân và event gốc.
@@ -388,38 +458,45 @@ nhiều so với một con số CER tổng hợp.
 
 Chia thành 4 plan độc lập, mỗi plan xong là dùng được thật.
 
+**Plan A — Nền tảng service** (6 bước) · **B — Gateway & Dashboard** (4) · **C — Benchmark** (3) · **D — Crawler** (1)
+
 **Plan A — Nền tảng service**
 
 | # | Việc | Kiểm chứng |
 |---|---|---|
 | 1 | `vypq-core`, `vypq-contracts`, `vypq-events` | Publish/consume một event qua Redpanda; DLQ và pause hoạt động |
-| 2 | `model-host` + runner `paddle` | Deploy lên máy GPU, `POST /v1/infer` với URI MinIO trả kết quả thô |
+| 2 | `model-host` + runner `paddle` + auth bearer | Deploy lên máy thuê, mở ngrok, `POST /v1/infer` multipart trả kết quả thô; gọi không token bị 401 |
 | 3 | `services/ocr`: RemoteBackend + FakeBackend + HTTP + pre/post | `curl` ảnh → bbox JSON đúng contract; test CI chạy không cần GPU |
 | 4 | `services/ocr`: Kafka worker + breaker + pause | Tắt model-host giữa chừng → worker pause, bật lại → chạy tiếp, không mất message |
 | 5 | `_template` + `new-service.sh` | Sinh service mới có sẵn hai entrypoint và hai backend |
 | 6 | `services/asr` + runner `whisper` | Dựng bằng chính script bước 5 |
 
+Trong Plan A, `host_discovery.source: static` — danh sách host lấy từ `fallback_static` trong
+config. Discovery động qua gateway đến ở bước 7. Nhờ vậy Plan A chạy và test được trọn vẹn
+mà chưa cần gateway tồn tại; đổi sang động sau chỉ là đổi một dòng config, không sửa code.
+
 **Plan B — Gateway & Dashboard**
 
 | # | Việc | Kiểm chứng |
 |---|---|---|
-| 7 | `gateway`: registry, sync, async, DB | `/services`, `/models`, `/invoke` cả hai mode |
-| 8 | `dashboard`: services, playground, models | Upload ảnh trên UI → bbox overlay, chọn được model |
-| 9 | Prometheus, Grafana, consumer lag | Biểu đồ latency, error, lag từng consumer group |
+| 7 | `gateway`: host registry + poll + routing, service registry, sync, async, DB | Đăng ký 2 host, tắt 1 → sau 45s tự gỡ khỏi routing, request vẫn chạy qua host còn lại |
+| 8 | `services`: chuyển sang `host_discovery.source: gateway` | Thêm host mới lúc service đang chạy → service tự thấy, không restart |
+| 9 | `dashboard`: hosts, services, playground, models | Dán URL ngrok vào UI → host lên xanh; upload ảnh → bbox overlay, chọn được model |
+| 10 | Prometheus, Grafana, consumer lag | Biểu đồ latency, error, lag từng consumer group |
 
 **Plan C — Benchmark**
 
 | # | Việc | Kiểm chứng |
 |---|---|---|
-| 10 | `evaluator`: format dataset, importer, `validate` | Import bộ test có sẵn, validate pass |
-| 11 | `evaluator`: metrics + runner + scoring | CER/WER đúng trên input đã biết đáp án, kể cả case NFD |
-| 12 | `dashboard/benchmarks`: leaderboard + diff | So Paddle vs VietOCR trên dataset thật, xem item sai |
+| 11 | `evaluator`: format dataset, importer, `validate` | Import bộ test có sẵn, validate pass |
+| 12 | `evaluator`: metrics + runner + scoring + resume | CER/WER đúng kể cả case NFD; giết runner giữa chừng, chạy lại → tiếp từ item dở |
+| 13 | `dashboard/benchmarks`: leaderboard + diff | So Paddle vs VietOCR trên dataset thật, xem item sai |
 
 **Plan D — Crawler** (repo `vypq-crawler`)
 
 | # | Việc | Kiểm chứng |
 |---|---|---|
-| 13 | Skeleton + 1 spider + `crawl.documents.ready` | Crawl → MinIO → OCR chạy tự động qua event |
+| 14 | Skeleton + 1 spider + `crawl.documents.ready` | Crawl → MinIO → OCR chạy tự động qua event |
 
 Làm trọn Plan A trước vì nó định ra contract mà B, C, D đều xây lên. Contract sai thì sửa
 ở A rẻ hơn nhiều so với sửa sau khi đã có dashboard.
@@ -435,7 +512,11 @@ Làm trọn Plan A trước vì nó định ra contract mà B, C, D đều xây 
 | Transport | Giữ cả HTTP và Kafka | HTTP cho playground (độ trễ thấp), Kafka cho batch/eval/crawler |
 | Nơi load model | `apps/model-host` trên máy GPU | Tách hẳn VRAM khỏi service; service stateless, scale và test dễ |
 | Nguồn sự thật về model | `model-host/models.yaml` | Một chỗ duy nhất; thêm checkpoint fine-tune = một khối YAML |
-| Truyền dữ liệu giữa 2 máy | MinIO URI | Base64 phình 33%, rất tệ với audio dài |
+| Truyền dữ liệu giữa 2 máy | multipart inline (mặc định), MinIO URI khi cùng mạng | Máy thuê không với tới MinIO nội bộ; multipart không phình như base64 |
+| Danh sách máy GPU | Registry động trong gateway, gateway poll ra | Máy thuê theo giờ, URL đổi liên tục; cả hai đầu đều sau NAT |
+| Nhiều GPU | Một container mỗi GPU, đăng ký thành host riêng | Không cần code chia GPU; máy 4 GPU giống hệt 4 máy 1 GPU |
+| Kho checkpoint | Object store ngoài (R2), tách khỏi MinIO nội bộ | Máy thuê phải tải lại weights mỗi lần; R2 miễn phí egress |
+| Truy cập máy GPU | ngrok + bearer token bắt buộc | Máy thuê không cài được VPN; URL ngrok bị quét tự động |
 | Ground truth | Format canonical JSONL + importer cắm thêm | Bộ test có sẵn quy về một định dạng, evaluator chỉ đọc một thứ |
 
 ## 11. Vấn đề còn mở
@@ -445,3 +526,5 @@ Làm trọn Plan A trước vì nó định ra contract mà B, C, D đều xây 
   thì dùng luôn, không cần viết thêm.
 - **Ngưỡng `vram_budget_mb`** đặt sau khi đo trên máy GPU thật. Không chặn việc triển khai:
   giá trị khởi đầu lấy 80% VRAM khả dụng, chỉnh sau bằng config.
+- **Nhà cung cấp GPU thuê** (Vast.ai, Runpod, ...) chưa chốt. Không ảnh hưởng thiết kế: yêu
+  cầu duy nhất là chạy được Docker + có Internet ra ngoài. Chọn khi bắt đầu bước 2.
