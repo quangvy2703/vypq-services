@@ -3734,17 +3734,23 @@ _register_optional()
 ```dockerfile
 FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
 
+# KHÔNG apt-get install python3.12: Ubuntu 22.04 chỉ có python3.10 trong repo
+# mặc định nên lệnh đó làm hỏng build. Để uv tự tải CPython 3.12 theo
+# .python-version — cùng đúng phiên bản đang chạy ở máy dev.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      python3.12 python3-pip libgl1 libglib2.0-0 curl \
+      ca-certificates curl libgl1 libglib2.0-0 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python UV_LINK_MODE=copy
 WORKDIR /app
 
-COPY pyproject.toml uv.lock ./
+COPY pyproject.toml uv.lock .python-version ./
 COPY packages ./packages
 COPY apps/model-host ./apps/model-host
-RUN uv sync --frozen --package model-host --extra gpu
+# Kèm cả nhóm dev để chạy được test chậm ngay trên máy GPU (bước 7). Bản build
+# thuần production thì thêm --no-dev cho ảnh gọn hơn.
+RUN uv sync --frozen --package model-host --extra gpu --group dev
 
 ENV VYPQ_MODELS_PATH=/app/apps/model-host/models.yaml \
     VYPQ_PORT=9000
@@ -3757,7 +3763,9 @@ CMD ["uv", "run", "uvicorn", "model_host.main:app", "--host", "0.0.0.0", "--port
 Thêm vào `apps/model-host/pyproject.toml`:
 ```toml
 [project.optional-dependencies]
-gpu = ["paddleocr>=2.9", "paddlepaddle-gpu>=2.6", "pillow>=10.4", "numpy>=1.26"]
+# Chặn trần paddleocr ở 3.0: bản 3.x đổi .ocr() thành .predict() với shape kết quả
+# khác hẳn, `uv lock --upgrade` sẽ âm thầm làm hỏng predict() nếu không khoá.
+gpu = ["paddleocr>=2.9,<3", "paddlepaddle-gpu>=2.6", "pillow>=10.4", "numpy>=1.26"]
 ```
 
 `apps/model-host/docker-compose.yml` — chạy trên máy GPU thuê, một container mỗi GPU:
@@ -3773,14 +3781,19 @@ services:
     deploy:
       resources:
         reservations:
-          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+          # device_ids chứ không phải count: all — mỗi container phải thấy đúng
+          # một GPU. Nhân bản service này cho GPU thứ hai thì đổi thành ["1"].
+          devices: [{driver: nvidia, device_ids: ["0"], capabilities: [gpu]}]
 
   ngrok:
     image: ngrok/ngrok:latest
     command: http model-host-0:9000
     environment:
       NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:?bat buoc dat NGROK_AUTHTOKEN}
-    ports: ["4040:4040"]
+    # Chỉ mở inspector cho localhost: cổng 4040 không có xác thực và hiện toàn bộ
+    # nội dung request đi qua tunnel — mở ra ngoài trên máy thuê là phát không
+    # ảnh và kết quả OCR cho bất kỳ ai quét cổng.
+    ports: ["127.0.0.1:4040:4040"]
     depends_on: [model-host-0]
 ```
 
