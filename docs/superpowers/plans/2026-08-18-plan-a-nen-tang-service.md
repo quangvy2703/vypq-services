@@ -1486,6 +1486,57 @@ async def test_cancelled_request_still_reports_to_the_breaker():
     assert breaker.state is CircuitState.OPEN
 
 
+class _CountingBreaker(CircuitBreaker):
+    """Đếm số lần báo để bắt regression double-report."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.calls: list[str] = []
+
+    def record_success(self) -> None:
+        self.calls.append("success")
+        super().record_success()
+
+    def record_failure(self) -> None:
+        self.calls.append("failure")
+        super().record_failure()
+
+
+@respx.mock
+async def test_exactly_one_breaker_report_on_every_exit_path():
+    respx.get(f"{BASE}/ok").mock(return_value=httpx.Response(200, json={}))
+    respx.get(f"{BASE}/bad").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE}/redir").mock(return_value=httpx.Response(302, headers={"location": "/z"}))
+    respx.get(f"{BASE}/down").mock(side_effect=httpx.ConnectError("x"))
+
+    cases = [("/ok", None), ("/bad", ServiceError), ("/redir", ServiceError),
+             ("/down", UpstreamError)]
+    for path, expected in cases:
+        breaker = _CountingBreaker(failure_threshold=99, recovery_timeout_s=30.0)
+        async with _client(max_attempts=1, breaker=breaker) as c:
+            if expected is None:
+                await c.request("GET", path)
+            else:
+                with pytest.raises(expected):
+                    await c.request("GET", path)
+        assert breaker.calls == [breaker.calls[0]], f"{path} báo {breaker.calls}"
+        assert len(breaker.calls) == 1, f"{path} báo {breaker.calls}"
+
+
+@respx.mock
+async def test_redirect_is_not_mistaken_for_success():
+    respx.get(f"{BASE}/v1/models").mock(
+        return_value=httpx.Response(302, headers={"location": "https://x/y"})
+    )
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_s=30.0)
+    async with _client(max_attempts=1, breaker=breaker) as c:
+        with pytest.raises(ServiceError) as exc:
+            await c.request("GET", "/v1/models")
+    assert "redirect" in exc.value.message
+    assert exc.value.http_status == 502
+    assert breaker.state is CircuitState.CLOSED       # host vẫn sống
+
+
 @respx.mock
 async def test_bearer_token_is_sent():
     captured: dict[str, str] = {}
@@ -1603,9 +1654,21 @@ class UpstreamClient:
                     )
                     last = UpstreamError(f"{self.base_url}: {exc}", code)
                 else:
-                    if response.status_code < 400:
-                        self.breaker.record_success()
+                    if 300 <= response.status_code < 400:
+                        # httpx không tự đi theo redirect. Hay gặp khi base_url để
+                        # http:// mà ngrok chuyển sang https:// — coi là thành công
+                        # thì downstream nhận body rỗng và vỡ ở chỗ khó lần ra.
                         reported = True
+                        self.breaker.record_success()
+                        raise ServiceError(
+                            ErrorCode.BAD_INPUT,
+                            f"upstream trả redirect {response.status_code} tới "
+                            f"{response.headers.get('location', '?')} — kiểm tra base_url",
+                            http_status=502,
+                        )
+                    if response.status_code < 400:
+                        reported = True
+                        self.breaker.record_success()
                         return response
                     if response.status_code >= 500 or response.status_code in _RETRYABLE_STATUS:
                         last = UpstreamError(f"{self.base_url} trả {response.status_code}")
@@ -1613,8 +1676,8 @@ class UpstreamClient:
                         # 4xx còn lại là lỗi của request, thử lại vẫn sai → không retry.
                         # Nhưng host phải còn sống mới trả được 4xx, nên record_success:
                         # thoát ra mà không báo gì sẽ để probe half-open treo.
-                        self.breaker.record_success()
                         reported = True
+                        self.breaker.record_success()
                         raise ServiceError(
                             ErrorCode.BAD_INPUT,
                             f"upstream từ chối ({response.status_code}): {response.text[:200]}",
@@ -1626,9 +1689,10 @@ class UpstreamClient:
                     await self._sleep(delay + self._jitter() * delay * 0.1)
                     log.warning("upstream_retry", url=self.base_url, attempt=attempt)
 
-            self.breaker.record_failure()
             reported = True
-            assert last is not None
+            self.breaker.record_failure()
+            if last is None:  # pragma: no cover - chỉ xảy ra nếu max_attempts < 1
+                raise ValueError(f"max_attempts phải >= 1, đang là {self._max_attempts}")
             raise last
         finally:
             if not reported:
@@ -1641,7 +1705,7 @@ class UpstreamClient:
 - [ ] **Step 4: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-core/tests/test_http_client.py -v`
-Mong đợi: 12 PASS
+Mong đợi: 14 PASS
 
 - [ ] **Step 5: Commit**
 
