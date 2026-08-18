@@ -148,6 +148,56 @@ async def test_cancelled_request_still_reports_to_the_breaker():
     assert breaker.state is CircuitState.OPEN
 
 
+class _CountingBreaker(CircuitBreaker):
+    """Đếm số lần báo để bắt regression double-report."""
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.calls: list[str] = []
+
+    def record_success(self) -> None:
+        self.calls.append("success")
+        super().record_success()
+
+    def record_failure(self) -> None:
+        self.calls.append("failure")
+        super().record_failure()
+
+
+@respx.mock
+async def test_exactly_one_breaker_report_on_every_exit_path():
+    respx.get(f"{BASE}/ok").mock(return_value=httpx.Response(200, json={}))
+    respx.get(f"{BASE}/bad").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE}/redir").mock(return_value=httpx.Response(302, headers={"location": "/z"}))
+    respx.get(f"{BASE}/down").mock(side_effect=httpx.ConnectError("x"))
+
+    cases = [("/ok", None), ("/bad", ServiceError), ("/redir", ServiceError),
+             ("/down", UpstreamError)]
+    for path, expected in cases:
+        breaker = _CountingBreaker(failure_threshold=99, recovery_timeout_s=30.0)
+        async with _client(max_attempts=1, breaker=breaker) as c:
+            if expected is None:
+                await c.request("GET", path)
+            else:
+                with pytest.raises(expected):
+                    await c.request("GET", path)
+        assert len(breaker.calls) == 1, f"{path} báo {breaker.calls}"
+
+
+@respx.mock
+async def test_redirect_is_not_mistaken_for_success():
+    respx.get(f"{BASE}/v1/models").mock(
+        return_value=httpx.Response(302, headers={"location": "https://x/y"})
+    )
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_s=30.0)
+    async with _client(max_attempts=1, breaker=breaker) as c:
+        with pytest.raises(ServiceError) as exc:
+            await c.request("GET", "/v1/models")
+    assert "redirect" in exc.value.message
+    assert exc.value.http_status == 502
+    assert breaker.state is CircuitState.CLOSED       # host vẫn sống
+
+
 @respx.mock
 async def test_bearer_token_is_sent():
     captured: dict[str, str] = {}

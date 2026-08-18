@@ -75,9 +75,21 @@ class UpstreamClient:
                     )
                     last = UpstreamError(f"{self.base_url}: {exc}", code)
                 else:
-                    if response.status_code < 400:
-                        self.breaker.record_success()
+                    if 300 <= response.status_code < 400:
+                        # httpx không tự đi theo redirect. Hay gặp khi base_url để
+                        # http:// mà ngrok chuyển sang https:// — coi là thành công
+                        # thì downstream nhận body rỗng và vỡ ở chỗ khó lần ra.
                         reported = True
+                        self.breaker.record_success()
+                        raise ServiceError(
+                            ErrorCode.BAD_INPUT,
+                            f"upstream trả redirect {response.status_code} tới "
+                            f"{response.headers.get('location', '?')} — kiểm tra base_url",
+                            http_status=502,
+                        )
+                    if response.status_code < 400:
+                        reported = True
+                        self.breaker.record_success()
                         return response
                     if response.status_code >= 500 or response.status_code in _RETRYABLE_STATUS:
                         last = UpstreamError(f"{self.base_url} trả {response.status_code}")
@@ -85,8 +97,8 @@ class UpstreamClient:
                         # 4xx còn lại là lỗi của request, thử lại vẫn sai → không retry.
                         # Nhưng host phải còn sống mới trả được 4xx, nên record_success:
                         # thoát ra mà không báo gì sẽ để probe half-open treo.
-                        self.breaker.record_success()
                         reported = True
+                        self.breaker.record_success()
                         raise ServiceError(
                             ErrorCode.BAD_INPUT,
                             f"upstream từ chối ({response.status_code}): {response.text[:200]}",
@@ -98,12 +110,15 @@ class UpstreamClient:
                     await self._sleep(delay + self._jitter() * delay * 0.1)
                     log.warning("upstream_retry", url=self.base_url, attempt=attempt)
 
-            self.breaker.record_failure()
             reported = True
-            assert last is not None
+            self.breaker.record_failure()
+            if last is None:  # pragma: no cover - chỉ xảy ra nếu max_attempts < 1
+                raise ValueError(f"max_attempts phải >= 1, đang là {self._max_attempts}")
             raise last
         finally:
             if not reported:
+                # `reported` được bật TRƯỚC khi gọi breaker, nên nếu lời gọi đó
+                # có ném thì ta bỏ sót một lần báo — thà vậy còn hơn báo hai lần.
                 # Lối thoát bất thường: CancelledError khi caller huỷ, lỗi lập trình,
                 # KeyboardInterrupt. Không báo lại thì probe half-open bị bỏ treo và
                 # phải mất hai chu kỳ recovery mới phục vụ lại được.
