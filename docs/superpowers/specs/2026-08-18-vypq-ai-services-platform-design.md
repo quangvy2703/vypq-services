@@ -542,6 +542,14 @@ tranh luận lại — và để Plan B, C không vấp phải.
   chấm CER trên nó là chỉ số **end-to-end**, hợp lệ, nhưng không được dùng để
   kết luận model nào nhận dạng tốt hơn. Model trả box mức từ trên ảnh hơi nghiêng
   sẽ bị trừ điểm vì cách gom dòng chứ không phải vì nhận dạng kém.
+- **Benchmark phải ghim `max_side` giống nhau giữa các model được so.**
+  `prepare_image` thu nhỏ ảnh xuống `max_side` TRƯỚC khi model nhìn thấy gì. Hai
+  lần chạy với `max_side` khác nhau đưa cho model hai bức ảnh khác nhau, nên
+  chênh lệch điểm không còn nói lên điều gì về model. Đây là biến gây nhiễu im
+  lặng, không có gì trong hệ thống hiện cảnh báo.
+- **`full_text` là chỉ số đường ống, không phải chỉ số nhận dạng** — mạnh hơn mức
+  đã nêu ở trên: `text_from_lines` còn bỏ hẳn dòng toàn box `ignore` và gộp
+  khoảng trắng trong dòng. Chấm nhận dạng thì dùng `boxes`.
 - **Bố cục hai cột bị trộn xen kẽ** (đã ghim bằng test). Cần tách cột kiểu XY-cut.
   Ảnh hưởng trực tiếp tới CER trên hoá đơn nhiều cột ở Plan C.
 - **`@runtime_checkable` chỉ kiểm method có mặt, không kiểm chữ ký.** Plan B thay
