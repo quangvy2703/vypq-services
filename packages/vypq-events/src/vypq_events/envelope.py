@@ -1,13 +1,10 @@
 import uuid
 from datetime import UTC, datetime
-from typing import Generic, TypeVar
 
 from pydantic import BaseModel, Field
 
-T = TypeVar("T", bound=BaseModel)
 
-
-class EventEnvelope(BaseModel, Generic[T]):  # noqa: UP046 — classic TypeVar/Generic kept intentionally (task-7 spec).
+class EventEnvelope[T: BaseModel](BaseModel):
     event_id: str
     event_type: str
     trace_id: str

@@ -153,7 +153,15 @@ class EventConsumer:
                 },
             ),
         )
-        await self._producer.publish(self._dlq_topic, dead)
+        try:
+            await self._producer.publish(self._dlq_topic, dead)
+        except Exception as dlq_exc:
+            # Không ghi được vào DLQ thì tuyệt đối không commit qua message này.
+            # Broker đang có vấn đề → coi như sự cố hạ tầng và dừng consume, giống
+            # hệt lúc upstream chết. Để exception bay tiếp thì nó không phải
+            # _PauseSignal, run_once() không bắt, và cả consumer chết đứng.
+            log.error("dlq_publish_failed", topic=self._dlq_topic, error=str(dlq_exc))
+            raise _PauseSignal from dlq_exc
         log.error("event_dead_lettered", topic=self._dlq_topic, reason=str(exc))
 
 

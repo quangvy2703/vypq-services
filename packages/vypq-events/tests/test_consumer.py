@@ -193,6 +193,23 @@ async def test_malformed_json_goes_to_dlq():
     assert producer.published[0][0] == "infer.ocr.dlq"
 
 
+async def test_dlq_publish_failure_pauses_instead_of_killing_the_consumer():
+    class BrokenProducer(FakeProducer):
+        async def publish(self, topic, envelope, key=None):
+            raise RuntimeError("broker chết")
+
+    async def handler(_env):
+        raise ValueError("dữ liệu hỏng")      # lỗi vĩnh viễn → đáng lẽ vào DLQ
+
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(7)]}])
+    c = _consumer(kafka, BrokenProducer(), handler, max_attempts=1)
+
+    processed = await c.run_once()            # không được ném ra ngoài
+    assert processed == 0
+    assert kafka.seeks == [(TOPIC_TP, 7)]     # giữ nguyên message, không bỏ qua
+    assert TOPIC_TP in kafka.paused_tps
+
+
 async def test_pause_stops_fetching_then_resumes_and_carries_on():
     gpu_down = [True]
 
