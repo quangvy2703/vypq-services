@@ -1,7 +1,12 @@
 import pytest
 from vypq_contracts.common import ModelKind, Task
 from vypq_contracts.hosting import ModelInfo
-from vypq_core.host_registry import HostRef, NoHostAvailableError, StaticHostRegistry
+from vypq_core.host_registry import (
+    HostRef,
+    HostRegistry,
+    NoHostAvailableError,
+    StaticHostRegistry,
+)
 
 
 def _model(mid: str, task: Task = Task.OCR, available: bool = True) -> ModelInfo:
@@ -63,6 +68,20 @@ async def test_lease_decrements_even_when_body_raises():
         async with reg.lease(host):
             raise RuntimeError("hỏng")
     assert host.inflight == 0
+
+
+def test_static_registry_satisfies_the_protocol():
+    # Nếu Protocol thiếu lease(), bản discovery ở Plan B có thể quên mà không ai biết.
+    assert isinstance(StaticHostRegistry([]), HostRegistry)
+
+
+def test_models_for_task_prefers_the_available_copy():
+    reg = StaticHostRegistry(
+        [_host("a", [_model("m1", available=False)]), _host("b", [_model("m1")])]
+    )
+    models = reg.models_for_task(Task.OCR)
+    assert len(models) == 1
+    assert models[0].available is True
 
 
 async def test_models_for_task_filters_and_dedupes():

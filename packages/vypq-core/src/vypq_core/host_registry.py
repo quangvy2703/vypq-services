@@ -1,5 +1,5 @@
-from contextlib import asynccontextmanager
-from typing import Protocol
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from typing import Protocol, runtime_checkable
 
 from pydantic import BaseModel, Field
 from vypq_contracts.common import ErrorCode, Task
@@ -29,10 +29,14 @@ class HostRef(BaseModel):
         return any(m.id == model_id and m.available for m in self.models)
 
 
+@runtime_checkable
 class HostRegistry(Protocol):
     async def hosts(self) -> list[HostRef]: ...
     async def pick(self, model_id: str) -> HostRef: ...
     def models_for_task(self, task: Task) -> list[ModelInfo]: ...
+    # lease() phải nằm trong Protocol: Plan B thay bằng bản discovery, thiếu khai
+    # báo ở đây thì bản đó quên cài mà type checker không kêu, chỉ vỡ lúc chạy.
+    def lease(self, host: HostRef) -> AbstractAsyncContextManager[HostRef]: ...
 
 
 class StaticHostRegistry:
@@ -54,7 +58,13 @@ class StaticHostRegistry:
         seen: dict[str, ModelInfo] = {}
         for host in self._hosts:
             for model in host.models:
-                if model.task is task and model.id not in seen:
+                if model.task is not task:
+                    continue
+                current = seen.get(model.id)
+                # Ưu tiên bản available. Lấy host đầu tiên gặp sẽ báo model là
+                # unavailable chỉ vì nó tắt trên một host, trong khi host khác
+                # vẫn chạy được — tức là giấu mất năng lực đang có.
+                if current is None or (not current.available and model.available):
                     seen[model.id] = model
         return list(seen.values())
 
