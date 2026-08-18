@@ -970,6 +970,7 @@ def create_app(
     readiness: Mapping[str, HealthCheck] | None = None,
     lifespan=None,
     expose_docs: bool = True,
+    expose_ready_detail: bool = True,
 ) -> FastAPI:
     setup_logging(settings.log_level)
     # /docs và /openapi.json nằm ngoài mọi router nên không dính dependency auth.
@@ -1019,7 +1020,10 @@ def create_app(
             status=overall,
             service=settings.service_name,
             version=settings.version,
-            detail=detail,
+            # /ready phải mở để probe hạ tầng gọi được, nên nó không qua auth.
+            # Với service phơi ra Internet thì trạng thái ok/degraded là đủ; tên
+            # check và chuỗi chẩn đoán bên trong không nên phát cho người lạ.
+            detail=detail if expose_ready_detail else {},
         )
         code = 200 if overall is HealthStatus.OK else 503
         return JSONResponse(status_code=code, content=body.model_dump(mode="json"))
@@ -3299,6 +3303,16 @@ async def test_file_uri_is_refused_by_default():
     assert "file://" in resp.json()["message"]
 
 
+async def test_ready_does_not_disclose_check_details():
+    # /ready mở cho probe nên không qua auth; vì thế không được kể chi tiết.
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app()), base_url="http://t"
+    ) as c:
+        resp = await c.get("/ready")
+    assert resp.status_code == 200
+    assert resp.json()["detail"] == {}
+
+
 async def test_docs_are_not_exposed_by_default():
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=_app()), base_url="http://t"
@@ -3355,6 +3369,7 @@ class ModelHostSettings(BaseServiceSettings):
     allow_file_uri: bool = False
     expose_docs: bool = False
     max_download_mb: int = 100
+    fetch_deadline_s: float = 60.0
 
     @field_validator("token")
     @classmethod
@@ -3390,6 +3405,7 @@ def make_token_dependency(expected: str):
 
 `apps/model-host/src/model_host/api/routes.py`:
 ```python
+import asyncio
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -3407,7 +3423,7 @@ from vypq_core.errors import ServiceError
 _SUPPORTED_SCHEMES = {"http", "https", "file"}
 
 
-async def _fetch(uri: str, *, allow_file: bool, max_bytes: int) -> bytes:
+async def _fetch(uri: str, *, allow_file: bool, max_bytes: int, deadline_s: float) -> bytes:
     scheme = urlparse(uri).scheme
     if scheme not in _SUPPORTED_SCHEMES:
         raise ServiceError(
@@ -3429,6 +3445,13 @@ async def _fetch(uri: str, *, allow_file: bool, max_bytes: int) -> bytes:
 
     # Đọc theo luồng và cắt khi vượt hạn: `response.content` nạp nguyên body vào
     # RAM, nên một URI trỏ tới file khổng lồ đủ để hạ cả máy GPU.
+    # timeout của httpx tính theo từng lần đọc, không phải toàn bộ request: một
+    # server nhỏ giọt dưới ngưỡng max_bytes có thể giữ connection vô hạn.
+    async with asyncio.timeout(deadline_s):
+        return await _stream(uri, max_bytes)
+
+
+async def _stream(uri: str, max_bytes: int) -> bytes:
     chunks: list[bytes] = []
     total = 0
     async with httpx.AsyncClient(timeout=30.0) as client:
@@ -3475,6 +3498,7 @@ def build_router(registry: ModelRegistry, settings: ModelHostSettings) -> APIRou
             request.input_uri,
             allow_file=settings.allow_file_uri,
             max_bytes=settings.max_download_mb * 1024 * 1024,
+            deadline_s=settings.fetch_deadline_s,
         )
         return _run(request.model_id, data, request.params)
 
@@ -3505,6 +3529,7 @@ def build_app():
         settings,
         routers=[build_router(registry, settings)],
         expose_docs=settings.expose_docs,
+        expose_ready_detail=False,
     )
 
 
@@ -3519,7 +3544,7 @@ __all__: list[str] = []
 - [ ] **Step 9: Chạy toàn bộ test model-host**
 
 Chạy: `uv run pytest apps/model-host -v`
-Mong đợi: 8 + 11 = 19 PASS
+Mong đợi: 8 + 12 = 20 PASS
 
 - [ ] **Step 10: Chạy thử host thật bằng fake runner**
 
