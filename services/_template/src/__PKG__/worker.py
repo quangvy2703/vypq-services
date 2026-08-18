@@ -38,6 +38,14 @@ async def fetch_bytes(uri: str) -> bytes:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(uri)
+    except (httpx.UnsupportedProtocol, httpx.InvalidURL) as exc:
+        # PHẢI bắt TRƯỚC TransportError: UnsupportedProtocol kế thừa từ nó.
+        # URI sai scheme hay sai định dạng thì thử lại bao nhiêu lần cũng hỏng
+        # y hệt — xếp vào hạ tầng sẽ làm consumer pause vô hạn và kẹt cả
+        # partition sau một URI hỏng, trong khi DLQ vẫn rỗng.
+        raise ServiceError(
+            ErrorCode.BAD_INPUT, f"URI không dùng được: {uri} ({exc})", http_status=422
+        ) from exc
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         raise UpstreamError(f"không tải được {uri}: {exc}") from exc
     if response.status_code >= 500:
