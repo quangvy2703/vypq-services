@@ -1,7 +1,7 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
-from gateway.db.models import Base
+from gateway.db.models import Base, Host
 from gateway.db.repo import HostRepo
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from vypq_contracts.common import ModelKind, Task
@@ -93,3 +93,57 @@ async def test_delete_removes_the_host(session):
 
 async def test_get_unknown_host_returns_none(session):
     assert await HostRepo(session).get("khong-co") is None
+
+
+async def test_non_utc_aware_datetime_round_trips_to_the_same_instant(session):
+    # +07:00 khác UTC 7 tiếng: nếu cột chỉ gắn nhãn UTC vào con số naive đọc lên
+    # từ SQLite (lỗi cũ), giờ đọc lại sẽ lệch 7 tiếng dù instant thực là như nhau.
+    repo = HostRepo(session)
+    await repo.upsert(HostRegistration(name="gpu-1", url="http://h:9000"))
+    row = await session.get(Host, "gpu-1")
+    plus7 = timezone(timedelta(hours=7))
+    written = datetime(2026, 1, 1, 10, 0, tzinfo=plus7)  # = 2026-01-01 03:00 UTC
+    row.last_seen_at = written
+    await session.commit()
+    session.expire_all()  # buộc SELECT lại thật, không dùng object đã có sẵn tzinfo
+
+    state = await repo.get("gpu-1")
+    assert state.last_seen_at.tzinfo is not None
+    assert state.last_seen_at == written  # so sánh instant, không so số giờ hiển thị
+    assert state.last_seen_at.astimezone(UTC) == datetime(2026, 1, 1, 3, 0, tzinfo=UTC)
+
+
+async def test_naive_datetime_is_rejected_instead_of_guessed(session):
+    # "10:00" không có múi giờ là mơ hồ; cột phải từ chối thay vì đoán hộ.
+    repo = HostRepo(session)
+    await repo.upsert(HostRegistration(name="gpu-1", url="http://h:9000"))
+    row = await session.get(Host, "gpu-1")
+    row.last_seen_at = datetime(2026, 1, 1, 10, 0)  # naive
+    with pytest.raises(Exception, match="tzinfo"):
+        await session.commit()
+
+
+async def test_registered_at_comes_back_aware(session):
+    # registered_at có cùng kiểu cột và cùng nguy cơ như last_seen_at, nhưng
+    # bản vá cũ ở call-site chỉ chạm last_seen_at — cột này từng bị bỏ sót.
+    repo = HostRepo(session)
+    await repo.upsert(HostRegistration(name="gpu-1", url="http://h:9000"))
+    session.expire_all()
+
+    row = await session.get(Host, "gpu-1")
+    assert row.registered_at.tzinfo is not None
+
+
+async def test_reregistering_same_url_with_new_token_keeps_health_and_models(session):
+    # Cùng URL nghĩa là cùng máy — chỉ đổi credential, không phải đổi máy. healthy
+    # và danh sách model đã biết phải giữ nguyên, khác với trường hợp đổi URL.
+    repo = HostRepo(session)
+    await repo.upsert(HostRegistration(name="gpu-1", url="http://h:9000", token="cu"))
+    await repo.mark_polled("gpu-1", healthy=True, models=[_model("a"), _model("b")], error=None)
+
+    await repo.upsert(HostRegistration(name="gpu-1", url="http://h:9000", token="moi"))
+
+    state = await repo.get("gpu-1")
+    assert state.healthy is True
+    assert [m.id for m in state.models] == ["a", "b"]
+    assert await repo.token_for("gpu-1") == "moi"

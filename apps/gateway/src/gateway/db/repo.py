@@ -9,25 +9,13 @@ from vypq_contracts.hosting import ModelInfo
 from gateway.db.models import Host
 
 
-def _as_aware_utc(value: datetime | None) -> datetime | None:
-    """SQLite không có kiểu datetime có timezone thật: một khi ORM identity map
-    mất tham chiếu mạnh tới row (hàm chứa nó return xong) và phải SELECT lại,
-    aiosqlite trả về giá trị "naive" dù cột khai `DateTime(timezone=True)` và ta
-    luôn ghi `datetime.now(UTC)`. Ta luôn ghi UTC nên gán lại tzinfo là đúng; nếu
-    không, so sánh với datetime aware khác (như trong test) sẽ ném TypeError.
-    Trên Postgres giá trị đọc lên vốn đã aware nên hàm này không đổi gì."""
-    if value is not None and value.tzinfo is None:
-        return value.replace(tzinfo=UTC)
-    return value
-
-
 def _to_state(row: Host) -> HostState:
     return HostState(
         name=row.name,
         url=row.url,
         healthy=row.healthy,
         models=[ModelInfo.model_validate(m) for m in (row.models_json or [])],
-        last_seen_at=_as_aware_utc(row.last_seen_at),
+        last_seen_at=row.last_seen_at,
         last_error=row.last_error,
     )
 
