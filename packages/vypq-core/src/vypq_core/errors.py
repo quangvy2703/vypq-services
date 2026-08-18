@@ -1,7 +1,7 @@
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
-
 from vypq_contracts.common import ErrorCode, ErrorResponse
+
 from vypq_core.logging import get_logger, get_trace_id
 
 log = get_logger(__name__)

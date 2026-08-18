@@ -1,19 +1,19 @@
-from enum import Enum
+from enum import StrEnum
 
 from pydantic import BaseModel, Field
 
 
-class Task(str, Enum):
+class Task(StrEnum):
     OCR = "ocr"
     ASR = "asr"
 
 
-class ModelKind(str, Enum):
+class ModelKind(StrEnum):
     OPENSOURCE = "opensource"
     FINETUNED = "finetuned"
 
 
-class ErrorCode(str, Enum):
+class ErrorCode(StrEnum):
     BAD_INPUT = "bad_input"
     MODEL_UNAVAILABLE = "model_unavailable"
     UPSTREAM_TIMEOUT = "upstream_timeout"
@@ -22,7 +22,7 @@ class ErrorCode(str, Enum):
     INTERNAL = "internal"
 
 
-class HealthStatus(str, Enum):
+class HealthStatus(StrEnum):
     OK = "ok"
     DEGRADED = "degraded"
     DOWN = "down"

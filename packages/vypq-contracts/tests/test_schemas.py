@@ -1,6 +1,5 @@
 import pytest
 from pydantic import ValidationError
-
 from vypq_contracts.asr import AsrResult, RawAsrOutput, Segment
 from vypq_contracts.common import ErrorCode, ErrorResponse, HealthStatus, Task
 from vypq_contracts.hosting import InferResponse, InferTiming, ModelInfo

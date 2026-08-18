@@ -3,13 +3,11 @@ from collections.abc import Awaitable, Callable, Mapping, Sequence
 
 from fastapi import APIRouter, FastAPI, Request
 from fastapi.responses import JSONResponse
+from vypq_contracts.common import HealthResponse, HealthStatus
 
-from vypq_contracts.common import ErrorCode, HealthResponse, HealthStatus
 from vypq_core.config import BaseServiceSettings
-from vypq_core.errors import _envelope, install_error_handlers
-from vypq_core.logging import get_logger, set_trace_id, setup_logging
-
-log = get_logger(__name__)
+from vypq_core.errors import install_error_handlers
+from vypq_core.logging import set_trace_id, setup_logging
 
 HealthCheck = Callable[[], Awaitable[tuple[HealthStatus, str]]]
 
@@ -29,24 +27,13 @@ def create_app(
 
     @app.middleware("http")
     async def _trace_middleware(request: Request, call_next):
-        # Chỉ gán trace_id (dùng cho log + error envelope) khi caller đã cung cấp
-        # sẵn qua header — nếu không, get_trace_id() giữ nguyên sentinel "-",
-        # khớp với hợp đồng "trace_id: null" khi client không truyền trace.
-        incoming = request.headers.get("x-trace-id")
-        if incoming:
-            set_trace_id(incoming)
-        trace = incoming or uuid.uuid4().hex
-        try:
-            response = await call_next(request)
-        except Exception as exc:
-            # An toàn bổ sung: với BaseHTTPMiddleware, Starlette đưa handler
-            # đăng ký cho `Exception` lên ServerErrorMiddleware — middleware đó
-            # gửi response xong vẫn "raise" lại exception gốc, khiến ASGI test
-            # client (mặc định raise_app_exceptions=True) lộ traceback ra ngoài
-            # thay vì trả JSONResponse. Bắt tại đây để đảm bảo hành vi ổn định,
-            # không phụ thuộc backend ASGI đang chạy.
-            log.exception("unhandled_error", error=str(exc))
-            response = _envelope(ErrorCode.INTERNAL, "internal server error", 500)
+        # Luôn gán, kể cả khi client không gửi: log và error envelope đều lấy từ
+        # đây, nên gán có điều kiện sẽ làm mọi request thường mất trace trong log.
+        # Middleware này KHÔNG bắt exception — việc đó thuộc install_error_handlers,
+        # để chỉ có một chỗ dựng error envelope.
+        trace = request.headers.get("x-trace-id") or uuid.uuid4().hex
+        set_trace_id(trace)
+        response = await call_next(request)
         response.headers["x-trace-id"] = trace
         return response
 
