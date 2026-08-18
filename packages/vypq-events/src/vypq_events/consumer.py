@@ -4,6 +4,7 @@ from collections.abc import Awaitable, Callable
 
 from aiokafka import AIOKafkaConsumer
 from vypq_core.breaker import CircuitOpenError
+from vypq_core.host_registry import NoHostAvailableError
 from vypq_core.http_client import UpstreamError
 from vypq_core.logging import get_logger, set_trace_id
 
@@ -15,8 +16,14 @@ Handler = Callable[[RawEnvelope], Awaitable[None]]
 
 
 def default_is_retryable(exc: Exception) -> bool:
-    """Lỗi của upstream thì đáng chờ; lỗi của dữ liệu thì không."""
-    return isinstance(exc, (CircuitOpenError, UpstreamError))
+    """Lỗi của upstream thì đáng chờ; lỗi của dữ liệu thì không.
+
+    NoHostAvailableError nằm ở đây vì "chưa có host khoẻ nào" là tình trạng hạ
+    tầng, không phải dữ liệu hỏng: máy GPU thuê chưa đăng ký xong, hoặc vừa hết
+    giờ và tắt. Xếp nhầm nó vào nhóm dữ liệu hỏng thì cả hàng đợi rơi vào DLQ
+    đúng lúc không có máy nào chạy — chính thảm hoạ mà cơ chế pause sinh ra để ngăn.
+    """
+    return isinstance(exc, (CircuitOpenError, UpstreamError, NoHostAvailableError))
 
 
 class _PauseSignal(Exception):

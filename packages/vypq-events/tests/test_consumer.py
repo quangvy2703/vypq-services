@@ -3,9 +3,11 @@ from dataclasses import dataclass, field
 import pytest
 from vypq_contracts.common import Task
 from vypq_core.breaker import CircuitOpenError
+from vypq_core.host_registry import NoHostAvailableError
 from vypq_core.http_client import UpstreamError
 from vypq_events.consumer import EventConsumer
 from vypq_events.envelope import EventEnvelope
+from vypq_events.producer import EventProducer
 from vypq_events.schemas.inference import InferenceRequested
 
 # Không dùng conftest.py: --import-mode=importlib khiến `from conftest import ...`
@@ -145,7 +147,15 @@ async def test_permanent_error_goes_to_dlq_and_processing_continues():
     assert kafka.seeks == []
 
 
-@pytest.mark.parametrize("exc", [CircuitOpenError("gpu"), UpstreamError("gpu chết")])
+@pytest.mark.parametrize(
+    "exc",
+    [
+        CircuitOpenError("gpu"),
+        UpstreamError("gpu chết"),
+        # Chưa đăng ký máy thuê, hoặc máy vừa tắt — hạ tầng, không phải dữ liệu.
+        NoHostAvailableError("m1"),
+    ],
+)
 async def test_retryable_exhaustion_pauses_and_seeks_back_without_dlq(exc):
     async def handler(_env):
         raise exc
@@ -237,3 +247,18 @@ async def test_pause_stops_fetching_then_resumes_and_carries_on():
     assert kafka.paused_tps == set()          # hết cửa sổ → resume
     assert processed == 1                     # và tiêu thụ tiếp được
     assert producer.published == []           # suốt quá trình không DLQ cái nào
+
+
+async def test_producer_wraps_broker_failure_as_upstream_error():
+    # Broker trục trặc lúc publish kết quả không được coi là dữ liệu hỏng:
+    # inference đã chạy xong rồi, dead-letter là vứt mất kết quả đã trả tiền.
+    class BrokenKafka:
+        async def send_and_wait(self, *_args, **_kwargs):
+            raise RuntimeError("broker mat ket noi")
+
+    producer = EventProducer(producer=BrokenKafka())
+    env = EventEnvelope[InferenceRequested].new(
+        "inference.requested", InferenceRequested(task=Task.OCR, input_uri="s3://b/a.jpg")
+    )
+    with pytest.raises(UpstreamError):
+        await producer.publish("infer.ocr.results", env)
