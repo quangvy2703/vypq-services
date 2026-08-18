@@ -13,7 +13,15 @@ class PaddleOcrRunner:
         self._engine = None
 
     def load(self, spec: ModelSpec) -> None:
-        from paddleocr import PaddleOCR  # import muộn: chỉ máy GPU mới có gói này
+        try:
+            # Import muộn: chỉ máy GPU mới có gói này, module vẫn phải import
+            # được ở mọi nơi để registry liệt kê được model.
+            from paddleocr import PaddleOCR
+        except ImportError as exc:
+            raise RuntimeError(
+                "thiếu extra 'gpu': chạy `uv sync --extra gpu` trên máy có CUDA. "
+                "Trên máy dev không GPU, dùng runner 'fake' trong models.dev.yaml."
+            ) from exc
 
         self._engine = PaddleOCR(
             lang=spec.params.get("lang", "vi"),
