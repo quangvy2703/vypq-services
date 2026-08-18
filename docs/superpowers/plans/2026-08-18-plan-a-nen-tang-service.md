@@ -1460,7 +1460,7 @@ async def test_4xx_does_not_trip_the_breaker():
 
 
 @respx.mock
-async def test_4xx_during_half_open_probe_closes_the_circuit():
+async def test_bad_input_4xx_during_half_open_probe_closes_the_circuit():
     # Host trả 4xx nghĩa là host còn sống. Nếu đường này thoát ra mà không báo
     # gì cho breaker, probe treo lại và circuit kẹt vĩnh viễn.
     respx.get(f"{BASE}/v1/models").mock(side_effect=httpx.ConnectError("chết"))
@@ -1471,7 +1471,7 @@ async def test_4xx_during_half_open_probe_closes_the_circuit():
             await c.request("GET", "/v1/models")
         assert breaker.state is CircuitState.OPEN
 
-        respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(404))
+        respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(422))
         clock.advance(31.0)
         with pytest.raises(ServiceError):
             await c.request("GET", "/v1/models")
@@ -1522,11 +1522,11 @@ class _CountingBreaker(CircuitBreaker):
 @respx.mock
 async def test_exactly_one_breaker_report_on_every_exit_path():
     respx.get(f"{BASE}/ok").mock(return_value=httpx.Response(200, json={}))
-    respx.get(f"{BASE}/bad").mock(return_value=httpx.Response(404))
+    respx.get(f"{BASE}/bad").mock(return_value=httpx.Response(422))
     respx.get(f"{BASE}/redir").mock(return_value=httpx.Response(302, headers={"location": "/z"}))
     respx.get(f"{BASE}/down").mock(side_effect=httpx.ConnectError("x"))
 
-    cases = [("/ok", None), ("/bad", ServiceError), ("/redir", ServiceError),
+    cases = [("/ok", None), ("/bad", ServiceError), ("/redir", UpstreamError),
              ("/down", UpstreamError)]
     for path, expected in cases:
         breaker = _CountingBreaker(failure_threshold=99, recovery_timeout_s=30.0)
@@ -1541,17 +1541,31 @@ async def test_exactly_one_breaker_report_on_every_exit_path():
 
 
 @respx.mock
-async def test_redirect_is_not_mistaken_for_success():
+@pytest.mark.parametrize("status", [401, 403, 404, 405, 302])
+async def test_infrastructure_statuses_pause_instead_of_dead_lettering(status):
+    # Máy thuê lại đổi token -> 401. Tunnel ngrok chết -> 404 từ edge ngrok.
+    # Đây là hạ tầng, không phải dữ liệu hỏng: phải là UpstreamError để consumer
+    # dừng chờ, và phải mở circuit để /ready báo degraded.
     respx.get(f"{BASE}/v1/models").mock(
-        return_value=httpx.Response(302, headers={"location": "https://x/y"})
+        return_value=httpx.Response(status, headers={"location": "https://x/y"})
     )
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_s=30.0)
+    async with _client(max_attempts=1, breaker=breaker) as c:
+        with pytest.raises(UpstreamError):
+            await c.request("GET", "/v1/models")
+    assert breaker.state is CircuitState.OPEN
+
+
+@respx.mock
+@pytest.mark.parametrize("status", [400, 413, 422])
+async def test_bad_input_statuses_stay_permanent(status):
+    respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(status))
     breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_s=30.0)
     async with _client(max_attempts=1, breaker=breaker) as c:
         with pytest.raises(ServiceError) as exc:
             await c.request("GET", "/v1/models")
-    assert "redirect" in exc.value.message
-    assert exc.value.http_status == 502
-    assert breaker.state is CircuitState.CLOSED       # host vẫn sống
+    assert not isinstance(exc.value, UpstreamError)
+    assert breaker.state is CircuitState.CLOSED      # host vẫn sống
 
 
 @respx.mock
@@ -1607,9 +1621,14 @@ from vypq_core.logging import get_logger
 
 log = get_logger(__name__)
 
-# 408 và 429 là 4xx nhưng nói về tình trạng upstream chứ không phải lỗi của request:
-# hết giờ và quá tải đều đáng thử lại có backoff, giống 5xx.
-_RETRYABLE_STATUS = frozenset({408, 429})
+# Những mã 4xx nói về HẠ TẦNG chứ không phải nội dung request: host còn sống
+# không, token còn đúng không, tunnel còn trỏ đúng chỗ không.
+#   401/403 — máy GPU thuê lại đổi token, hoặc token hết hạn
+#   404/405 — tunnel ngrok chết, edge của ngrok trả 404 thay cho host
+#   408/429 — hết giờ, quá tải
+# Xếp nhầm chúng vào "dữ liệu hỏng" thì đổi một cái token là cả hàng đợi đổ vào
+# DLQ trong vài giây, mà circuit vẫn đóng nên không hề có backpressure.
+_INFRA_STATUS = frozenset({401, 403, 404, 405, 408, 429})
 
 
 class UpstreamError(ServiceError):
@@ -1673,24 +1692,22 @@ class UpstreamClient:
                 else:
                     if 300 <= response.status_code < 400:
                         # httpx không tự đi theo redirect. Hay gặp khi base_url để
-                        # http:// mà ngrok chuyển sang https:// — coi là thành công
-                        # thì downstream nhận body rỗng và vỡ ở chỗ khó lần ra.
-                        reported = True
-                        self.breaker.record_success()
-                        raise ServiceError(
-                            ErrorCode.BAD_INPUT,
-                            f"upstream trả redirect {response.status_code} tới "
-                            f"{response.headers.get('location', '?')} — kiểm tra base_url",
-                            http_status=502,
+                        # http:// mà ngrok chuyển sang https://. Xếp vào hạ tầng:
+                        # dừng chờ và mở circuit để /ready báo degraded, còn hơn
+                        # đổ hàng đợi vào DLQ vì một dòng cấu hình sai.
+                        last = UpstreamError(
+                            f"{self.base_url} trả redirect {response.status_code} tới "
+                            f"{response.headers.get('location', '?')} — kiểm tra base_url"
                         )
-                    if response.status_code < 400:
+                    elif response.status_code < 400:
                         reported = True
                         self.breaker.record_success()
                         return response
-                    if response.status_code >= 500 or response.status_code in _RETRYABLE_STATUS:
+                    elif response.status_code >= 500 or response.status_code in _INFRA_STATUS:
                         last = UpstreamError(f"{self.base_url} trả {response.status_code}")
                     else:
-                        # 4xx còn lại là lỗi của request, thử lại vẫn sai → không retry.
+                        # 400/413/422 và các 4xx còn lại là lỗi của chính request,
+                        # thử lại vẫn sai → không retry.
                         # Nhưng host phải còn sống mới trả được 4xx, nên record_success:
                         # thoát ra mà không báo gì sẽ để probe half-open treo.
                         reported = True
