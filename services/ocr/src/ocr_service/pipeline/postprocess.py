@@ -49,7 +49,12 @@ def group_lines(boxes: list[TextBox]) -> list[list[TextBox]]:
     """
     if not boxes:
         return []
-    tolerance = statistics.median(_height(b) for b in boxes) * _LINE_TOLERANCE_RATIO
+    # Đo tolerance trên chữ THẬT, nhưng vẫn gom cả box bị bỏ qua vào dòng. Nếu
+    # tính median trên tất cả, một con dấu mờ cao 200px giữa các dòng chữ cao 20px
+    # sẽ kéo median lên 110, tolerance lên 66, và hai dòng chữ cách nhau 60px bị
+    # gộp làm một — im lặng, không lỗi, đúng loại tài liệu hệ thống này phục vụ.
+    measured = [b for b in boxes if not b.ignore] or boxes
+    tolerance = statistics.median(_height(b) for b in measured) * _LINE_TOLERANCE_RATIO
     lines: list[list[TextBox]] = []
     for box in sorted(boxes, key=_y_center):
         if lines and abs(_y_center(box) - _y_center(lines[-1][0])) <= tolerance:
@@ -64,7 +69,12 @@ def sort_reading_order(boxes: list[TextBox]) -> list[TextBox]:
 
 
 def text_from_lines(lines: list[list[TextBox]]) -> str:
-    """Ghép theo dòng: cùng dòng nối bằng dấu cách, khác dòng xuống hàng."""
+    """Ghép theo dòng: cùng dòng nối bằng dấu cách, khác dòng xuống hàng.
+
+    Dòng chỉ toàn box `ignore` bị bỏ hẳn thay vì để lại dòng trống — vùng không
+    đọc được không nên biến thành một dòng rỗng trong transcript. Hệ quả:
+    số dòng của `full_text` bằng số dòng CÓ CHỮ, không phải `len(lines)`.
+    """
     rendered = [
         " ".join(box.text for box in line if not box.ignore) for line in lines
     ]

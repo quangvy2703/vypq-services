@@ -128,8 +128,27 @@ def test_full_text_never_disagrees_with_box_order_on_jittered_text():
 
     assert ordered == [b for line in lines for b in line]
     assert build_full_text(ordered) == text_from_lines(lines)
-    # Số dòng trong full_text phải đúng bằng số dòng đã gom.
-    assert build_full_text(ordered).count("\n") + 1 == len(lines)
+    # Số dòng trong full_text bằng số dòng CÓ CHỮ (dòng toàn box ignore bị bỏ).
+    visible = [line for line in lines if any(not b.ignore for b in line)]
+    assert build_full_text(ordered).count("\n") + 1 == len(visible)
+
+
+def test_a_large_ignored_stamp_does_not_merge_real_lines():
+    # Con dấu mờ cao 200px cạnh chữ cao 20px: nếu tolerance tính cả nó thì hai
+    # dòng chữ cách nhau 60px bị gộp làm một.
+    boxes = [_box(0, 10, 0, text="LineA"), _box(1, 10, 60, text="LineB")]
+    for idx, y in ((2, 0), (3, 300)):
+        stamp = _box(idx, 400, y, w=200, h=200, text="")
+        stamp.ignore = True
+        boxes.append(stamp)
+    assert build_full_text(sort_reading_order(boxes)) == "LineA\nLineB"
+
+
+def test_a_fully_ignored_line_is_dropped_without_leaving_a_blank():
+    boxes = [_box(0, 10, 0, text="Tren"), _box(1, 10, 60, text=""),
+             _box(2, 10, 120, text="Duoi")]
+    boxes[1].ignore = True
+    assert build_full_text(sort_reading_order(boxes)) == "Tren\nDuoi"
 
 
 def test_two_column_layout_interleaves_columns_known_limitation():
@@ -142,12 +161,13 @@ def test_two_column_layout_interleaves_columns_known_limitation():
     assert build_full_text(sort_reading_order(boxes)) == "T0 P0\nT1 P1\nT2 P2"
 
 
-def test_prepare_image_rejects_a_decompression_bomb():
-    bomb = Image.new("RGB", (12000, 12000), "white")
+def test_prepare_image_rejects_an_oversized_image():
+    # Ảnh nhỏ + ngưỡng thấp: kiểm đúng hành vi mà không dựng ảnh 144 triệu điểm
+    # ảnh thật (tốn RAM trong CI và làm Pillow phun DecompressionBombWarning).
     buf = io.BytesIO()
-    bomb.save(buf, format="PNG")
+    Image.new("RGB", (2000, 2000), "white").save(buf, format="PNG")
     with pytest.raises(ServiceError) as exc:
-        prepare_image(buf.getvalue(), max_side=2000, max_pixels=1_000_000)
+        prepare_image(buf.getvalue(), max_side=2000, max_pixels=1_000)
     assert exc.value.http_status == 422
     assert "điểm ảnh" in exc.value.message
 
