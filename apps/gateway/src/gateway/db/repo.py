@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 from sqlalchemy import delete as sql_delete
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from vypq_contracts.gateway import HostRegistration, HostState
 from vypq_contracts.hosting import ModelInfo
@@ -27,6 +28,24 @@ class HostRepo:
         self._s = session
 
     async def upsert(self, reg: HostRegistration) -> HostState:
+        row = await self._load_and_apply(reg)
+        try:
+            await self._s.commit()
+        except IntegrityError:
+            # Hai box GPU đăng ký cùng một tên gần như đồng thời (ví dụ một
+            # script thuê rồi đăng ký nhiều máy liên tiếp) là vận hành bình
+            # thường, không phải lỗi. Đoạn read-modify-write ở trên có khe hở
+            # giữa SELECT và INSERT: cả hai request cùng thấy "chưa tồn tại"
+            # rồi cùng INSERT, bên thua thua cuộc đua trên khoá chính và nhận
+            # IntegrityError. Rollback rồi đọc lại — lần này sẽ thấy row mà
+            # bên thắng vừa chèn — và UPDATE nó thay vì INSERT lần nữa. Đăng
+            # ký đến sau thắng, y hệt như đăng ký lại tuần tự.
+            await self._s.rollback()
+            row = await self._load_and_apply(reg)
+            await self._s.commit()
+        return _to_state(row)
+
+    async def _load_and_apply(self, reg: HostRegistration) -> Host:
         row = await self._s.get(Host, reg.name)
         if row is None:
             row = Host(name=reg.name, registered_at=datetime.now(UTC))
@@ -40,8 +59,7 @@ class HostRepo:
             row.last_error = None
         row.url = reg.url
         row.token = reg.token
-        await self._s.commit()
-        return _to_state(row)
+        return row
 
     async def get(self, name: str) -> HostState | None:
         row = await self._s.get(Host, name)

@@ -1,3 +1,4 @@
+import asyncio
 from datetime import UTC, datetime, timedelta, timezone
 
 import pytest
@@ -10,14 +11,19 @@ from vypq_contracts.hosting import ModelInfo
 
 
 @pytest.fixture
-async def session():
+async def engine():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+async def session(engine):
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with factory() as s:
         yield s
-    await engine.dispose()
 
 
 def _model(mid: str = "m1") -> ModelInfo:
@@ -40,6 +46,28 @@ async def test_upsert_twice_updates_url_instead_of_duplicating(session):
     hosts = await repo.list_all()
     assert len(hosts) == 1
     assert hosts[0].url == "http://moi:9000"
+
+
+async def test_concurrent_upsert_of_a_new_name_does_not_500(engine):
+    # Thuê hai box rồi đăng ký gần như đồng thời từ một script là chuyện bình
+    # thường: get-then-insert của upsert có khe hở đua nhau trên cùng khoá
+    # chính. Mỗi task phải dùng session riêng — dùng chung một AsyncSession
+    # giữa các task cũng không an toàn, nên bài test dựng hai session độc lập
+    # từ cùng một factory, giống hệt hai request HTTP song song thật sự.
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async def register():
+        async with factory() as s:
+            return await HostRepo(s).upsert(
+                HostRegistration(name="gpu-race", url="http://h:9000", token="t")
+            )
+
+    results = await asyncio.gather(register(), register())
+    assert all(r.name == "gpu-race" for r in results)
+
+    async with factory() as s:
+        hosts = await HostRepo(s).list_all()
+    assert [h.name for h in hosts] == ["gpu-race"]
 
 
 async def test_reregistering_resets_health_until_polled_again(session):

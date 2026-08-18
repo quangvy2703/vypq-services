@@ -1,6 +1,7 @@
 import httpx
 import pytest
 from fastapi import APIRouter
+from pydantic import BaseModel
 from vypq_contracts.common import ErrorCode, HealthStatus
 from vypq_core.app import create_app
 from vypq_core.config import BaseServiceSettings
@@ -89,6 +90,38 @@ async def test_unexpected_exception_is_masked_as_internal():
     assert resp.status_code == 500
     assert body["code"] == "internal"
     assert "chi tiết nội bộ" not in body["message"]
+
+
+class _Registration(BaseModel):
+    name: str
+    url: str
+    token: str | None = None
+
+
+SECRET = "SUPER-SECRET-TOKEN-XYZ123"
+
+
+async def test_malformed_body_does_not_echo_back_a_submitted_secret():
+    router = APIRouter()
+
+    @router.post("/v1/hosts")
+    async def register(reg: _Registration) -> _Registration:
+        return reg
+
+    app = create_app(SETTINGS, routers=[router])
+    async with _client(app) as c:
+        # `url` bị thiếu, nhưng `token` mang một bí mật cụ thể — FastAPI mặc
+        # định sẽ nhét nguyên `input` (bao gồm token) vào từng lỗi 422.
+        resp = await c.post("/v1/hosts", json={"name": "gpu-2", "token": SECRET})
+
+    assert resp.status_code == 422
+    body = resp.json()
+    assert body["code"] == "bad_input"
+    # Đúng chuẩn envelope của nền tảng, không phải shape `detail` mặc định của FastAPI.
+    assert set(body.keys()) == {"code", "message", "trace_id"}
+    assert SECRET not in resp.text
+    # Vẫn phải nêu tên trường sai để còn debug được, chỉ là không được lộ giá trị.
+    assert "url" in body["message"]
 
 
 async def test_trace_id_is_generated_when_client_supplies_none():
