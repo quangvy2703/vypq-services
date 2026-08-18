@@ -1,4 +1,4 @@
-name: __TASK__
+name: __SLUG__
 port: __PORT__
 capability: {input: bytes, output: json}
 consumes: [infer.__TASK__.requests]
