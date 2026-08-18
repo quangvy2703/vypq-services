@@ -1323,7 +1323,7 @@ class CircuitBreaker:
 - [ ] **Step 4: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-core/tests/test_breaker.py -v`
-Mong đợi: 15 PASS
+Mong đợi: 17 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -4066,8 +4066,27 @@ def test_full_text_never_disagrees_with_box_order_on_jittered_text():
 
     assert ordered == [b for line in lines for b in line]
     assert build_full_text(ordered) == text_from_lines(lines)
-    # Số dòng trong full_text phải đúng bằng số dòng đã gom.
-    assert build_full_text(ordered).count("\n") + 1 == len(lines)
+    # Số dòng trong full_text bằng số dòng CÓ CHỮ (dòng toàn box ignore bị bỏ).
+    visible = [line for line in lines if any(not b.ignore for b in line)]
+    assert build_full_text(ordered).count("\n") + 1 == len(visible)
+
+
+def test_a_large_ignored_stamp_does_not_merge_real_lines():
+    # Con dấu mờ cao 200px cạnh chữ cao 20px: nếu tolerance tính cả nó thì hai
+    # dòng chữ cách nhau 60px bị gộp làm một.
+    boxes = [_box(0, 10, 0, text="LineA"), _box(1, 10, 60, text="LineB")]
+    for idx, y in ((2, 0), (3, 300)):
+        stamp = _box(idx, 400, y, w=200, h=200, text="")
+        stamp.ignore = True
+        boxes.append(stamp)
+    assert build_full_text(sort_reading_order(boxes)) == "LineA\nLineB"
+
+
+def test_a_fully_ignored_line_is_dropped_without_leaving_a_blank():
+    boxes = [_box(0, 10, 0, text="Tren"), _box(1, 10, 60, text=""),
+             _box(2, 10, 120, text="Duoi")]
+    boxes[1].ignore = True
+    assert build_full_text(sort_reading_order(boxes)) == "Tren\nDuoi"
 
 
 def test_two_column_layout_interleaves_columns_known_limitation():
@@ -4080,12 +4099,13 @@ def test_two_column_layout_interleaves_columns_known_limitation():
     assert build_full_text(sort_reading_order(boxes)) == "T0 P0\nT1 P1\nT2 P2"
 
 
-def test_prepare_image_rejects_a_decompression_bomb():
-    bomb = Image.new("RGB", (12000, 12000), "white")
+def test_prepare_image_rejects_an_oversized_image():
+    # Ảnh nhỏ + ngưỡng thấp: kiểm đúng hành vi mà không dựng ảnh 144 triệu điểm
+    # ảnh thật (tốn RAM trong CI và làm Pillow phun DecompressionBombWarning).
     buf = io.BytesIO()
-    bomb.save(buf, format="PNG")
+    Image.new("RGB", (2000, 2000), "white").save(buf, format="PNG")
     with pytest.raises(ServiceError) as exc:
-        prepare_image(buf.getvalue(), max_side=2000, max_pixels=1_000_000)
+        prepare_image(buf.getvalue(), max_side=2000, max_pixels=1_000)
     assert exc.value.http_status == 422
     assert "điểm ảnh" in exc.value.message
 
@@ -4211,7 +4231,12 @@ def group_lines(boxes: list[TextBox]) -> list[list[TextBox]]:
     """
     if not boxes:
         return []
-    tolerance = statistics.median(_height(b) for b in boxes) * _LINE_TOLERANCE_RATIO
+    # Đo tolerance trên chữ THẬT, nhưng vẫn gom cả box bị bỏ qua vào dòng. Nếu
+    # tính median trên tất cả, một con dấu mờ cao 200px giữa các dòng chữ cao 20px
+    # sẽ kéo median lên 110, tolerance lên 66, và hai dòng chữ cách nhau 60px bị
+    # gộp làm một — im lặng, không lỗi, đúng loại tài liệu hệ thống này phục vụ.
+    measured = [b for b in boxes if not b.ignore] or boxes
+    tolerance = statistics.median(_height(b) for b in measured) * _LINE_TOLERANCE_RATIO
     lines: list[list[TextBox]] = []
     for box in sorted(boxes, key=_y_center):
         if lines and abs(_y_center(box) - _y_center(lines[-1][0])) <= tolerance:
@@ -4226,7 +4251,12 @@ def sort_reading_order(boxes: list[TextBox]) -> list[TextBox]:
 
 
 def text_from_lines(lines: list[list[TextBox]]) -> str:
-    """Ghép theo dòng: cùng dòng nối bằng dấu cách, khác dòng xuống hàng."""
+    """Ghép theo dòng: cùng dòng nối bằng dấu cách, khác dòng xuống hàng.
+
+    Dòng chỉ toàn box `ignore` bị bỏ hẳn thay vì để lại dòng trống — vùng không
+    đọc được không nên biến thành một dòng rỗng trong transcript. Hệ quả:
+    số dòng của `full_text` bằng số dòng CÓ CHỮ, không phải `len(lines)`.
+    """
     rendered = [
         " ".join(box.text for box in line if not box.ignore) for line in lines
     ]
