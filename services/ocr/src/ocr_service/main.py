@@ -1,3 +1,5 @@
+from contextlib import asynccontextmanager
+
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from vypq_contracts.common import HealthStatus
 from vypq_contracts.ocr import OcrResponse
@@ -10,7 +12,7 @@ from ocr_service.handler import OcrHandler
 from ocr_service.settings import OcrSettings, load_hosts
 
 
-def build_app_with(handler: OcrHandler, settings: OcrSettings, backend=None):
+def build_app_with(handler: OcrHandler, settings: OcrSettings, backend=None, lifespan=None):
     router = APIRouter(prefix="/v1")
 
     @router.post("/ocr", response_model=OcrResponse)
@@ -30,7 +32,9 @@ def build_app_with(handler: OcrHandler, settings: OcrSettings, backend=None):
             return HealthStatus.DOWN, f"circuit đang mở: {', '.join(open_hosts)}"
         return HealthStatus.OK, "model-host phản hồi bình thường"
 
-    return create_app(settings, routers=[router], readiness={"model_host": _upstream_ready})
+    return create_app(
+        settings, routers=[router], readiness={"model_host": _upstream_ready}, lifespan=lifespan
+    )
 
 
 def build_app():
@@ -40,7 +44,15 @@ def build_app():
     handler = OcrHandler(
         backend, default_model=settings.default_model, max_side=settings.max_side
     )
-    return build_app_with(handler, settings, backend=backend)
+
+    @asynccontextmanager
+    async def _lifespan(_app):
+        yield
+        # Không đóng thì các connection httpx của mỗi host treo tới khi tiến trình
+        # chết — với worker chạy dài (Task 12) đó là rò tài nguyên thật.
+        await backend.aclose()
+
+    return build_app_with(handler, settings, backend=backend, lifespan=_lifespan)
 
 
 app = build_app()

@@ -104,6 +104,28 @@ async def test_each_host_has_its_own_breaker():
 
 
 @respx.mock
+async def test_client_is_rebuilt_when_the_host_changes_its_url():
+    # Máy thuê lại: cùng tên host, URL ngrok mới. Cache theo tên thôi sẽ gửi
+    # request tới tunnel cũ đã chết mãi mãi.
+    old = respx.post(f"{HOST_A}/v1/infer/upload").mock(
+        return_value=httpx.Response(200, json=OK_BODY)
+    )
+    new = respx.post(f"{HOST_B}/v1/infer/upload").mock(
+        return_value=httpx.Response(200, json=OK_BODY)
+    )
+    hosts = [_host("gpu-1", HOST_A)]
+    backend = _backend(hosts)
+
+    await backend.infer(b"x", "m1")
+    assert old.called and not new.called
+
+    hosts[0].url = HOST_B                      # thuê lại, URL mới
+    await backend.infer(b"x", "m1")
+    assert new.called
+    await backend.aclose()
+
+
+@respx.mock
 async def test_inflight_returns_to_zero_after_failure():
     respx.post(f"{HOST_A}/v1/infer/upload").mock(side_effect=httpx.ConnectError("chết"))
     hosts = [_host("a", HOST_A)]

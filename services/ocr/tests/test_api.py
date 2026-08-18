@@ -43,6 +43,22 @@ async def test_post_ocr_with_broken_file_returns_422_envelope():
     assert resp.json()["code"] == "bad_input"
 
 
+async def test_ready_reports_degraded_when_a_host_circuit_is_open():
+    class _OpenBackend(FakeOcrBackend):
+        def open_circuits(self) -> list[str]:
+            return ["gpu-1"]
+
+    settings = OcrSettings(service_name="ocr", default_model="m1")
+    backend = _OpenBackend(RawOcrOutput())
+    app = build_app_with(
+        OcrHandler(backend, default_model=settings.default_model), settings, backend=backend
+    )
+    async with _client(app) as c:
+        resp = await c.get("/ready")
+    assert resp.status_code == 503
+    assert "gpu-1" in resp.json()["detail"]["model_host"]
+
+
 async def test_trace_id_header_is_echoed_back():
     async with _client(_app(FakeOcrBackend(RawOcrOutput()))) as c:
         resp = await c.post(
