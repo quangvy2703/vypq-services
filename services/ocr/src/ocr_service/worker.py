@@ -2,8 +2,10 @@ import asyncio
 from collections.abc import Awaitable, Callable
 
 import httpx
-from vypq_contracts.common import Task
+from vypq_contracts.common import ErrorCode, Task
+from vypq_core.errors import ServiceError
 from vypq_core.host_registry import StaticHostRegistry
+from vypq_core.http_client import UpstreamError
 from vypq_core.logging import get_logger, setup_logging
 from vypq_events.consumer import EventConsumer
 from vypq_events.envelope import EventEnvelope, RawEnvelope
@@ -25,9 +27,25 @@ def group_id(prefix: str, model_version: str | None) -> str:
 
 
 async def fetch_bytes(uri: str) -> bytes:
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        response = await client.get(uri)
-    response.raise_for_status()
+    """Tải input, PHÂN LOẠI ĐÚNG lỗi tải.
+
+    httpx trần ném ConnectError/TimeoutException — những lỗi này không phải
+    UpstreamError nên EventConsumer coi là dữ liệu hỏng và dead-letter ngay.
+    Hậu quả đo được: MinIO/R2 chập chờn vài giây là cả hàng đợi rơi vào DLQ,
+    dù chẳng có gì sai với dữ liệu. Kết nối hỏng và 5xx là sự cố hạ tầng →
+    UpstreamError → consumer dừng chờ. Chỉ 4xx mới thật sự là URI hỏng.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(uri)
+    except (httpx.TimeoutException, httpx.TransportError) as exc:
+        raise UpstreamError(f"không tải được {uri}: {exc}") from exc
+    if response.status_code >= 500:
+        raise UpstreamError(f"{uri} trả {response.status_code}")
+    if response.status_code >= 400:
+        raise ServiceError(
+            ErrorCode.BAD_INPUT, f"{uri} trả {response.status_code}", http_status=422
+        )
     return response.content
 
 

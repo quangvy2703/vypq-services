@@ -1,12 +1,15 @@
 import io
 
+import httpx
 import pytest
+import respx
 from ocr_service.backend.fake import FakeOcrBackend
 from ocr_service.handler import OcrHandler
-from ocr_service.worker import OcrWorkerHandler, group_id
+from ocr_service.worker import OcrWorkerHandler, fetch_bytes, group_id
 from PIL import Image
 from vypq_contracts.common import Task
 from vypq_contracts.ocr import RawOcrOutput, TextBox
+from vypq_core.errors import ServiceError
 from vypq_core.http_client import UpstreamError
 from vypq_events.envelope import EventEnvelope, RawEnvelope
 from vypq_events.schemas.inference import InferenceRequested
@@ -112,6 +115,30 @@ async def test_upstream_error_is_not_swallowed():
     )
     with pytest.raises(UpstreamError):
         await worker(_envelope())
+
+
+async def test_input_fetch_connection_error_is_retryable_not_dead_letter():
+    # Kho đối tượng chập chờn KHÔNG được làm cả hàng đợi rơi vào DLQ.
+    with respx.mock:
+        respx.get("http://minio/a.png").mock(side_effect=httpx.ConnectError("mat ket noi"))
+        with pytest.raises(UpstreamError):
+            await fetch_bytes("http://minio/a.png")
+
+
+async def test_input_fetch_500_is_retryable():
+    with respx.mock:
+        respx.get("http://minio/a.png").mock(return_value=httpx.Response(503))
+        with pytest.raises(UpstreamError):
+            await fetch_bytes("http://minio/a.png")
+
+
+async def test_input_fetch_404_is_permanent_and_goes_to_dlq():
+    # URI trỏ vào chỗ không tồn tại là dữ liệu hỏng thật, retry mãi vẫn hỏng.
+    with respx.mock:
+        respx.get("http://minio/a.png").mock(return_value=httpx.Response(404))
+        with pytest.raises(ServiceError) as exc:
+            await fetch_bytes("http://minio/a.png")
+    assert not isinstance(exc.value, UpstreamError)
 
 
 async def test_nothing_is_published_when_inference_fails():
