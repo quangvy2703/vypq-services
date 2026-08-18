@@ -5691,6 +5691,10 @@ if ! grep -q "\"$SLUG-service\"" "$ROOT/pyproject.toml"; then
 fi
 uv sync --project "$ROOT" >/dev/null
 
+# Thứ tự import phụ thuộc tên task (vypq_contracts.$TASK sắp xen giữa các import
+# khác), nên template không thể có sẵn thứ tự đúng cho mọi tên. Để ruff tự sắp.
+uv run --project "$ROOT" ruff check --fix "$DST" >/dev/null 2>&1 || true
+
 echo "đã tạo services/$SLUG (task=$TASK, port=$PORT)"
 echo "bước tiếp: viết pipeline và runner tương ứng, rồi chạy: uv run pytest services/$SLUG"
 ```
@@ -5772,6 +5776,21 @@ def test_merge_never_joins_across_different_speakers():
     assert len(merged) == 2
 
 
+def test_merge_sorts_out_of_order_segments_before_joining():
+    # Đoạn tới sai thứ tự thời gian: hiệu ra số âm, lọt ngưỡng, sinh đoạn end < start.
+    merged = merge_segments([_seg(5.0, 6.0, "sau"), _seg(0.0, 1.0, "truoc")])
+    assert [s.text for s in merged] == ["truoc", "sau"]
+    assert all(s.end >= s.start for s in merged)
+
+
+def test_merge_never_produces_a_segment_ending_before_it_starts():
+    merged = merge_segments(
+        [_seg(2.0, 3.0, "b"), _seg(0.0, 1.0, "a"), _seg(1.1, 1.9, "giua")]
+    )
+    assert all(s.end >= s.start for s in merged)
+    assert " ".join(s.text for s in merged).split() == ["a", "giua", "b"]
+
+
 def test_merge_on_empty_input_returns_empty():
     assert merge_segments([]) == []
 
@@ -5804,14 +5823,20 @@ def normalize_text(text: str) -> str:
 
 
 def merge_segments(segments: list[Segment], gap_s: float = 0.3) -> list[Segment]:
-    """Gộp các đoạn liền nhau của cùng một người nói, cách nhau dưới `gap_s` giây."""
+    """Gộp các đoạn liền nhau của cùng một người nói, cách nhau dưới `gap_s` giây.
+
+    Sắp theo `start` trước khi gộp: nếu đoạn tới không đúng thứ tự thời gian —
+    diarization nhiều luồng, hoặc kết quả gộp từ nhiều kênh — thì hiệu
+    `segment.start - previous.end` ra số âm và vẫn lọt qua ngưỡng, sinh ra đoạn
+    có `end < start` và chữ đảo ngược. Không lỗi, không cảnh báo.
+    """
     merged: list[Segment] = []
-    for segment in segments:
+    for segment in sorted(segments, key=lambda s: s.start):
         previous = merged[-1] if merged else None
         joinable = (
             previous is not None
             and previous.speaker == segment.speaker
-            and segment.start - previous.end <= gap_s
+            and 0 <= segment.start - previous.end <= gap_s
         )
         if joinable:
             merged[-1] = previous.model_copy(
@@ -5868,7 +5893,7 @@ class AsrHandler:
 - [ ] **Step 5: Chạy test asr**
 
 Chạy: `uv run pytest services/asr -v`
-Mong đợi: 6 test pipeline + các test sinh từ template, tất cả PASS
+Mong đợi: 8 test pipeline + các test sinh từ template, tất cả PASS
 
 - [ ] **Step 6: Viết runner Whisper**
 
