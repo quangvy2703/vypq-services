@@ -4862,23 +4862,25 @@ produces: [infer.ocr.results]
 - [ ] **Step 8: Chạy toàn bộ test service ocr**
 
 Chạy: `uv run pytest services/ocr -v`
-Mong đợi: 12 + 7 + 5 + 3 = 27 PASS
+Mong đợi: 17 + 7 + 5 + 3 = 32 PASS
 
 - [ ] **Step 9: Chạy thử end-to-end với model-host fake**
 
 ```bash
 # cửa sổ 1: model-host chế độ fake
 cd apps/model-host && VYPQ_TOKEN=sekret VYPQ_MODELS_PATH=models.dev.yaml \
-  uv run uvicorn model_host.main:app --port 9001 &
+  uv run uvicorn model_host.main:app --port 9001 &   # models.dev.yaml đã có sẵn trong repo
 
 # cửa sổ 2: ocr service trỏ vào đó
 cd services/ocr
 cat > config.dev.yaml <<'YAML'
-hosts:
-  - name: gpu-dev
-    url: http://localhost:9001
-    token: sekret
-    models: [{id: fake-ocr, task: ocr, kind: opensource, runner: fake}]
+host_discovery:
+  source: static
+  fallback_static:
+    - name: gpu-dev
+      url: http://localhost:9001
+      token: sekret
+      models: [{id: fake-ocr, task: ocr, kind: opensource, runner: fake}]
 YAML
 VYPQ_HOSTS_PATH=config.dev.yaml VYPQ_DEFAULT_MODEL=fake-ocr \
   uv run uvicorn ocr_service.main:app --port 8001 &
