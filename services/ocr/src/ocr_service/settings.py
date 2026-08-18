@@ -14,6 +14,11 @@ class OcrSettings(BaseServiceSettings):
     timeout_s: float = 60.0
     hosts_path: Path = Path("config.yaml")
     brokers: str = "localhost:9092"
+    # Prefix theo SLUG, không phải task. Hai service khác nhau cùng đọc một topic
+    # (ví dụ ocr và ocr-handwriting) là hai pipeline riêng, mỗi bên phải nhận đủ
+    # mọi message — chung group thì Kafka chia partition và mỗi bên chỉ thấy một
+    # phần, im lặng. Nhiều instance của CÙNG một service thì chung group là đúng,
+    # đó mới là chia tải.
     group_prefix: str = "ocr"
     model_version: str | None = None  # VYPQ_MODEL_VERSION — đặt để bật shadow-run
 
