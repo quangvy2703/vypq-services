@@ -133,3 +133,26 @@ async def test_inflight_returns_to_zero_after_failure():
     with pytest.raises(UpstreamError):
         await backend.infer(b"x", "m1")
     assert hosts[0].inflight == 0
+
+
+@respx.mock
+async def test_concurrent_requests_spread_across_hosts():
+    # pick() đọc inflight, lease() mới tăng. Nếu có await chen giữa hai lời gọi,
+    # mọi coroutine đọc cùng một con số cũ và dồn hết vào một host.
+    import asyncio
+
+    seen: list[str] = []
+
+    def _record(host_name: str):
+        def _handler(_request: httpx.Request) -> httpx.Response:
+            seen.append(host_name)
+            return httpx.Response(200, json=OK_BODY)
+        return _handler
+
+    respx.post(f"{HOST_A}/v1/infer/upload").mock(side_effect=_record("a"))
+    respx.post(f"{HOST_B}/v1/infer/upload").mock(side_effect=_record("b"))
+    backend = _backend([_host("a", HOST_A), _host("b", HOST_B)])
+    await asyncio.gather(*(backend.infer(b"x", "m1") for _ in range(20)))
+    await backend.aclose()
+
+    assert set(seen) == {"a", "b"}, f"dồn hết vào một host: {seen}"

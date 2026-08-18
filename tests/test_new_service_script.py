@@ -20,6 +20,10 @@ def generated():
         shutil.rmtree(target)
     # Script sửa root pyproject — trả lại nguyên trạng để không rác workspace.
     root_pyproject.write_text(original, encoding="utf-8")
+    # pyproject.toml phục hồi rồi nhưng uv.lock vẫn còn nhớ tmptest-service trỏ
+    # vào thư mục vừa xoá — "uv sync --frozen" (đúng lệnh Dockerfile dùng) sẽ vỡ
+    # ngay sau khi chạy xong test này nếu không đồng bộ lại lock ở đây.
+    subprocess.run(["uv", "sync"], cwd=REPO, check=True, capture_output=True)
 
 
 def test_script_generates_a_service_that_passes_its_own_tests(generated):
