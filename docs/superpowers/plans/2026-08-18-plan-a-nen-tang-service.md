@@ -1,0 +1,4998 @@
+# Plan A — Nền tảng Service Implementation Plan
+
+> **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
+
+**Goal:** Dựng nền tảng để OCR và ASR chạy được qua cả HTTP lẫn Kafka, gọi model trên máy GPU thuê theo giờ, và test được trọn vẹn trên máy không có GPU.
+
+**Architecture:** `model-host` (máy GPU) load model và trả kết quả thô. `services/*` (máy ứng dụng, CPU, stateless) làm pre/post-processing rồi map về contract chuẩn, gọi model-host qua HTTP có retry + circuit breaker. Mỗi service có hai entrypoint — FastAPI và Kafka worker — cùng gọi một `handler`. Backend được tách thành interface nên toàn bộ test chạy được không cần GPU.
+
+**Tech Stack:** Python 3.12, uv workspace, FastAPI, Pydantic v2, httpx, aiokafka, structlog, pytest + pytest-asyncio + respx, Redpanda, Docker Compose.
+
+**Spec:** `docs/superpowers/specs/2026-08-18-vypq-ai-services-platform-design.md`
+
+## Global Constraints
+
+- Python **3.12** cố định (`requires-python = ">=3.12,<3.13"`). Python hệ thống trên máy dev là 3.9 — luôn dùng `uv run`, không gọi `python3` trực tiếp.
+- Quản lí package bằng **uv workspace**. Mọi lệnh chạy qua `uv run`, không dùng `pip install` thủ công.
+- Pydantic **v2** (`pydantic>=2.9`), settings qua `pydantic-settings>=2.5`.
+- Mọi biến môi trường dùng tiền tố `VYPQ_`, lồng nhau bằng `__`.
+- Test **không được yêu cầu GPU**. Test cần GPU phải đánh dấu `@pytest.mark.slow` và bị loại khỏi lệnh mặc định.
+- Chuẩn hoá Unicode tiếng Việt: dạng **NFC**, áp dụng ở `postprocess` trước khi trả kết quả.
+- Truyền file tới model-host mặc định `multipart/form-data` (**không** base64).
+- `model-host` **từ chối khởi động nếu token rỗng**.
+- Chỉ retry lỗi kết nối và HTTP 5xx. **Không bao giờ retry 4xx.**
+- Commit sau mỗi task. Message theo Conventional Commits, tiếng Anh cho prefix, mô tả tiếng Việt.
+
+## File Structure
+
+| File | Trách nhiệm |
+|---|---|
+| `pyproject.toml` | uv workspace root, dependency chung cho dev/test |
+| `packages/vypq-contracts/src/vypq_contracts/common.py` | Enum dùng chung: `Task`, `ModelKind`, `ErrorCode`, `HealthStatus`, `ErrorResponse`, `HealthResponse` |
+| `packages/vypq-contracts/src/vypq_contracts/ocr.py` | `TextBox`, `OcrResult`, `OcrRequest`, `OcrResponse`, `RawOcrOutput` |
+| `packages/vypq-contracts/src/vypq_contracts/asr.py` | `Segment`, `AsrResult`, `AsrRequest`, `AsrResponse`, `RawAsrOutput` |
+| `packages/vypq-contracts/src/vypq_contracts/hosting.py` | `ModelInfo`, `ModelsResponse`, `InferRequest`, `InferResponse`, `InferTiming` |
+| `packages/vypq-core/src/vypq_core/config.py` | `BaseServiceSettings` |
+| `packages/vypq-core/src/vypq_core/logging.py` | structlog JSON + contextvar `trace_id` |
+| `packages/vypq-core/src/vypq_core/errors.py` | `ServiceError` + exception handler |
+| `packages/vypq-core/src/vypq_core/app.py` | `create_app()` — FastAPI factory, `/health`, `/ready` |
+| `packages/vypq-core/src/vypq_core/breaker.py` | `CircuitBreaker` — thuần logic, clock tiêm được |
+| `packages/vypq-core/src/vypq_core/http_client.py` | `UpstreamClient` — retry + backoff + breaker |
+| `packages/vypq-core/src/vypq_core/host_registry.py` | `HostRef`, `HostRegistry` Protocol, `StaticHostRegistry` |
+| `packages/vypq-events/src/vypq_events/topics.py` | Hàm sinh tên topic |
+| `packages/vypq-events/src/vypq_events/envelope.py` | `EventEnvelope[T]` |
+| `packages/vypq-events/src/vypq_events/schemas/inference.py` | `InferenceRequested/Completed/Failed` |
+| `packages/vypq-events/src/vypq_events/producer.py` | `EventProducer` |
+| `packages/vypq-events/src/vypq_events/consumer.py` | `EventConsumer` — retry, DLQ, pause theo gate |
+| `apps/model-host/models.yaml` | Nguồn sự thật về model trên host này |
+| `apps/model-host/src/model_host/spec.py` | `ModelSpec`, `HostConfig` đọc từ YAML |
+| `apps/model-host/src/model_host/runners/base.py` | `ModelRunner` Protocol |
+| `apps/model-host/src/model_host/runners/fake.py` | Runner giả cho test — không cần GPU |
+| `apps/model-host/src/model_host/runners/paddle.py` | Runner PaddleOCR thật |
+| `apps/model-host/src/model_host/registry.py` | Lazy load, LRU evict theo `vram_budget_mb` |
+| `apps/model-host/src/model_host/auth.py` | Bearer token dependency |
+| `apps/model-host/src/model_host/api/routes.py` | `/v1/infer`, `/v1/infer/upload`, `/v1/models` |
+| `apps/model-host/src/model_host/main.py` | Entrypoint |
+| `services/ocr/src/ocr_service/backend/base.py` | `OcrBackend` Protocol |
+| `services/ocr/src/ocr_service/backend/remote.py` | Gọi model-host |
+| `services/ocr/src/ocr_service/backend/fake.py` | Backend giả cho test |
+| `services/ocr/src/ocr_service/pipeline/preprocess.py` | EXIF orientation, giới hạn cạnh dài |
+| `services/ocr/src/ocr_service/pipeline/postprocess.py` | Sắp thứ tự đọc, ghép `full_text`, chuẩn hoá NFC |
+| `services/ocr/src/ocr_service/handler.py` | Logic dùng chung cho HTTP và Kafka |
+| `services/ocr/src/ocr_service/main.py` | HTTP entrypoint |
+| `services/ocr/src/ocr_service/worker.py` | Kafka entrypoint |
+| `services/_template/` | Khung sinh service mới |
+| `scripts/new-service.sh` | Sinh service từ template |
+
+---
+### Task 1: Workspace và bộ khung test
+
+**Files:**
+- Create: `pyproject.toml`, `.python-version`, `pytest.ini`, `Makefile`
+- Create: `packages/vypq-contracts/pyproject.toml`
+- Create: `packages/vypq-contracts/src/vypq_contracts/__init__.py`
+- Test: `tests/test_workspace.py`
+
+**Interfaces:**
+- Consumes: (không có — task đầu tiên)
+- Produces: uv workspace với member `packages/*`, `apps/*`, `services/*`. Lệnh `uv run pytest` chạy được. Marker `slow` đã đăng ký.
+
+- [ ] **Step 1: Tạo file pin Python và workspace root**
+
+`.python-version`:
+```
+3.12
+```
+
+`pyproject.toml`:
+```toml
+[project]
+name = "vypq-services"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = []
+
+[tool.uv.workspace]
+members = ["packages/*", "apps/*", "services/*"]
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "pytest-cov>=5.0",
+    "respx>=0.21",
+    "ruff>=0.7",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+```
+
+`pytest.ini`:
+```ini
+[pytest]
+testpaths = tests packages services apps
+asyncio_mode = auto
+markers =
+    slow: cần GPU hoặc dịch vụ ngoài, không chạy mặc định
+addopts = -m "not slow" --strict-markers
+```
+
+- [ ] **Step 2: Tạo package vypq-contracts rỗng**
+
+`packages/vypq-contracts/pyproject.toml`:
+```toml
+[project]
+name = "vypq-contracts"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["pydantic>=2.9"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vypq_contracts"]
+```
+
+`packages/vypq-contracts/src/vypq_contracts/__init__.py`:
+```python
+__all__: list[str] = []
+```
+
+- [ ] **Step 3: Viết test xác nhận workspace hoạt động**
+
+`tests/test_workspace.py`:
+```python
+import sys
+
+import vypq_contracts
+
+
+def test_python_version_is_312():
+    assert sys.version_info[:2] == (3, 12)
+
+
+def test_contracts_package_importable():
+    assert vypq_contracts.__all__ == []
+```
+
+- [ ] **Step 4: Chạy test**
+
+Chạy: `uv run pytest tests/test_workspace.py -v`
+Mong đợi: 2 PASS. Nếu `uv` chưa tải Python 3.12, nó tự tải ở lần chạy đầu.
+
+- [ ] **Step 5: Tạo Makefile**
+
+`Makefile`:
+```makefile
+.PHONY: test test-all lint fmt
+test:
+	uv run pytest
+test-all:
+	uv run pytest -m ""
+lint:
+	uv run ruff check .
+fmt:
+	uv run ruff format .
+```
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add pyproject.toml .python-version pytest.ini Makefile packages tests
+git commit -m "chore: khởi tạo uv workspace và bộ khung test"
+```
+
+---
+
+### Task 2: vypq-contracts — schema dùng chung
+
+**Files:**
+- Create: `packages/vypq-contracts/src/vypq_contracts/common.py`
+- Create: `packages/vypq-contracts/src/vypq_contracts/ocr.py`
+- Create: `packages/vypq-contracts/src/vypq_contracts/asr.py`
+- Create: `packages/vypq-contracts/src/vypq_contracts/hosting.py`
+- Test: `packages/vypq-contracts/tests/test_schemas.py`
+
+**Interfaces:**
+- Consumes: workspace từ Task 1.
+- Produces:
+  - `Task` (enum: `OCR="ocr"`, `ASR="asr"`), `ModelKind` (`OPENSOURCE`, `FINETUNED`), `ErrorCode` (`BAD_INPUT`, `MODEL_UNAVAILABLE`, `UPSTREAM_TIMEOUT`, `UPSTREAM_ERROR`, `CIRCUIT_OPEN`, `INTERNAL`), `HealthStatus` (`OK`, `DEGRADED`, `DOWN`)
+  - `ErrorResponse(code, message, trace_id)`, `HealthResponse(status, service, version, detail)`
+  - `TextBox(id: int, polygon: list[tuple[float,float]], text: str, confidence: float|None, ignore: bool)`
+  - `RawOcrOutput(boxes: list[TextBox])`, `OcrResult(full_text: str, boxes: list[TextBox])`
+  - `OcrResponse(trace_id, model_version, result: OcrResult, latency_ms)`
+  - `Segment(start, end, text, speaker)`, `RawAsrOutput(segments)`, `AsrResult(text, segments)`, `AsrResponse(trace_id, model_version, result, latency_ms)`
+  - `ModelInfo(id, task, kind, runner, loaded, available, vram_mb, base, trained_on)`, `ModelsResponse(host_name, models)`
+  - `InferRequest(model_id, input_uri, params)`, `InferTiming(load_ms, infer_ms)`, `InferResponse(model_id, task, output, timing)`
+
+- [ ] **Step 1: Viết test trước cho common và ocr**
+
+`packages/vypq-contracts/tests/test_schemas.py`:
+```python
+import pytest
+from pydantic import ValidationError
+
+from vypq_contracts.asr import AsrResult, RawAsrOutput, Segment
+from vypq_contracts.common import ErrorCode, ErrorResponse, HealthStatus, Task
+from vypq_contracts.hosting import InferResponse, InferTiming, ModelInfo
+from vypq_contracts.ocr import OcrResult, RawOcrOutput, TextBox
+
+
+def test_task_values():
+    assert Task.OCR.value == "ocr"
+    assert Task.ASR.value == "asr"
+
+
+def test_error_response_roundtrip():
+    err = ErrorResponse(code=ErrorCode.BAD_INPUT, message="ảnh hỏng", trace_id="t1")
+    assert ErrorResponse.model_validate_json(err.model_dump_json()) == err
+
+
+def test_health_status_has_degraded():
+    assert HealthStatus.DEGRADED.value == "degraded"
+
+
+def test_textbox_defaults_ignore_false():
+    box = TextBox(id=0, polygon=[(0, 0), (10, 0), (10, 5), (0, 5)], text="A")
+    assert box.ignore is False
+    assert box.confidence is None
+
+
+def test_textbox_rejects_polygon_with_three_points():
+    with pytest.raises(ValidationError):
+        TextBox(id=0, polygon=[(0, 0), (10, 0), (10, 5)], text="A")
+
+
+def test_textbox_accepts_polygon_with_more_than_four_points():
+    box = TextBox(
+        id=1,
+        polygon=[(0, 0), (5, -1), (10, 0), (10, 5), (0, 5)],
+        text="cong",
+    )
+    assert len(box.polygon) == 5
+
+
+def test_ocr_result_roundtrip():
+    result = OcrResult(
+        full_text="A\nB",
+        boxes=[
+            TextBox(id=0, polygon=[(0, 0), (1, 0), (1, 1), (0, 1)], text="A"),
+            TextBox(id=1, polygon=[(0, 2), (1, 2), (1, 3), (0, 3)], text="B"),
+        ],
+    )
+    assert OcrResult.model_validate_json(result.model_dump_json()) == result
+
+
+def test_raw_ocr_output_holds_only_boxes():
+    raw = RawOcrOutput(boxes=[])
+    assert raw.model_dump() == {"boxes": []}
+
+
+def test_segment_and_asr_result():
+    seg = Segment(start=0.4, end=2.1, text="xin chào", speaker="A")
+    res = AsrResult(text="xin chào", segments=[seg])
+    assert AsrResult.model_validate_json(res.model_dump_json()) == res
+
+
+def test_infer_response_discriminates_ocr_output():
+    resp = InferResponse(
+        model_id="fake-ocr",
+        task=Task.OCR,
+        output=RawOcrOutput(boxes=[]),
+        timing=InferTiming(load_ms=0, infer_ms=12),
+    )
+    parsed = InferResponse.model_validate_json(resp.model_dump_json())
+    assert isinstance(parsed.output, RawOcrOutput)
+
+
+def test_infer_response_discriminates_asr_output():
+    resp = InferResponse(
+        model_id="fake-asr",
+        task=Task.ASR,
+        output=RawAsrOutput(segments=[Segment(start=0.0, end=1.0, text="a")]),
+        timing=InferTiming(infer_ms=5),
+    )
+    parsed = InferResponse.model_validate_json(resp.model_dump_json())
+    assert isinstance(parsed.output, RawAsrOutput)
+
+
+def test_model_info_defaults():
+    info = ModelInfo(id="m1", task=Task.OCR, kind="opensource", runner="fake")
+    assert info.loaded is False
+    assert info.available is True
+```
+
+- [ ] **Step 2: Chạy test để xác nhận nó fail**
+
+Chạy: `uv run pytest packages/vypq-contracts -v`
+Mong đợi: FAIL với `ModuleNotFoundError: No module named 'vypq_contracts.common'`
+
+- [ ] **Step 3: Viết common.py**
+
+`packages/vypq-contracts/src/vypq_contracts/common.py`:
+```python
+from enum import Enum
+
+from pydantic import BaseModel, Field
+
+
+class Task(str, Enum):
+    OCR = "ocr"
+    ASR = "asr"
+
+
+class ModelKind(str, Enum):
+    OPENSOURCE = "opensource"
+    FINETUNED = "finetuned"
+
+
+class ErrorCode(str, Enum):
+    BAD_INPUT = "bad_input"
+    MODEL_UNAVAILABLE = "model_unavailable"
+    UPSTREAM_TIMEOUT = "upstream_timeout"
+    UPSTREAM_ERROR = "upstream_error"
+    CIRCUIT_OPEN = "circuit_open"
+    INTERNAL = "internal"
+
+
+class HealthStatus(str, Enum):
+    OK = "ok"
+    DEGRADED = "degraded"
+    DOWN = "down"
+
+
+class ErrorResponse(BaseModel):
+    code: ErrorCode
+    message: str
+    trace_id: str | None = None
+
+
+class HealthResponse(BaseModel):
+    status: HealthStatus
+    service: str
+    version: str
+    detail: dict[str, str] = Field(default_factory=dict)
+```
+
+- [ ] **Step 4: Viết ocr.py**
+
+`packages/vypq-contracts/src/vypq_contracts/ocr.py`:
+```python
+from pydantic import BaseModel, Field
+
+Polygon = list[tuple[float, float]]
+
+
+class TextBox(BaseModel):
+    id: int
+    polygon: Polygon = Field(min_length=4)
+    text: str
+    confidence: float | None = None
+    ignore: bool = False
+
+
+class RawOcrOutput(BaseModel):
+    """Kết quả thô từ model-host: chỉ có box, chưa sắp thứ tự đọc."""
+
+    boxes: list[TextBox] = Field(default_factory=list)
+
+
+class OcrResult(BaseModel):
+    """Kết quả đã qua postprocess của service."""
+
+    full_text: str
+    boxes: list[TextBox] = Field(default_factory=list)
+
+
+class OcrRequest(BaseModel):
+    image_uri: str | None = None
+    model_version: str | None = None
+
+
+class OcrResponse(BaseModel):
+    trace_id: str
+    model_version: str
+    result: OcrResult
+    latency_ms: int
+```
+
+- [ ] **Step 5: Viết asr.py**
+
+`packages/vypq-contracts/src/vypq_contracts/asr.py`:
+```python
+from pydantic import BaseModel, Field
+
+
+class Segment(BaseModel):
+    start: float
+    end: float
+    text: str
+    speaker: str | None = None
+
+
+class RawAsrOutput(BaseModel):
+    segments: list[Segment] = Field(default_factory=list)
+
+
+class AsrResult(BaseModel):
+    text: str
+    segments: list[Segment] = Field(default_factory=list)
+
+
+class AsrRequest(BaseModel):
+    audio_uri: str | None = None
+    model_version: str | None = None
+
+
+class AsrResponse(BaseModel):
+    trace_id: str
+    model_version: str
+    result: AsrResult
+    latency_ms: int
+```
+
+- [ ] **Step 6: Viết hosting.py**
+
+`packages/vypq-contracts/src/vypq_contracts/hosting.py`:
+```python
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from vypq_contracts.asr import RawAsrOutput
+from vypq_contracts.common import ModelKind, Task
+from vypq_contracts.ocr import RawOcrOutput
+
+# Union thường: RawOcrOutput có 'boxes', RawAsrOutput có 'segments' — hai
+# trường rời nhau nên pydantic phân biệt được mà không cần discriminator.
+RawOutput = RawOcrOutput | RawAsrOutput
+
+
+class ModelInfo(BaseModel):
+    id: str
+    task: Task
+    kind: ModelKind
+    runner: str
+    loaded: bool = False
+    available: bool = True
+    vram_mb: int = 0
+    base: str | None = None
+    trained_on: str | None = None
+
+
+class ModelsResponse(BaseModel):
+    host_name: str
+    models: list[ModelInfo] = Field(default_factory=list)
+
+
+class InferRequest(BaseModel):
+    model_id: str
+    input_uri: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class InferTiming(BaseModel):
+    load_ms: int = 0
+    infer_ms: int
+
+
+class InferResponse(BaseModel):
+    model_id: str
+    task: Task
+    output: RawOutput
+    timing: InferTiming
+```
+
+- [ ] **Step 7: Chạy test để xác nhận pass**
+
+Chạy: `uv run pytest packages/vypq-contracts -v`
+Mong đợi: 11 PASS
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add packages/vypq-contracts
+git commit -m "feat(contracts): schema dùng chung cho ocr, asr và model hosting"
+```
+
+---
+### Task 3: vypq-core — config, logging, errors, app factory
+
+**Files:**
+- Create: `packages/vypq-core/pyproject.toml`
+- Create: `packages/vypq-core/src/vypq_core/{__init__,config,logging,errors,app}.py`
+- Test: `packages/vypq-core/tests/test_app.py`
+
+**Interfaces:**
+- Consumes: `vypq_contracts.common.{ErrorCode, ErrorResponse, HealthResponse, HealthStatus}`
+- Produces:
+  - `BaseServiceSettings(service_name: str, version: str, log_level: str, port: int)` — đọc env tiền tố `VYPQ_`
+  - `ServiceError(code: ErrorCode, message: str, http_status: int)`
+  - `setup_logging(level: str) -> None`, `set_trace_id(v: str) -> None`, `get_trace_id() -> str`
+  - `HealthCheck = Callable[[], Awaitable[tuple[HealthStatus, str]]]`
+  - `create_app(settings: BaseServiceSettings, *, routers: Sequence[APIRouter] = (), readiness: Mapping[str, HealthCheck] = {}, lifespan=None) -> FastAPI` — gắn sẵn `GET /health` và `GET /ready`
+
+- [ ] **Step 1: Tạo pyproject cho vypq-core**
+
+`packages/vypq-core/pyproject.toml`:
+```toml
+[project]
+name = "vypq-core"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "vypq-contracts",
+    "fastapi>=0.115",
+    "pydantic-settings>=2.5",
+    "structlog>=24.4",
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vypq_core"]
+
+[tool.uv.sources]
+vypq-contracts = { workspace = true }
+```
+
+Thêm vào `[dependency-groups] dev` của `pyproject.toml` gốc: `"asgi-lifespan>=2.1"`.
+
+- [ ] **Step 2: Viết test trước**
+
+`packages/vypq-core/tests/test_app.py`:
+```python
+import httpx
+import pytest
+from fastapi import APIRouter
+
+from vypq_contracts.common import ErrorCode, HealthStatus
+from vypq_core.app import create_app
+from vypq_core.config import BaseServiceSettings
+from vypq_core.errors import ServiceError
+from vypq_core.logging import get_trace_id, set_trace_id
+
+SETTINGS = BaseServiceSettings(service_name="demo", version="9.9.9")
+
+
+def _client(app) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+
+
+async def test_health_is_ok_even_when_dependencies_are_down():
+    async def failing():
+        return HealthStatus.DOWN, "upstream chết"
+
+    app = create_app(SETTINGS, readiness={"upstream": failing})
+    async with _client(app) as c:
+        resp = await c.get("/health")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+async def test_ready_reports_degraded_when_a_check_is_down():
+    async def failing():
+        return HealthStatus.DOWN, "upstream chết"
+
+    app = create_app(SETTINGS, readiness={"upstream": failing})
+    async with _client(app) as c:
+        resp = await c.get("/ready")
+    body = resp.json()
+    assert resp.status_code == 503
+    assert body["status"] == "degraded"
+    assert body["detail"]["upstream"] == "upstream chết"
+
+
+async def test_ready_is_ok_when_all_checks_pass():
+    async def fine():
+        return HealthStatus.OK, "sẵn sàng"
+
+    app = create_app(SETTINGS, readiness={"upstream": fine})
+    async with _client(app) as c:
+        resp = await c.get("/ready")
+    assert resp.status_code == 200
+    assert resp.json()["status"] == "ok"
+
+
+async def test_service_error_becomes_error_envelope_without_traceback():
+    router = APIRouter()
+
+    @router.get("/boom")
+    async def boom():
+        raise ServiceError(ErrorCode.BAD_INPUT, "ảnh hỏng", http_status=422)
+
+    app = create_app(SETTINGS, routers=[router])
+    async with _client(app) as c:
+        resp = await c.get("/boom")
+    assert resp.status_code == 422
+    assert resp.json() == {"code": "bad_input", "message": "ảnh hỏng", "trace_id": None}
+
+
+async def test_unexpected_exception_is_masked_as_internal():
+    router = APIRouter()
+
+    @router.get("/crash")
+    async def crash():
+        raise RuntimeError("chi tiết nội bộ không được lộ ra")
+
+    app = create_app(SETTINGS, routers=[router])
+    async with _client(app) as c:
+        resp = await c.get("/crash")
+    body = resp.json()
+    assert resp.status_code == 500
+    assert body["code"] == "internal"
+    assert "chi tiết nội bộ" not in body["message"]
+
+
+def test_trace_id_defaults_to_dash_and_can_be_set():
+    assert get_trace_id() == "-"
+    set_trace_id("abc123")
+    assert get_trace_id() == "abc123"
+
+
+def test_settings_read_env_with_vypq_prefix(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("VYPQ_SERVICE_NAME", "ocr")
+    monkeypatch.setenv("VYPQ_PORT", "8123")
+    s = BaseServiceSettings()
+    assert s.service_name == "ocr"
+    assert s.port == 8123
+```
+
+- [ ] **Step 3: Chạy test để xác nhận fail**
+
+Chạy: `uv run pytest packages/vypq-core -v`
+Mong đợi: FAIL với `ModuleNotFoundError: No module named 'vypq_core'`
+
+- [ ] **Step 4: Viết config.py**
+
+`packages/vypq-core/src/vypq_core/config.py`:
+```python
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class BaseServiceSettings(BaseSettings):
+    model_config = SettingsConfigDict(
+        env_prefix="VYPQ_",
+        env_nested_delimiter="__",
+        extra="ignore",
+    )
+
+    service_name: str = "unnamed"
+    version: str = "0.1.0"
+    log_level: str = "INFO"
+    port: int = 8000
+```
+
+- [ ] **Step 5: Viết logging.py**
+
+`packages/vypq-core/src/vypq_core/logging.py`:
+```python
+import logging
+from contextvars import ContextVar
+
+import structlog
+
+_trace_id: ContextVar[str] = ContextVar("trace_id", default="-")
+
+
+def set_trace_id(value: str) -> None:
+    _trace_id.set(value)
+
+
+def get_trace_id() -> str:
+    return _trace_id.get()
+
+
+def _inject_trace_id(_logger, _method, event_dict):
+    event_dict["trace_id"] = get_trace_id()
+    return event_dict
+
+
+def setup_logging(level: str = "INFO") -> None:
+    logging.basicConfig(format="%(message)s", level=getattr(logging, level.upper()))
+    structlog.configure(
+        processors=[
+            structlog.contextvars.merge_contextvars,
+            _inject_trace_id,
+            structlog.processors.add_log_level,
+            structlog.processors.TimeStamper(fmt="iso", utc=True),
+            structlog.processors.JSONRenderer(),
+        ],
+        wrapper_class=structlog.make_filtering_bound_logger(
+            getattr(logging, level.upper())
+        ),
+        cache_logger_on_first_use=True,
+    )
+
+
+def get_logger(name: str):
+    return structlog.get_logger(name)
+```
+
+- [ ] **Step 6: Viết errors.py**
+
+`packages/vypq-core/src/vypq_core/errors.py`:
+```python
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from vypq_contracts.common import ErrorCode, ErrorResponse
+from vypq_core.logging import get_logger, get_trace_id
+
+log = get_logger(__name__)
+
+
+class ServiceError(Exception):
+    def __init__(self, code: ErrorCode, message: str, http_status: int = 400) -> None:
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.http_status = http_status
+
+
+def _envelope(code: ErrorCode, message: str, status: int) -> JSONResponse:
+    body = ErrorResponse(code=code, message=message, trace_id=_trace_or_none())
+    return JSONResponse(status_code=status, content=body.model_dump(mode="json"))
+
+
+def _trace_or_none() -> str | None:
+    trace = get_trace_id()
+    return None if trace == "-" else trace
+
+
+def install_error_handlers(app: FastAPI) -> None:
+    @app.exception_handler(ServiceError)
+    async def _handle_service_error(_request: Request, exc: ServiceError):
+        log.warning("service_error", code=exc.code.value, message=exc.message)
+        return _envelope(exc.code, exc.message, exc.http_status)
+
+    @app.exception_handler(Exception)
+    async def _handle_unexpected(_request: Request, exc: Exception):
+        # Ghi traceback vào log, nhưng không bao giờ trả ra ngoài.
+        log.exception("unhandled_error", error=str(exc))
+        return _envelope(ErrorCode.INTERNAL, "internal server error", 500)
+```
+
+- [ ] **Step 7: Viết app.py**
+
+`packages/vypq-core/src/vypq_core/app.py`:
+```python
+import uuid
+from collections.abc import Awaitable, Callable, Mapping, Sequence
+
+from fastapi import APIRouter, FastAPI, Request
+from fastapi.responses import JSONResponse
+
+from vypq_contracts.common import HealthResponse, HealthStatus
+from vypq_core.config import BaseServiceSettings
+from vypq_core.errors import install_error_handlers
+from vypq_core.logging import set_trace_id, setup_logging
+
+HealthCheck = Callable[[], Awaitable[tuple[HealthStatus, str]]]
+
+_WORST = {HealthStatus.OK: 0, HealthStatus.DEGRADED: 1, HealthStatus.DOWN: 2}
+
+
+def create_app(
+    settings: BaseServiceSettings,
+    *,
+    routers: Sequence[APIRouter] = (),
+    readiness: Mapping[str, HealthCheck] | None = None,
+    lifespan=None,
+) -> FastAPI:
+    setup_logging(settings.log_level)
+    app = FastAPI(title=settings.service_name, version=settings.version, lifespan=lifespan)
+    checks: Mapping[str, HealthCheck] = readiness or {}
+
+    @app.middleware("http")
+    async def _trace_middleware(request: Request, call_next):
+        trace = request.headers.get("x-trace-id") or uuid.uuid4().hex
+        set_trace_id(trace)
+        response = await call_next(request)
+        response.headers["x-trace-id"] = trace
+        return response
+
+    @app.get("/health", response_model=HealthResponse)
+    async def health() -> HealthResponse:
+        # Liveness: tiến trình còn sống là ok, không phụ thuộc upstream.
+        return HealthResponse(
+            status=HealthStatus.OK, service=settings.service_name, version=settings.version
+        )
+
+    @app.get("/ready")
+    async def ready() -> JSONResponse:
+        detail: dict[str, str] = {}
+        worst = HealthStatus.OK
+        for name, check in checks.items():
+            status, note = await check()
+            detail[name] = note
+            if _WORST[status] > _WORST[worst]:
+                worst = status
+        # DOWN của một dependency = service degraded, không phải chết hẳn.
+        overall = HealthStatus.OK if worst is HealthStatus.OK else HealthStatus.DEGRADED
+        body = HealthResponse(
+            status=overall,
+            service=settings.service_name,
+            version=settings.version,
+            detail=detail,
+        )
+        code = 200 if overall is HealthStatus.OK else 503
+        return JSONResponse(status_code=code, content=body.model_dump(mode="json"))
+
+    for router in routers:
+        app.include_router(router)
+
+    install_error_handlers(app)
+    return app
+```
+
+`packages/vypq-core/src/vypq_core/__init__.py`:
+```python
+__all__: list[str] = []
+```
+
+- [ ] **Step 8: Chạy test để xác nhận pass**
+
+Chạy: `uv run pytest packages/vypq-core -v`
+Mong đợi: 7 PASS
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add packages/vypq-core pyproject.toml
+git commit -m "feat(core): app factory, config, logging json và error envelope"
+```
+
+---
+
+### Task 4: vypq-core — circuit breaker
+
+**Files:**
+- Create: `packages/vypq-core/src/vypq_core/breaker.py`
+- Test: `packages/vypq-core/tests/test_breaker.py`
+
+**Interfaces:**
+- Consumes: `vypq_core.errors.ServiceError`, `vypq_contracts.common.ErrorCode`
+- Produces:
+  - `CircuitState` (enum: `CLOSED`, `OPEN`, `HALF_OPEN`)
+  - `CircuitBreaker(failure_threshold: int = 5, recovery_timeout_s: float = 30.0, clock: Callable[[], float] = time.monotonic)` với `.state`, `.allow() -> bool`, `.record_success()`, `.record_failure()`
+  - `CircuitOpenError(ServiceError)`
+
+Đồng hồ tiêm được qua tham số `clock` để test không phải `sleep`.
+
+- [ ] **Step 1: Viết test trước**
+
+`packages/vypq-core/tests/test_breaker.py`:
+```python
+from vypq_core.breaker import CircuitBreaker, CircuitState
+
+
+class FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+def _breaker(clock: FakeClock) -> CircuitBreaker:
+    return CircuitBreaker(failure_threshold=3, recovery_timeout_s=30.0, clock=clock)
+
+
+def test_starts_closed_and_allows():
+    b = _breaker(FakeClock())
+    assert b.state is CircuitState.CLOSED
+    assert b.allow() is True
+
+
+def test_opens_after_threshold_consecutive_failures():
+    b = _breaker(FakeClock())
+    for _ in range(3):
+        b.record_failure()
+    assert b.state is CircuitState.OPEN
+    assert b.allow() is False
+
+
+def test_success_resets_failure_count():
+    b = _breaker(FakeClock())
+    b.record_failure()
+    b.record_failure()
+    b.record_success()
+    b.record_failure()
+    b.record_failure()
+    assert b.state is CircuitState.CLOSED
+
+
+def test_moves_to_half_open_after_recovery_timeout():
+    clock = FakeClock()
+    b = _breaker(clock)
+    for _ in range(3):
+        b.record_failure()
+    assert b.allow() is False
+    clock.advance(30.0)
+    assert b.allow() is True
+    assert b.state is CircuitState.HALF_OPEN
+
+
+def test_half_open_success_closes_circuit():
+    clock = FakeClock()
+    b = _breaker(clock)
+    for _ in range(3):
+        b.record_failure()
+    clock.advance(31.0)
+    b.allow()
+    b.record_success()
+    assert b.state is CircuitState.CLOSED
+    assert b.allow() is True
+
+
+def test_half_open_failure_reopens_immediately():
+    clock = FakeClock()
+    b = _breaker(clock)
+    for _ in range(3):
+        b.record_failure()
+    clock.advance(31.0)
+    b.allow()
+    b.record_failure()
+    assert b.state is CircuitState.OPEN
+    assert b.allow() is False
+
+
+def test_half_open_allows_only_one_probe():
+    clock = FakeClock()
+    b = _breaker(clock)
+    for _ in range(3):
+        b.record_failure()
+    clock.advance(31.0)
+    assert b.allow() is True
+    assert b.allow() is False
+```
+
+- [ ] **Step 2: Chạy test để xác nhận fail**
+
+Chạy: `uv run pytest packages/vypq-core/tests/test_breaker.py -v`
+Mong đợi: FAIL với `ModuleNotFoundError: No module named 'vypq_core.breaker'`
+
+- [ ] **Step 3: Viết breaker.py**
+
+`packages/vypq-core/src/vypq_core/breaker.py`:
+```python
+import time
+from collections.abc import Callable
+from enum import Enum
+
+from vypq_contracts.common import ErrorCode
+from vypq_core.errors import ServiceError
+
+
+class CircuitState(str, Enum):
+    CLOSED = "closed"
+    OPEN = "open"
+    HALF_OPEN = "half_open"
+
+
+class CircuitOpenError(ServiceError):
+    def __init__(self, target: str) -> None:
+        super().__init__(
+            ErrorCode.CIRCUIT_OPEN,
+            f"circuit đang mở cho {target}",
+            http_status=503,
+        )
+
+
+class CircuitBreaker:
+    """Mở sau N lỗi liên tiếp, half-open sau T giây, đóng lại khi probe thành công."""
+
+    def __init__(
+        self,
+        failure_threshold: int = 5,
+        recovery_timeout_s: float = 30.0,
+        clock: Callable[[], float] = time.monotonic,
+    ) -> None:
+        self._threshold = failure_threshold
+        self._recovery = recovery_timeout_s
+        self._clock = clock
+        self._failures = 0
+        self._opened_at: float | None = None
+        self._probe_in_flight = False
+
+    @property
+    def state(self) -> CircuitState:
+        if self._opened_at is None:
+            return CircuitState.CLOSED
+        if self._probe_in_flight:
+            return CircuitState.HALF_OPEN
+        return CircuitState.OPEN
+
+    def allow(self) -> bool:
+        if self._opened_at is None:
+            return True
+        if self._probe_in_flight:
+            # Half-open chỉ cho đúng một request thăm dò đi qua.
+            return False
+        if self._clock() - self._opened_at >= self._recovery:
+            self._probe_in_flight = True
+            return True
+        return False
+
+    def record_success(self) -> None:
+        self._failures = 0
+        self._opened_at = None
+        self._probe_in_flight = False
+
+    def record_failure(self) -> None:
+        if self._probe_in_flight:
+            # Probe hỏng → mở lại ngay, tính lại thời gian chờ.
+            self._probe_in_flight = False
+            self._opened_at = self._clock()
+            return
+        self._failures += 1
+        if self._failures >= self._threshold:
+            self._opened_at = self._clock()
+
+    def is_open(self) -> bool:
+        return self.state is not CircuitState.CLOSED
+```
+
+- [ ] **Step 4: Chạy test để xác nhận pass**
+
+Chạy: `uv run pytest packages/vypq-core/tests/test_breaker.py -v`
+Mong đợi: 7 PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/vypq-core
+git commit -m "feat(core): circuit breaker với đồng hồ tiêm được"
+```
+
+---
+### Task 5: vypq-core — UpstreamClient (retry + backoff + breaker)
+
+**Files:**
+- Create: `packages/vypq-core/src/vypq_core/http_client.py`
+- Test: `packages/vypq-core/tests/test_http_client.py`
+
+**Interfaces:**
+- Consumes: `vypq_core.breaker.{CircuitBreaker, CircuitOpenError}`, `vypq_core.errors.ServiceError`
+- Produces:
+  - `UpstreamError(ServiceError)` — lỗi tạm thời, đáng retry
+  - `UpstreamClient(base_url: str, *, token: str | None = None, timeout_s: float = 60.0, max_attempts: int = 3, base_delay_s: float = 0.2, breaker: CircuitBreaker | None = None, client: httpx.AsyncClient | None = None, sleep=asyncio.sleep, jitter=random.random)`
+  - `await UpstreamClient.request(method: str, path: str, **kw) -> httpx.Response`
+  - `await UpstreamClient.aclose() -> None`
+  - Thuộc tính `.breaker`
+
+- [ ] **Step 1: Viết test trước**
+
+`packages/vypq-core/tests/test_http_client.py`:
+```python
+import httpx
+import pytest
+import respx
+
+from vypq_core.breaker import CircuitBreaker, CircuitOpenError, CircuitState
+from vypq_core.errors import ServiceError
+from vypq_core.http_client import UpstreamClient, UpstreamError
+
+BASE = "http://gpu-box:9001"
+
+
+async def _noop_sleep(_seconds: float) -> None:
+    return None
+
+
+def _client(**kw) -> UpstreamClient:
+    kw.setdefault("sleep", _noop_sleep)
+    kw.setdefault("jitter", lambda: 0.0)
+    return UpstreamClient(BASE, **kw)
+
+
+@respx.mock
+async def test_returns_response_on_success():
+    respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(200, json={"ok": True}))
+    async with _client() as c:
+        resp = await c.request("GET", "/v1/models")
+    assert resp.json() == {"ok": True}
+
+
+@respx.mock
+async def test_retries_on_500_then_succeeds():
+    route = respx.get(f"{BASE}/v1/models").mock(
+        side_effect=[httpx.Response(500), httpx.Response(200, json={"ok": True})]
+    )
+    async with _client(max_attempts=3) as c:
+        resp = await c.request("GET", "/v1/models")
+    assert resp.status_code == 200
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_does_not_retry_on_400():
+    route = respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(400, text="sai"))
+    async with _client(max_attempts=3) as c:
+        with pytest.raises(ServiceError) as exc:
+            await c.request("GET", "/v1/models")
+    assert route.call_count == 1
+    assert exc.value.http_status == 400
+    assert not isinstance(exc.value, UpstreamError)
+
+
+@respx.mock
+async def test_retries_on_connect_error_then_raises_upstream_error():
+    route = respx.get(f"{BASE}/v1/models").mock(side_effect=httpx.ConnectError("từ chối"))
+    async with _client(max_attempts=3) as c:
+        with pytest.raises(UpstreamError):
+            await c.request("GET", "/v1/models")
+    assert route.call_count == 3
+
+
+@respx.mock
+async def test_timeout_is_reported_as_upstream_error():
+    respx.get(f"{BASE}/v1/models").mock(side_effect=httpx.ReadTimeout("quá hạn"))
+    async with _client(max_attempts=1) as c:
+        with pytest.raises(UpstreamError):
+            await c.request("GET", "/v1/models")
+
+
+@respx.mock
+async def test_breaker_opens_after_repeated_failures_and_short_circuits():
+    route = respx.get(f"{BASE}/v1/models").mock(side_effect=httpx.ConnectError("từ chối"))
+    breaker = CircuitBreaker(failure_threshold=2, recovery_timeout_s=30.0)
+    async with _client(max_attempts=1, breaker=breaker) as c:
+        for _ in range(2):
+            with pytest.raises(UpstreamError):
+                await c.request("GET", "/v1/models")
+        assert breaker.state is CircuitState.OPEN
+        with pytest.raises(CircuitOpenError):
+            await c.request("GET", "/v1/models")
+    # Lần thứ ba bị chặn tại chỗ, không gửi request nào ra ngoài.
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_4xx_does_not_trip_the_breaker():
+    respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(422))
+    breaker = CircuitBreaker(failure_threshold=2, recovery_timeout_s=30.0)
+    async with _client(max_attempts=1, breaker=breaker) as c:
+        for _ in range(3):
+            with pytest.raises(ServiceError):
+                await c.request("GET", "/v1/models")
+    assert breaker.state is CircuitState.CLOSED
+
+
+@respx.mock
+async def test_bearer_token_is_sent():
+    captured: dict[str, str] = {}
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers.get("authorization", "")
+        return httpx.Response(200, json={})
+
+    respx.get(f"{BASE}/v1/models").mock(side_effect=_record)
+    async with _client(token="sekret") as c:
+        await c.request("GET", "/v1/models")
+    assert captured["auth"] == "Bearer sekret"
+
+
+@respx.mock
+async def test_backoff_delays_grow_exponentially():
+    delays: list[float] = []
+
+    async def _record_sleep(seconds: float) -> None:
+        delays.append(seconds)
+
+    respx.get(f"{BASE}/v1/models").mock(side_effect=httpx.ConnectError("từ chối"))
+    c = UpstreamClient(
+        BASE, max_attempts=4, base_delay_s=0.5, sleep=_record_sleep, jitter=lambda: 0.0
+    )
+    async with c:
+        with pytest.raises(UpstreamError):
+            await c.request("GET", "/v1/models")
+    assert delays == [0.5, 1.0, 2.0]
+```
+
+- [ ] **Step 2: Chạy test để xác nhận fail**
+
+Chạy: `uv run pytest packages/vypq-core/tests/test_http_client.py -v`
+Mong đợi: FAIL với `ModuleNotFoundError: No module named 'vypq_core.http_client'`
+
+- [ ] **Step 3: Viết http_client.py**
+
+`packages/vypq-core/src/vypq_core/http_client.py`:
+```python
+import asyncio
+import random
+from collections.abc import Awaitable, Callable
+
+import httpx
+
+from vypq_contracts.common import ErrorCode
+from vypq_core.breaker import CircuitBreaker, CircuitOpenError
+from vypq_core.errors import ServiceError
+from vypq_core.logging import get_logger
+
+log = get_logger(__name__)
+
+
+class UpstreamError(ServiceError):
+    """Lỗi tạm thời phía upstream — đáng retry và làm sập circuit."""
+
+    def __init__(self, message: str, code: ErrorCode = ErrorCode.UPSTREAM_ERROR) -> None:
+        super().__init__(code, message, http_status=503)
+
+
+class UpstreamClient:
+    def __init__(
+        self,
+        base_url: str,
+        *,
+        token: str | None = None,
+        timeout_s: float = 60.0,
+        max_attempts: int = 3,
+        base_delay_s: float = 0.2,
+        breaker: CircuitBreaker | None = None,
+        client: httpx.AsyncClient | None = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        jitter: Callable[[], float] = random.random,
+    ) -> None:
+        self.base_url = base_url.rstrip("/")
+        self.breaker = breaker or CircuitBreaker()
+        self._max_attempts = max_attempts
+        self._base_delay = base_delay_s
+        self._sleep = sleep
+        self._jitter = jitter
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        self._client = client or httpx.AsyncClient(
+            base_url=self.base_url, timeout=timeout_s, headers=headers
+        )
+
+    async def __aenter__(self) -> "UpstreamClient":
+        return self
+
+    async def __aexit__(self, *_exc) -> None:
+        await self.aclose()
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+    async def request(self, method: str, path: str, **kwargs) -> httpx.Response:
+        if not self.breaker.allow():
+            raise CircuitOpenError(self.base_url)
+
+        last: Exception | None = None
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                response = await self._client.request(method, path, **kwargs)
+            except (httpx.TimeoutException, httpx.TransportError) as exc:
+                code = (
+                    ErrorCode.UPSTREAM_TIMEOUT
+                    if isinstance(exc, httpx.TimeoutException)
+                    else ErrorCode.UPSTREAM_ERROR
+                )
+                last = UpstreamError(f"{self.base_url}: {exc}", code)
+            else:
+                if response.status_code < 400:
+                    self.breaker.record_success()
+                    return response
+                if response.status_code < 500:
+                    # 4xx là lỗi của request, thử lại vẫn sai. Không retry,
+                    # không tính vào circuit breaker.
+                    raise ServiceError(
+                        ErrorCode.BAD_INPUT,
+                        f"upstream từ chối ({response.status_code}): {response.text[:200]}",
+                        http_status=response.status_code,
+                    )
+                last = UpstreamError(f"{self.base_url} trả {response.status_code}")
+
+            if attempt < self._max_attempts:
+                delay = self._base_delay * (2 ** (attempt - 1))
+                await self._sleep(delay + self._jitter() * delay * 0.1)
+                log.warning("upstream_retry", url=self.base_url, attempt=attempt)
+
+        self.breaker.record_failure()
+        assert last is not None
+        raise last
+```
+
+- [ ] **Step 4: Chạy test để xác nhận pass**
+
+Chạy: `uv run pytest packages/vypq-core/tests/test_http_client.py -v`
+Mong đợi: 9 PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/vypq-core
+git commit -m "feat(core): UpstreamClient với retry, backoff và circuit breaker"
+```
+
+---
+
+### Task 6: vypq-core — host registry
+
+**Files:**
+- Create: `packages/vypq-core/src/vypq_core/host_registry.py`
+- Test: `packages/vypq-core/tests/test_host_registry.py`
+
+**Interfaces:**
+- Consumes: `vypq_contracts.hosting.ModelInfo`, `vypq_contracts.common.{ErrorCode, Task}`, `vypq_core.errors.ServiceError`
+- Produces:
+  - `HostRef(name: str, url: str, token: str | None, models: list[ModelInfo], healthy: bool, inflight: int)` — có `.has_model(model_id) -> bool`
+  - `NoHostAvailableError(ServiceError)` — code `MODEL_UNAVAILABLE`, http 503
+  - `HostRegistry` Protocol: `await hosts() -> list[HostRef]`, `await pick(model_id: str) -> HostRef`, `models_for_task(task: Task) -> list[ModelInfo]`, context manager `lease(host)` tăng/giảm `inflight`
+  - `StaticHostRegistry(hosts: list[HostRef])`
+
+Plan B sẽ thêm `DiscoveryHostRegistry` cùng Protocol này. Plan A chỉ cần bản static.
+
+- [ ] **Step 1: Viết test trước**
+
+`packages/vypq-core/tests/test_host_registry.py`:
+```python
+import pytest
+
+from vypq_contracts.common import ModelKind, Task
+from vypq_contracts.hosting import ModelInfo
+from vypq_core.host_registry import HostRef, NoHostAvailableError, StaticHostRegistry
+
+
+def _model(mid: str, task: Task = Task.OCR, available: bool = True) -> ModelInfo:
+    return ModelInfo(
+        id=mid, task=task, kind=ModelKind.OPENSOURCE, runner="fake", available=available
+    )
+
+
+def _host(name: str, models: list[ModelInfo], healthy: bool = True) -> HostRef:
+    return HostRef(name=name, url=f"http://{name}:9000", models=models, healthy=healthy)
+
+
+async def test_pick_returns_host_that_has_the_model():
+    reg = StaticHostRegistry([_host("a", [_model("m1")]), _host("b", [_model("m2")])])
+    assert (await reg.pick("m2")).name == "b"
+
+
+async def test_pick_skips_unhealthy_hosts():
+    reg = StaticHostRegistry(
+        [_host("a", [_model("m1")], healthy=False), _host("b", [_model("m1")])]
+    )
+    assert (await reg.pick("m1")).name == "b"
+
+
+async def test_pick_skips_hosts_where_model_is_unavailable():
+    reg = StaticHostRegistry(
+        [_host("a", [_model("m1", available=False)]), _host("b", [_model("m1")])]
+    )
+    assert (await reg.pick("m1")).name == "b"
+
+
+async def test_pick_chooses_least_inflight():
+    a = _host("a", [_model("m1")])
+    b = _host("b", [_model("m1")])
+    a.inflight = 3
+    b.inflight = 1
+    reg = StaticHostRegistry([a, b])
+    assert (await reg.pick("m1")).name == "b"
+
+
+async def test_pick_raises_when_no_host_has_the_model():
+    reg = StaticHostRegistry([_host("a", [_model("m1")])])
+    with pytest.raises(NoHostAvailableError):
+        await reg.pick("khong-ton-tai")
+
+
+async def test_lease_increments_then_decrements_inflight():
+    host = _host("a", [_model("m1")])
+    reg = StaticHostRegistry([host])
+    async with reg.lease(host):
+        assert host.inflight == 1
+    assert host.inflight == 0
+
+
+async def test_lease_decrements_even_when_body_raises():
+    host = _host("a", [_model("m1")])
+    reg = StaticHostRegistry([host])
+    with pytest.raises(RuntimeError):
+        async with reg.lease(host):
+            raise RuntimeError("hỏng")
+    assert host.inflight == 0
+
+
+async def test_models_for_task_filters_and_dedupes():
+    reg = StaticHostRegistry(
+        [
+            _host("a", [_model("m1"), _model("m9", task=Task.ASR)]),
+            _host("b", [_model("m1"), _model("m2")]),
+        ]
+    )
+    ids = sorted(m.id for m in reg.models_for_task(Task.OCR))
+    assert ids == ["m1", "m2"]
+```
+
+- [ ] **Step 2: Chạy test để xác nhận fail**
+
+Chạy: `uv run pytest packages/vypq-core/tests/test_host_registry.py -v`
+Mong đợi: FAIL với `ModuleNotFoundError: No module named 'vypq_core.host_registry'`
+
+- [ ] **Step 3: Viết host_registry.py**
+
+`packages/vypq-core/src/vypq_core/host_registry.py`:
+```python
+from contextlib import asynccontextmanager
+from typing import Protocol
+
+from pydantic import BaseModel, Field
+
+from vypq_contracts.common import ErrorCode, Task
+from vypq_contracts.hosting import ModelInfo
+from vypq_core.errors import ServiceError
+
+
+class NoHostAvailableError(ServiceError):
+    def __init__(self, model_id: str) -> None:
+        super().__init__(
+            ErrorCode.MODEL_UNAVAILABLE,
+            f"không có host khoẻ nào phục vụ model '{model_id}'",
+            http_status=503,
+        )
+
+
+class HostRef(BaseModel):
+    name: str
+    url: str
+    token: str | None = None
+    models: list[ModelInfo] = Field(default_factory=list)
+    healthy: bool = True
+    inflight: int = 0
+
+    def has_model(self, model_id: str) -> bool:
+        return any(m.id == model_id and m.available for m in self.models)
+
+
+class HostRegistry(Protocol):
+    async def hosts(self) -> list[HostRef]: ...
+    async def pick(self, model_id: str) -> HostRef: ...
+    def models_for_task(self, task: Task) -> list[ModelInfo]: ...
+
+
+class StaticHostRegistry:
+    """Danh sách host cố định từ config. Plan B thay bằng DiscoveryHostRegistry."""
+
+    def __init__(self, hosts: list[HostRef]) -> None:
+        self._hosts = hosts
+
+    async def hosts(self) -> list[HostRef]:
+        return list(self._hosts)
+
+    async def pick(self, model_id: str) -> HostRef:
+        candidates = [h for h in self._hosts if h.healthy and h.has_model(model_id)]
+        if not candidates:
+            raise NoHostAvailableError(model_id)
+        return min(candidates, key=lambda h: h.inflight)
+
+    def models_for_task(self, task: Task) -> list[ModelInfo]:
+        seen: dict[str, ModelInfo] = {}
+        for host in self._hosts:
+            for model in host.models:
+                if model.task is task and model.id not in seen:
+                    seen[model.id] = model
+        return list(seen.values())
+
+    @asynccontextmanager
+    async def lease(self, host: HostRef):
+        host.inflight += 1
+        try:
+            yield host
+        finally:
+            host.inflight -= 1
+```
+
+- [ ] **Step 4: Chạy test để xác nhận pass**
+
+Chạy: `uv run pytest packages/vypq-core/tests/test_host_registry.py -v`
+Mong đợi: 8 PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add packages/vypq-core
+git commit -m "feat(core): host registry tĩnh, chọn host ít request đang chạy nhất"
+```
+
+---
+### Task 7: vypq-events — topic, envelope, producer, consumer
+
+Đây là task quan trọng nhất của Plan A. Yêu cầu cốt lõi từ spec mục 3.5: **khi upstream chết,
+worker phải dừng consume, không được đẩy message vào DLQ.** Nếu làm sai, một lần GPU sập sẽ
+đổ nguyên hàng đợi vào dead-letter.
+
+**Files:**
+- Create: `packages/vypq-events/pyproject.toml`
+- Create: `packages/vypq-events/src/vypq_events/{__init__,topics,envelope,producer,consumer}.py`
+- Create: `packages/vypq-events/src/vypq_events/schemas/{__init__,inference}.py`
+- Test: `packages/vypq-events/tests/{conftest,test_topics,test_consumer}.py`
+
+**Interfaces:**
+- Consumes: `vypq_contracts.common.{ErrorCode, Task}`, `vypq_core.breaker.CircuitOpenError`, `vypq_core.http_client.UpstreamError`
+- Produces:
+  - `request_topic(task) -> str`, `result_topic(task) -> str`, `dlq_topic(task) -> str`, `CRAWL_DOCUMENTS_READY: str`
+  - `EventEnvelope[T](event_id, event_type, trace_id, occurred_at, payload: T)` với classmethod `new(event_type, payload, trace_id=None) -> EventEnvelope[T]`
+  - `InferenceRequested`, `InferenceCompleted`, `InferenceFailed`
+  - `EventProducer(brokers, producer=None)` — `start()`, `stop()`, `publish(topic, envelope, key=None)`
+  - `EventConsumer(...)` — `run_once() -> int`, `run()`
+  - `default_is_retryable(exc) -> bool`
+
+- [ ] **Step 1: Tạo pyproject**
+
+`packages/vypq-events/pyproject.toml`:
+```toml
+[project]
+name = "vypq-events"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = ["vypq-contracts", "vypq-core", "aiokafka>=0.11", "pydantic>=2.9"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/vypq_events"]
+
+[tool.uv.sources]
+vypq-contracts = { workspace = true }
+vypq-core = { workspace = true }
+```
+
+- [ ] **Step 2: Viết test cho topics và envelope**
+
+`packages/vypq-events/tests/test_topics.py`:
+```python
+from vypq_contracts.common import Task
+from vypq_events.envelope import EventEnvelope
+from vypq_events.schemas.inference import InferenceRequested
+from vypq_events.topics import dlq_topic, request_topic, result_topic
+
+
+def test_topic_names():
+    assert request_topic(Task.OCR) == "infer.ocr.requests"
+    assert result_topic(Task.OCR) == "infer.ocr.results"
+    assert dlq_topic(Task.ASR) == "infer.asr.dlq"
+
+
+def test_envelope_new_generates_ids():
+    payload = InferenceRequested(task=Task.OCR, input_uri="s3://b/a.jpg")
+    env = EventEnvelope[InferenceRequested].new("inference.requested", payload)
+    assert env.event_id
+    assert env.trace_id
+    assert env.event_type == "inference.requested"
+
+
+def test_envelope_roundtrip_preserves_payload():
+    payload = InferenceRequested(
+        task=Task.OCR, input_uri="s3://b/a.jpg", model_version="m1", eval_job_id="e1"
+    )
+    env = EventEnvelope[InferenceRequested].new("inference.requested", payload)
+    parsed = EventEnvelope[InferenceRequested].model_validate_json(env.model_dump_json())
+    assert parsed.payload.model_version == "m1"
+    assert parsed.payload.eval_job_id == "e1"
+    assert parsed.trace_id == env.trace_id
+
+
+def test_envelope_reuses_supplied_trace_id():
+    payload = InferenceRequested(task=Task.OCR, input_uri="s3://b/a.jpg")
+    env = EventEnvelope[InferenceRequested].new("x", payload, trace_id="trace-9")
+    assert env.trace_id == "trace-9"
+```
+
+- [ ] **Step 3: Viết topics.py, envelope.py, schemas/inference.py**
+
+`packages/vypq-events/src/vypq_events/topics.py`:
+```python
+from vypq_contracts.common import Task
+
+CRAWL_DOCUMENTS_READY = "crawl.documents.ready"
+
+
+def request_topic(task: Task) -> str:
+    return f"infer.{task.value}.requests"
+
+
+def result_topic(task: Task) -> str:
+    return f"infer.{task.value}.results"
+
+
+def dlq_topic(task: Task) -> str:
+    return f"infer.{task.value}.dlq"
+```
+
+`packages/vypq-events/src/vypq_events/envelope.py`:
+```python
+import uuid
+from datetime import UTC, datetime
+from typing import Generic, TypeVar
+
+from pydantic import BaseModel, Field
+
+T = TypeVar("T", bound=BaseModel)
+
+
+class EventEnvelope(BaseModel, Generic[T]):
+    event_id: str
+    event_type: str
+    trace_id: str
+    occurred_at: datetime
+    payload: T
+
+    @classmethod
+    def new(cls, event_type: str, payload: T, trace_id: str | None = None):
+        return cls(
+            event_id=uuid.uuid4().hex,
+            event_type=event_type,
+            trace_id=trace_id or uuid.uuid4().hex,
+            occurred_at=datetime.now(UTC),
+            payload=payload,
+        )
+
+
+class RawEnvelope(BaseModel):
+    """Envelope chưa biết kiểu payload — dùng khi đẩy vào DLQ."""
+
+    event_id: str
+    event_type: str
+    trace_id: str
+    occurred_at: datetime
+    payload: dict = Field(default_factory=dict)
+```
+
+`packages/vypq-events/src/vypq_events/schemas/inference.py`:
+```python
+from typing import Any
+
+from pydantic import BaseModel, Field
+
+from vypq_contracts.common import ErrorCode, Task
+
+
+class InferenceRequested(BaseModel):
+    task: Task
+    input_uri: str
+    model_version: str | None = None
+    eval_job_id: str | None = None
+    dataset_item_id: str | None = None
+
+
+class InferenceCompleted(BaseModel):
+    task: Task
+    model_version: str
+    input_uri: str
+    output: dict[str, Any] = Field(default_factory=dict)
+    latency_ms: int
+    eval_job_id: str | None = None
+    dataset_item_id: str | None = None
+
+
+class InferenceFailed(BaseModel):
+    task: Task
+    input_uri: str
+    code: ErrorCode
+    message: str
+    attempts: int
+    model_version: str | None = None
+    eval_job_id: str | None = None
+    dataset_item_id: str | None = None
+```
+
+`packages/vypq-events/src/vypq_events/schemas/__init__.py` và `packages/vypq-events/src/vypq_events/__init__.py`:
+```python
+__all__: list[str] = []
+```
+
+- [ ] **Step 4: Chạy test topics**
+
+Chạy: `uv run pytest packages/vypq-events/tests/test_topics.py -v`
+Mong đợi: 4 PASS
+
+- [ ] **Step 5: Viết fake Kafka cho test consumer**
+
+`packages/vypq-events/tests/conftest.py`:
+```python
+from dataclasses import dataclass, field
+
+
+@dataclass(frozen=True)
+class TP:
+    topic: str
+    partition: int = 0
+
+
+@dataclass
+class FakeMessage:
+    value: bytes
+    offset: int
+    topic: str = "infer.ocr.requests"
+    partition: int = 0
+    key: bytes | None = None
+
+
+@dataclass
+class FakeConsumer:
+    """Thay aiokafka.AIOKafkaConsumer trong unit test."""
+
+    batches: list[dict] = field(default_factory=list)
+    committed: int = 0
+    paused_tps: set = field(default_factory=set)
+    seeks: list[tuple] = field(default_factory=list)
+    _tp: TP = field(default_factory=lambda: TP("infer.ocr.requests", 0))
+
+    async def getmany(self, timeout_ms: int = 1000, max_records: int | None = None):
+        if not self.batches:
+            return {}
+        return self.batches.pop(0)
+
+    def assignment(self):
+        return {self._tp}
+
+    def paused(self):
+        return set(self.paused_tps)
+
+    def pause(self, *tps):
+        self.paused_tps.update(tps)
+
+    def resume(self, *tps):
+        self.paused_tps.difference_update(tps)
+
+    def seek(self, tp, offset):
+        self.seeks.append((tp, offset))
+
+    async def commit(self):
+        self.committed += 1
+
+
+@dataclass
+class FakeProducer:
+    published: list[tuple] = field(default_factory=list)
+
+    async def publish(self, topic, envelope, key=None):
+        self.published.append((topic, envelope, key))
+```
+
+- [ ] **Step 6: Viết test cho consumer**
+
+`packages/vypq-events/tests/test_consumer.py`:
+```python
+import pytest
+from conftest import TP, FakeConsumer, FakeMessage, FakeProducer
+
+from vypq_contracts.common import Task
+from vypq_core.breaker import CircuitOpenError
+from vypq_core.http_client import UpstreamError
+from vypq_events.consumer import EventConsumer
+from vypq_events.envelope import EventEnvelope
+from vypq_events.schemas.inference import InferenceRequested
+
+TOPIC_TP = TP("infer.ocr.requests", 0)
+
+
+def _msg(offset: int, uri: str = "s3://b/a.jpg") -> FakeMessage:
+    env = EventEnvelope[InferenceRequested].new(
+        "inference.requested", InferenceRequested(task=Task.OCR, input_uri=uri)
+    )
+    return FakeMessage(value=env.model_dump_json().encode(), offset=offset)
+
+
+class Clock:
+    def __init__(self) -> None:
+        self.now = 0.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, s: float) -> None:
+        self.now += s
+
+
+async def _noop_sleep(_s: float) -> None:
+    return None
+
+
+def _consumer(kafka, producer, handler, clock=None, **kw) -> EventConsumer:
+    return EventConsumer(
+        topic="infer.ocr.requests",
+        group_id="ocr-default",
+        handler=handler,
+        dlq_topic="infer.ocr.dlq",
+        producer=producer,
+        consumer=kafka,
+        sleep=_noop_sleep,
+        clock=clock or Clock(),
+        max_attempts=kw.pop("max_attempts", 3),
+        pause_seconds=kw.pop("pause_seconds", 10.0),
+        **kw,
+    )
+
+
+async def test_processes_batch_and_commits():
+    seen = []
+
+    async def handler(env):
+        seen.append(env)
+
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0), _msg(1)]}])
+    c = _consumer(kafka, FakeProducer(), handler)
+    processed = await c.run_once()
+    assert processed == 2
+    assert len(seen) == 2
+    assert kafka.committed == 1
+
+
+async def test_permanent_error_goes_to_dlq_and_processing_continues():
+    calls = []
+
+    async def handler(env):
+        calls.append(env)
+        if len(calls) == 1:
+            raise ValueError("ảnh hỏng")
+
+    producer = FakeProducer()
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0), _msg(1)]}])
+    c = _consumer(kafka, producer, handler)
+    processed = await c.run_once()
+    assert processed == 2
+    assert len(producer.published) == 1
+    assert producer.published[0][0] == "infer.ocr.dlq"
+    assert kafka.seeks == []
+
+
+@pytest.mark.parametrize("exc", [CircuitOpenError("gpu"), UpstreamError("gpu chết")])
+async def test_retryable_exhaustion_pauses_and_seeks_back_without_dlq(exc):
+    async def handler(_env):
+        raise exc
+
+    producer = FakeProducer()
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(5), _msg(6)]}])
+    c = _consumer(kafka, producer, handler, max_attempts=2)
+    processed = await c.run_once()
+
+    assert processed == 0
+    assert producer.published == []          # tuyệt đối không đẩy vào DLQ
+    assert kafka.seeks == [(TOPIC_TP, 5)]    # tua về đúng message đang dở
+    assert TOPIC_TP in kafka.paused_tps      # đã dừng consume
+    assert kafka.committed == 1              # commit tới trước message đó
+
+
+async def test_retryable_then_success_does_not_pause():
+    attempts = []
+
+    async def handler(_env):
+        attempts.append(1)
+        if len(attempts) == 1:
+            raise UpstreamError("chập chờn")
+
+    producer = FakeProducer()
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]}])
+    c = _consumer(kafka, producer, handler, max_attempts=3)
+    processed = await c.run_once()
+    assert processed == 1
+    assert len(attempts) == 2
+    assert kafka.paused_tps == set()
+    assert producer.published == []
+
+
+async def test_malformed_json_goes_to_dlq():
+    async def handler(_env):
+        raise AssertionError("không bao giờ được gọi")
+
+    producer = FakeProducer()
+    bad = FakeMessage(value=b"{khong-phai-json", offset=0)
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [bad]}])
+    c = _consumer(kafka, producer, handler)
+    processed = await c.run_once()
+    assert processed == 1
+    assert producer.published[0][0] == "infer.ocr.dlq"
+
+
+async def test_stays_paused_until_pause_window_elapses():
+    async def handler(_env):
+        raise UpstreamError("gpu chết")
+
+    clock = Clock()
+    producer = FakeProducer()
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]}, {TOPIC_TP: [_msg(0)]}])
+    c = _consumer(kafka, producer, handler, clock=clock, max_attempts=1, pause_seconds=10.0)
+
+    await c.run_once()
+    assert TOPIC_TP in kafka.paused_tps
+
+    clock.advance(5.0)
+    await c.run_once()
+    assert TOPIC_TP in kafka.paused_tps       # chưa hết cửa sổ chờ, vẫn dừng
+
+    clock.advance(6.0)
+    await c.run_once()
+    assert kafka.paused_tps == set()          # hết cửa sổ → tự resume để thử lại
+```
+
+- [ ] **Step 7: Chạy test để xác nhận fail**
+
+Chạy: `uv run pytest packages/vypq-events/tests/test_consumer.py -v`
+Mong đợi: FAIL với `ModuleNotFoundError: No module named 'vypq_events.consumer'`
+
+- [ ] **Step 8: Viết producer.py**
+
+`packages/vypq-events/src/vypq_events/producer.py`:
+```python
+from aiokafka import AIOKafkaProducer
+
+from vypq_events.envelope import EventEnvelope
+
+
+class EventProducer:
+    def __init__(self, brokers: str = "localhost:9092", producer=None) -> None:
+        self._producer = producer or AIOKafkaProducer(bootstrap_servers=brokers)
+
+    async def start(self) -> None:
+        await self._producer.start()
+
+    async def stop(self) -> None:
+        await self._producer.stop()
+
+    async def publish(self, topic: str, envelope: EventEnvelope, key: str | None = None) -> None:
+        # Partition key mặc định là trace_id → mọi event của một request cùng partition.
+        partition_key = (key or envelope.trace_id).encode()
+        await self._producer.send_and_wait(
+            topic, envelope.model_dump_json().encode(), key=partition_key
+        )
+```
+
+- [ ] **Step 9: Viết consumer.py**
+
+`packages/vypq-events/src/vypq_events/consumer.py`:
+```python
+import asyncio
+import time
+from collections.abc import Awaitable, Callable
+
+from aiokafka import AIOKafkaConsumer
+
+from vypq_core.breaker import CircuitOpenError
+from vypq_core.http_client import UpstreamError
+from vypq_core.logging import get_logger, set_trace_id
+from vypq_events.envelope import EventEnvelope, RawEnvelope
+
+log = get_logger(__name__)
+
+Handler = Callable[[RawEnvelope], Awaitable[None]]
+
+
+def default_is_retryable(exc: Exception) -> bool:
+    """Lỗi của upstream thì đáng chờ; lỗi của dữ liệu thì không."""
+    return isinstance(exc, (CircuitOpenError, UpstreamError))
+
+
+class _PauseSignal(Exception):
+    """Nội bộ: báo run_once dừng consume thay vì đẩy message vào DLQ."""
+
+
+class EventConsumer:
+    def __init__(
+        self,
+        *,
+        topic: str,
+        group_id: str,
+        handler: Handler,
+        dlq_topic: str,
+        producer,
+        brokers: str = "localhost:9092",
+        consumer=None,
+        max_attempts: int = 3,
+        base_delay_s: float = 0.5,
+        pause_seconds: float = 30.0,
+        poll_ms: int = 1000,
+        max_records: int = 20,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        clock: Callable[[], float] = time.monotonic,
+        is_retryable: Callable[[Exception], bool] = default_is_retryable,
+    ) -> None:
+        self._handler = handler
+        self._dlq_topic = dlq_topic
+        self._producer = producer
+        self._max_attempts = max_attempts
+        self._base_delay = base_delay_s
+        self._pause_seconds = pause_seconds
+        self._poll_ms = poll_ms
+        self._max_records = max_records
+        self._sleep = sleep
+        self._clock = clock
+        self._is_retryable = is_retryable
+        self._paused_until: float | None = None
+        self._consumer = consumer or AIOKafkaConsumer(
+            topic,
+            bootstrap_servers=brokers,
+            group_id=group_id,
+            enable_auto_commit=False,
+            auto_offset_reset="earliest",
+        )
+
+    async def start(self) -> None:
+        await self._consumer.start()
+
+    async def stop(self) -> None:
+        await self._consumer.stop()
+
+    async def run(self) -> None:
+        while True:
+            await self.run_once()
+
+    async def run_once(self) -> int:
+        self._maybe_resume()
+        batch = await self._consumer.getmany(
+            timeout_ms=self._poll_ms, max_records=self._max_records
+        )
+        processed = 0
+        for tp, messages in batch.items():
+            for message in messages:
+                try:
+                    await self._process(message)
+                except _PauseSignal:
+                    # Tua về đúng message đang dở rồi commit: mọi thứ trước nó
+                    # coi như xong, còn nó sẽ được giao lại khi resume.
+                    self._consumer.seek(tp, message.offset)
+                    await self._consumer.commit()
+                    self._pause()
+                    return processed
+                processed += 1
+        if processed:
+            await self._consumer.commit()
+        return processed
+
+    def _pause(self) -> None:
+        assignment = self._consumer.assignment()
+        if assignment:
+            self._consumer.pause(*assignment)
+        self._paused_until = self._clock() + self._pause_seconds
+        log.warning("consumer_paused", seconds=self._pause_seconds)
+
+    def _maybe_resume(self) -> None:
+        if self._paused_until is None:
+            return
+        if self._clock() < self._paused_until:
+            return
+        paused = self._consumer.paused()
+        if paused:
+            self._consumer.resume(*paused)
+        self._paused_until = None
+        log.info("consumer_resumed")
+
+    async def _process(self, message) -> None:
+        try:
+            envelope = RawEnvelope.model_validate_json(message.value)
+        except Exception as exc:
+            log.error("envelope_parse_failed", error=str(exc))
+            await self._to_dlq(message, None, exc, attempts=1)
+            return
+
+        set_trace_id(envelope.trace_id)
+        for attempt in range(1, self._max_attempts + 1):
+            try:
+                await self._handler(envelope)
+                return
+            except Exception as exc:
+                if not self._is_retryable(exc):
+                    await self._to_dlq(message, envelope, exc, attempts=attempt)
+                    return
+                if attempt == self._max_attempts:
+                    log.warning("retry_exhausted_pausing", error=str(exc))
+                    raise _PauseSignal from exc
+                await self._sleep(self._base_delay * (2 ** (attempt - 1)))
+
+    async def _to_dlq(self, message, envelope, exc: Exception, attempts: int) -> None:
+        dead = EventEnvelope[RawEnvelope].new(
+            "event.dead_lettered",
+            RawEnvelope(
+                event_id=getattr(envelope, "event_id", "unknown"),
+                event_type=getattr(envelope, "event_type", "unknown"),
+                trace_id=getattr(envelope, "trace_id", "unknown"),
+                occurred_at=getattr(envelope, "occurred_at", None) or _now(),
+                payload={
+                    "reason": f"{type(exc).__name__}: {exc}",
+                    "attempts": attempts,
+                    "raw": message.value.decode("utf-8", errors="replace"),
+                },
+            ),
+        )
+        await self._producer.publish(self._dlq_topic, dead)
+        log.error("event_dead_lettered", topic=self._dlq_topic, reason=str(exc))
+
+
+def _now():
+    from datetime import UTC, datetime
+
+    return datetime.now(UTC)
+```
+
+- [ ] **Step 10: Chạy test để xác nhận pass**
+
+Chạy: `uv run pytest packages/vypq-events -v`
+Mong đợi: 4 + 7 = 11 PASS
+
+- [ ] **Step 11: Thêm Redpanda vào compose và viết test tích hợp**
+
+`infra/compose/docker-compose.dev.yml`:
+```yaml
+services:
+  redpanda:
+    image: redpandadata/redpanda:v24.2.7
+    command:
+      - redpanda start
+      - --overprovisioned
+      - --smp 1
+      - --memory 1G
+      - --kafka-addr PLAINTEXT://0.0.0.0:9092
+      - --advertise-kafka-addr PLAINTEXT://localhost:9092
+    ports: ["9092:9092"]
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
+      interval: 5s
+      retries: 20
+
+  redpanda-console:
+    image: redpandadata/console:v2.7.2
+    environment:
+      KAFKA_BROKERS: redpanda:9092
+    ports: ["8090:8080"]
+    depends_on: [redpanda]
+```
+
+`packages/vypq-events/tests/test_integration_redpanda.py`:
+```python
+import asyncio
+
+import pytest
+
+from vypq_contracts.common import Task
+from vypq_events.consumer import EventConsumer
+from vypq_events.envelope import EventEnvelope
+from vypq_events.producer import EventProducer
+from vypq_events.schemas.inference import InferenceRequested
+from vypq_events.topics import dlq_topic, request_topic
+
+pytestmark = pytest.mark.slow
+BROKERS = "localhost:9092"
+
+
+async def test_roundtrip_through_real_redpanda():
+    producer = EventProducer(BROKERS)
+    await producer.start()
+    received: list = []
+
+    async def handler(env):
+        received.append(env)
+
+    consumer = EventConsumer(
+        topic=request_topic(Task.OCR),
+        group_id="test-ocr",
+        handler=handler,
+        dlq_topic=dlq_topic(Task.OCR),
+        producer=producer,
+        brokers=BROKERS,
+    )
+    await consumer.start()
+    try:
+        env = EventEnvelope[InferenceRequested].new(
+            "inference.requested",
+            InferenceRequested(task=Task.OCR, input_uri="s3://b/a.jpg"),
+        )
+        await producer.publish(request_topic(Task.OCR), env)
+        for _ in range(20):
+            if await consumer.run_once():
+                break
+            await asyncio.sleep(0.5)
+    finally:
+        await consumer.stop()
+        await producer.stop()
+
+    assert len(received) == 1
+    assert received[0].payload["input_uri"] == "s3://b/a.jpg"
+```
+
+- [ ] **Step 12: Chạy test tích hợp với Redpanda thật**
+
+```bash
+docker compose -f infra/compose/docker-compose.dev.yml up -d redpanda
+uv run pytest packages/vypq-events/tests/test_integration_redpanda.py -m slow -v
+```
+Mong đợi: 1 PASS. Console xem topic tại http://localhost:8090
+
+- [ ] **Step 13: Commit**
+
+```bash
+git add packages/vypq-events infra
+git commit -m "feat(events): envelope, producer và consumer dừng-consume thay vì đổ DLQ"
+```
+
+---
+### Task 8: model-host — registry, VRAM, auth, API
+
+**Files:**
+- Create: `apps/model-host/pyproject.toml`, `apps/model-host/models.yaml`
+- Create: `apps/model-host/src/model_host/{__init__,settings,spec,registry,auth,main}.py`
+- Create: `apps/model-host/src/model_host/runners/{__init__,base,fake}.py`
+- Create: `apps/model-host/src/model_host/api/{__init__,routes}.py`
+- Test: `apps/model-host/tests/{test_registry,test_api}.py`
+
+**Interfaces:**
+- Consumes: `vypq_core.app.create_app`, `vypq_core.config.BaseServiceSettings`, `vypq_core.errors.ServiceError`, `vypq_contracts.hosting.*`
+- Produces:
+  - `ModelSpec(id, task, kind, runner, source, vram_mb, pinned, base, trained_on, params)`
+  - `HostConfig(host_name, vram_budget_mb, models)`, `load_host_config(path: Path) -> HostConfig`
+  - `ModelRunner` Protocol: `task: Task`, `load(spec: ModelSpec) -> None`, `unload() -> None`, `predict(data: bytes, params: dict) -> RawOcrOutput | RawAsrOutput`
+  - `RunnerFactory = Callable[[str], ModelRunner]`, `RUNNERS: dict[str, RunnerFactory]`
+  - `ModelRegistry(config, runners)` — `.infos() -> list[ModelInfo]`, `.acquire(model_id) -> tuple[ModelRunner, ModelSpec, int]` (int = load_ms)
+  - `ModelHostSettings(host_name, token, models_path, vram_budget_mb)`
+  - Endpoint `GET /v1/models`, `POST /v1/infer`, `POST /v1/infer/upload`
+
+- [ ] **Step 1: Tạo pyproject và models.yaml**
+
+`apps/model-host/pyproject.toml`:
+```toml
+[project]
+name = "model-host"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "vypq-contracts",
+    "vypq-core",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.12",
+    "pyyaml>=6.0",
+    "httpx>=0.27",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/model_host"]
+
+[tool.uv.sources]
+vypq-contracts = { workspace = true }
+vypq-core = { workspace = true }
+```
+
+`apps/model-host/models.yaml`:
+```yaml
+host_name: gpu-1
+vram_budget_mb: 20000
+models:
+  - id: paddleocr-v4-vi
+    task: ocr
+    kind: opensource
+    runner: paddle
+    vram_mb: 2500
+    pinned: true
+    source: {type: hf, repo: PaddlePaddle/PP-OCRv4}
+    params: {lang: vi, use_angle_cls: true}
+```
+
+- [ ] **Step 2: Viết test cho registry**
+
+`apps/model-host/tests/test_registry.py`:
+```python
+import pytest
+
+from model_host.registry import ModelRegistry
+from model_host.runners.fake import FakeOcrRunner
+from model_host.spec import HostConfig, ModelSpec
+from vypq_contracts.common import ModelKind, Task
+from vypq_core.errors import ServiceError
+
+
+def _spec(mid: str, vram: int, pinned: bool = False) -> ModelSpec:
+    return ModelSpec(
+        id=mid, task=Task.OCR, kind=ModelKind.OPENSOURCE, runner="fake",
+        vram_mb=vram, pinned=pinned,
+    )
+
+
+def _registry(specs: list[ModelSpec], budget: int) -> ModelRegistry:
+    config = HostConfig(host_name="gpu-1", vram_budget_mb=budget, models=specs)
+    return ModelRegistry(config, runners={"fake": FakeOcrRunner})
+
+
+def test_models_are_not_loaded_until_acquired():
+    reg = _registry([_spec("m1", 1000)], budget=5000)
+    assert reg.infos()[0].loaded is False
+    reg.acquire("m1")
+    assert reg.infos()[0].loaded is True
+
+
+def test_acquire_returns_same_runner_instance_on_second_call():
+    reg = _registry([_spec("m1", 1000)], budget=5000)
+    first, _, load_ms_1 = reg.acquire("m1")
+    second, _, load_ms_2 = reg.acquire("m1")
+    assert first is second
+    assert load_ms_2 == 0  # lần thứ hai không tốn thời gian load
+
+
+def test_evicts_least_recently_used_when_budget_exceeded():
+    reg = _registry([_spec("m1", 3000), _spec("m2", 3000)], budget=5000)
+    reg.acquire("m1")
+    reg.acquire("m2")
+    loaded = {i.id: i.loaded for i in reg.infos()}
+    assert loaded == {"m1": False, "m2": True}
+
+
+def test_pinned_model_is_never_evicted():
+    reg = _registry([_spec("m1", 3000, pinned=True), _spec("m2", 3000)], budget=5000)
+    reg.acquire("m1")
+    with pytest.raises(ServiceError) as exc:
+        reg.acquire("m2")
+    assert "không đủ VRAM" in exc.value.message
+    assert reg.infos()[0].loaded is True
+
+
+def test_recently_used_model_survives_eviction():
+    reg = _registry([_spec("m1", 2000), _spec("m2", 2000), _spec("m3", 2000)], budget=5000)
+    reg.acquire("m1")
+    reg.acquire("m2")
+    reg.acquire("m1")   # m1 vừa dùng → m2 mới là cũ nhất
+    reg.acquire("m3")
+    loaded = {i.id: i.loaded for i in reg.infos()}
+    assert loaded == {"m1": True, "m2": False, "m3": True}
+
+
+def test_model_larger_than_budget_is_rejected_clearly():
+    reg = _registry([_spec("m1", 99000)], budget=5000)
+    with pytest.raises(ServiceError) as exc:
+        reg.acquire("m1")
+    assert "lớn hơn ngân sách" in exc.value.message
+
+
+def test_unknown_model_raises_service_error():
+    reg = _registry([_spec("m1", 1000)], budget=5000)
+    with pytest.raises(ServiceError):
+        reg.acquire("khong-co")
+
+
+def test_failed_load_marks_model_unavailable_without_killing_host():
+    class Broken(FakeOcrRunner):
+        def load(self, spec):
+            raise RuntimeError("thiếu checkpoint")
+
+    config = HostConfig(
+        host_name="gpu-1", vram_budget_mb=5000,
+        models=[_spec("m1", 1000), _spec("m2", 1000)],
+    )
+    config.models[0].runner = "broken"
+    reg = ModelRegistry(config, runners={"fake": FakeOcrRunner, "broken": Broken})
+    with pytest.raises(ServiceError):
+        reg.acquire("m1")
+    infos = {i.id: i for i in reg.infos()}
+    assert infos["m1"].available is False
+    assert infos["m2"].available is True     # model khác không bị ảnh hưởng
+```
+
+- [ ] **Step 3: Chạy test để xác nhận fail**
+
+Chạy: `uv run pytest apps/model-host -v`
+Mong đợi: FAIL với `ModuleNotFoundError: No module named 'model_host'`
+
+- [ ] **Step 4: Viết spec.py và runners**
+
+`apps/model-host/src/model_host/spec.py`:
+```python
+from pathlib import Path
+from typing import Any
+
+import yaml
+from pydantic import BaseModel, Field
+
+from vypq_contracts.common import ModelKind, Task
+
+
+class ModelSpec(BaseModel):
+    id: str
+    task: Task
+    kind: ModelKind
+    runner: str
+    vram_mb: int = 0
+    pinned: bool = False
+    source: dict[str, str] = Field(default_factory=dict)
+    base: str | None = None
+    trained_on: str | None = None
+    params: dict[str, Any] = Field(default_factory=dict)
+
+
+class HostConfig(BaseModel):
+    host_name: str
+    vram_budget_mb: int
+    models: list[ModelSpec] = Field(default_factory=list)
+
+
+def load_host_config(path: Path) -> HostConfig:
+    return HostConfig.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+```
+
+`apps/model-host/src/model_host/runners/base.py`:
+```python
+from typing import Protocol
+
+from model_host.spec import ModelSpec
+from vypq_contracts.asr import RawAsrOutput
+from vypq_contracts.common import Task
+from vypq_contracts.ocr import RawOcrOutput
+
+
+class ModelRunner(Protocol):
+    task: Task
+
+    def load(self, spec: ModelSpec) -> None: ...
+    def unload(self) -> None: ...
+    def predict(self, data: bytes, params: dict) -> RawOcrOutput | RawAsrOutput: ...
+```
+
+`apps/model-host/src/model_host/runners/fake.py`:
+```python
+from model_host.spec import ModelSpec
+from vypq_contracts.asr import RawAsrOutput, Segment
+from vypq_contracts.common import Task
+from vypq_contracts.ocr import RawOcrOutput, TextBox
+
+
+class FakeOcrRunner:
+    """Runner không cần GPU. Dùng cho test và cho việc chạy thử toàn stack."""
+
+    task = Task.OCR
+
+    def __init__(self) -> None:
+        self._spec: ModelSpec | None = None
+
+    def load(self, spec: ModelSpec) -> None:
+        self._spec = spec
+
+    def unload(self) -> None:
+        self._spec = None
+
+    def predict(self, data: bytes, params: dict) -> RawOcrOutput:
+        # Trả box cố định, không phụ thuộc nội dung ảnh — đủ để kiểm hợp đồng.
+        return RawOcrOutput(
+            boxes=[
+                TextBox(id=0, polygon=[(10, 10), (110, 10), (110, 40), (10, 40)],
+                        text="XIN CHÀO", confidence=0.99),
+                TextBox(id=1, polygon=[(10, 50), (90, 50), (90, 80), (10, 80)],
+                        text="thế giới", confidence=0.95),
+            ]
+        )
+
+
+class FakeAsrRunner:
+    task = Task.ASR
+
+    def load(self, spec: ModelSpec) -> None:
+        self._spec = spec
+
+    def unload(self) -> None:
+        self._spec = None
+
+    def predict(self, data: bytes, params: dict) -> RawAsrOutput:
+        return RawAsrOutput(
+            segments=[
+                Segment(start=0.0, end=1.2, text="xin chào"),
+                Segment(start=1.4, end=2.9, text="thế giới"),
+            ]
+        )
+```
+
+`apps/model-host/src/model_host/runners/__init__.py`:
+```python
+from model_host.runners.fake import FakeAsrRunner, FakeOcrRunner
+
+RUNNERS: dict[str, type] = {
+    "fake": FakeOcrRunner,
+    "fake-asr": FakeAsrRunner,
+}
+```
+
+- [ ] **Step 5: Viết registry.py**
+
+`apps/model-host/src/model_host/registry.py`:
+```python
+import time
+from collections.abc import Callable
+
+from model_host.runners.base import ModelRunner
+from model_host.spec import HostConfig, ModelSpec
+from vypq_contracts.common import ErrorCode
+from vypq_contracts.hosting import ModelInfo
+from vypq_core.errors import ServiceError
+from vypq_core.logging import get_logger
+
+log = get_logger(__name__)
+
+
+class _Loaded:
+    __slots__ = ("runner", "spec", "last_used")
+
+    def __init__(self, runner: ModelRunner, spec: ModelSpec, last_used: int) -> None:
+        self.runner = runner
+        self.spec = spec
+        self.last_used = last_used
+
+
+class ModelRegistry:
+    """Lazy load, evict LRU theo vram_budget_mb. Model pinned không bao giờ bị evict."""
+
+    def __init__(self, config: HostConfig, runners: dict[str, Callable[[], ModelRunner]]) -> None:
+        self._config = config
+        self._runners = runners
+        self._specs = {spec.id: spec for spec in config.models}
+        self._loaded: dict[str, _Loaded] = {}
+        self._unavailable: set[str] = set()
+        self._tick = 0
+
+    @property
+    def host_name(self) -> str:
+        return self._config.host_name
+
+    def infos(self) -> list[ModelInfo]:
+        return [
+            ModelInfo(
+                id=s.id, task=s.task, kind=s.kind, runner=s.runner, vram_mb=s.vram_mb,
+                base=s.base, trained_on=s.trained_on,
+                loaded=s.id in self._loaded,
+                available=s.id not in self._unavailable,
+            )
+            for s in self._config.models
+        ]
+
+    def acquire(self, model_id: str) -> tuple[ModelRunner, ModelSpec, int]:
+        spec = self._specs.get(model_id)
+        if spec is None:
+            raise ServiceError(
+                ErrorCode.MODEL_UNAVAILABLE, f"không có model '{model_id}' trên host này", 404
+            )
+        if model_id in self._unavailable:
+            raise ServiceError(
+                ErrorCode.MODEL_UNAVAILABLE, f"model '{model_id}' đang không dùng được", 503
+            )
+
+        self._tick += 1
+        if entry := self._loaded.get(model_id):
+            entry.last_used = self._tick
+            return entry.runner, entry.spec, 0
+
+        self._make_room(spec)
+        factory = self._runners.get(spec.runner)
+        if factory is None:
+            raise ServiceError(
+                ErrorCode.INTERNAL, f"không biết runner '{spec.runner}'", 500
+            )
+        started = time.monotonic()
+        runner = factory()
+        try:
+            runner.load(spec)
+        except Exception as exc:
+            # Một model hỏng không được làm sập cả host.
+            self._unavailable.add(model_id)
+            log.error("model_load_failed", model_id=model_id, error=str(exc))
+            raise ServiceError(
+                ErrorCode.MODEL_UNAVAILABLE, f"không load được '{model_id}': {exc}", 503
+            ) from exc
+        load_ms = int((time.monotonic() - started) * 1000)
+        self._loaded[model_id] = _Loaded(runner, spec, self._tick)
+        log.info("model_loaded", model_id=model_id, load_ms=load_ms)
+        return runner, spec, load_ms
+
+    def _used_mb(self) -> int:
+        return sum(e.spec.vram_mb for e in self._loaded.values())
+
+    def _make_room(self, spec: ModelSpec) -> None:
+        budget = self._config.vram_budget_mb
+        if spec.vram_mb > budget:
+            raise ServiceError(
+                ErrorCode.MODEL_UNAVAILABLE,
+                f"model '{spec.id}' cần {spec.vram_mb}MB, lớn hơn ngân sách {budget}MB",
+                503,
+            )
+        while self._used_mb() + spec.vram_mb > budget:
+            evictable = [e for e in self._loaded.values() if not e.spec.pinned]
+            if not evictable:
+                raise ServiceError(
+                    ErrorCode.MODEL_UNAVAILABLE,
+                    f"không đủ VRAM cho '{spec.id}': các model đang giữ đều là pinned",
+                    503,
+                )
+            victim = min(evictable, key=lambda e: e.last_used)
+            victim.runner.unload()
+            del self._loaded[victim.spec.id]
+            log.info("model_evicted", model_id=victim.spec.id)
+```
+
+- [ ] **Step 6: Chạy test registry**
+
+Chạy: `uv run pytest apps/model-host/tests/test_registry.py -v`
+Mong đợi: 8 PASS
+
+- [ ] **Step 7: Viết test cho API**
+
+`apps/model-host/tests/test_api.py`:
+```python
+import httpx
+import pytest
+
+from model_host.api.routes import build_router
+from model_host.registry import ModelRegistry
+from model_host.runners.fake import FakeOcrRunner
+from model_host.settings import ModelHostSettings
+from model_host.spec import HostConfig, ModelSpec
+from vypq_contracts.common import ModelKind, Task
+from vypq_core.app import create_app
+
+TOKEN = "sekret"
+
+
+def _app():
+    config = HostConfig(
+        host_name="gpu-1", vram_budget_mb=5000,
+        models=[ModelSpec(id="m1", task=Task.OCR, kind=ModelKind.OPENSOURCE,
+                          runner="fake", vram_mb=1000)],
+    )
+    registry = ModelRegistry(config, runners={"fake": FakeOcrRunner})
+    settings = ModelHostSettings(service_name="model-host", token=TOKEN, host_name="gpu-1")
+    return create_app(settings, routers=[build_router(registry, settings)])
+
+
+def _client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app()),
+        base_url="http://t",
+        headers={"Authorization": f"Bearer {TOKEN}"},
+    )
+
+
+async def test_models_endpoint_lists_declared_models():
+    async with _client() as c:
+        resp = await c.get("/v1/models")
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["host_name"] == "gpu-1"
+    assert [m["id"] for m in body["models"]] == ["m1"]
+
+
+async def test_request_without_token_is_rejected():
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app()), base_url="http://t"
+    ) as c:
+        resp = await c.get("/v1/models")
+    assert resp.status_code == 401
+
+
+async def test_request_with_wrong_token_is_rejected():
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app()),
+        base_url="http://t",
+        headers={"Authorization": "Bearer sai"},
+    ) as c:
+        resp = await c.get("/v1/models")
+    assert resp.status_code == 401
+
+
+async def test_health_does_not_require_token():
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=_app()), base_url="http://t"
+    ) as c:
+        resp = await c.get("/health")
+    assert resp.status_code == 200
+
+
+async def test_infer_upload_returns_raw_boxes():
+    async with _client() as c:
+        resp = await c.post(
+            "/v1/infer/upload",
+            data={"model_id": "m1"},
+            files={"file": ("a.jpg", b"\xff\xd8fake-jpeg", "image/jpeg")},
+        )
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["model_id"] == "m1"
+    assert body["task"] == "ocr"
+    assert body["output"]["boxes"][0]["text"] == "XIN CHÀO"
+    assert body["timing"]["infer_ms"] >= 0
+
+
+async def test_infer_upload_with_unknown_model_returns_404_envelope():
+    async with _client() as c:
+        resp = await c.post(
+            "/v1/infer/upload",
+            data={"model_id": "khong-co"},
+            files={"file": ("a.jpg", b"x", "image/jpeg")},
+        )
+    assert resp.status_code == 404
+    assert resp.json()["code"] == "model_unavailable"
+
+
+async def test_infer_by_uri_reads_local_file(tmp_path):
+    image = tmp_path / "a.jpg"
+    image.write_bytes(b"\xff\xd8fake-jpeg")
+    async with _client() as c:
+        resp = await c.post(
+            "/v1/infer", json={"model_id": "m1", "input_uri": image.as_uri()}
+        )
+    assert resp.status_code == 200
+    assert resp.json()["output"]["boxes"][1]["text"] == "thế giới"
+
+
+async def test_infer_by_uri_rejects_unsupported_scheme():
+    async with _client() as c:
+        resp = await c.post(
+            "/v1/infer", json={"model_id": "m1", "input_uri": "s3://bucket/a.jpg"}
+        )
+    assert resp.status_code == 400
+    assert "scheme" in resp.json()["message"]
+
+
+def test_settings_refuse_empty_token():
+    with pytest.raises(ValueError):
+        ModelHostSettings(service_name="model-host", token="", host_name="gpu-1")
+```
+
+- [ ] **Step 8: Viết settings.py, auth.py, api/routes.py, main.py**
+
+`apps/model-host/src/model_host/settings.py`:
+```python
+from pathlib import Path
+
+from pydantic import field_validator
+
+from vypq_core.config import BaseServiceSettings
+
+
+class ModelHostSettings(BaseServiceSettings):
+    service_name: str = "model-host"
+    host_name: str = "gpu-1"
+    token: str = ""
+    models_path: Path = Path("models.yaml")
+    port: int = 9000
+
+    @field_validator("token")
+    @classmethod
+    def _token_must_not_be_empty(cls, value: str) -> str:
+        # ngrok phơi endpoint ra Internet công cộng: chạy không token là không chấp nhận được.
+        if not value.strip():
+            raise ValueError("VYPQ_TOKEN bắt buộc phải có — model-host từ chối khởi động")
+        return value
+```
+
+`apps/model-host/src/model_host/auth.py`:
+```python
+from fastapi import Header
+
+from vypq_contracts.common import ErrorCode
+from vypq_core.errors import ServiceError
+
+
+def make_token_dependency(expected: str):
+    async def require_token(authorization: str = Header(default="")) -> None:
+        prefix = "Bearer "
+        supplied = authorization[len(prefix):] if authorization.startswith(prefix) else ""
+        if supplied != expected:
+            raise ServiceError(ErrorCode.BAD_INPUT, "token không hợp lệ", http_status=401)
+
+    return require_token
+```
+
+`apps/model-host/src/model_host/api/routes.py`:
+```python
+import time
+from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx
+from fastapi import APIRouter, Depends, File, Form, UploadFile
+
+from model_host.auth import make_token_dependency
+from model_host.registry import ModelRegistry
+from model_host.settings import ModelHostSettings
+from vypq_contracts.common import ErrorCode
+from vypq_contracts.hosting import InferRequest, InferResponse, InferTiming, ModelsResponse
+from vypq_core.errors import ServiceError
+
+_SUPPORTED_SCHEMES = {"http", "https", "file"}
+
+
+async def _fetch(uri: str) -> bytes:
+    scheme = urlparse(uri).scheme
+    if scheme not in _SUPPORTED_SCHEMES:
+        raise ServiceError(
+            ErrorCode.BAD_INPUT,
+            f"scheme '{scheme}' chưa hỗ trợ — dùng http(s) presigned url hoặc file://",
+            http_status=400,
+        )
+    if scheme == "file":
+        path = Path(urlparse(uri).path)
+        if not path.is_file():
+            raise ServiceError(ErrorCode.BAD_INPUT, f"không thấy file {path}", 400)
+        return path.read_bytes()
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(uri)
+    if response.status_code >= 400:
+        raise ServiceError(ErrorCode.BAD_INPUT, f"tải {uri} thất bại", 400)
+    return response.content
+
+
+def build_router(registry: ModelRegistry, settings: ModelHostSettings) -> APIRouter:
+    guard = Depends(make_token_dependency(settings.token))
+    router = APIRouter(prefix="/v1", dependencies=[guard])
+
+    def _run(model_id: str, data: bytes, params: dict) -> InferResponse:
+        runner, spec, load_ms = registry.acquire(model_id)
+        started = time.monotonic()
+        output = runner.predict(data, {**spec.params, **params})
+        infer_ms = int((time.monotonic() - started) * 1000)
+        return InferResponse(
+            model_id=model_id,
+            task=spec.task,
+            output=output,
+            timing=InferTiming(load_ms=load_ms, infer_ms=infer_ms),
+        )
+
+    @router.get("/models", response_model=ModelsResponse)
+    async def list_models() -> ModelsResponse:
+        return ModelsResponse(host_name=registry.host_name, models=registry.infos())
+
+    @router.post("/infer", response_model=InferResponse)
+    async def infer(request: InferRequest) -> InferResponse:
+        if not request.input_uri:
+            raise ServiceError(ErrorCode.BAD_INPUT, "thiếu input_uri", 400)
+        data = await _fetch(request.input_uri)
+        return _run(request.model_id, data, request.params)
+
+    @router.post("/infer/upload", response_model=InferResponse)
+    async def infer_upload(
+        model_id: str = Form(...), file: UploadFile = File(...)
+    ) -> InferResponse:
+        return _run(model_id, await file.read(), {})
+
+    return router
+```
+
+`apps/model-host/src/model_host/main.py`:
+```python
+from model_host.api.routes import build_router
+from model_host.registry import ModelRegistry
+from model_host.runners import RUNNERS
+from model_host.settings import ModelHostSettings
+from model_host.spec import load_host_config
+from vypq_core.app import create_app
+
+
+def build_app():
+    settings = ModelHostSettings()
+    config = load_host_config(settings.models_path)
+    registry = ModelRegistry(config, runners=RUNNERS)
+    return create_app(settings, routers=[build_router(registry, settings)])
+
+
+app = build_app()
+```
+
+`apps/model-host/src/model_host/__init__.py` và `apps/model-host/src/model_host/api/__init__.py`:
+```python
+__all__: list[str] = []
+```
+
+- [ ] **Step 9: Chạy toàn bộ test model-host**
+
+Chạy: `uv run pytest apps/model-host -v`
+Mong đợi: 8 + 9 = 17 PASS
+
+- [ ] **Step 10: Chạy thử host thật bằng fake runner**
+
+```bash
+cd apps/model-host
+cat > models.dev.yaml <<'YAML'
+host_name: gpu-dev
+vram_budget_mb: 4000
+models:
+  - {id: fake-ocr, task: ocr, kind: opensource, runner: fake, vram_mb: 100, pinned: true}
+YAML
+VYPQ_TOKEN=sekret VYPQ_MODELS_PATH=models.dev.yaml \
+  uv run uvicorn model_host.main:app --port 9001 &
+sleep 3
+curl -s localhost:9001/v1/models -H "Authorization: Bearer sekret" | head -c 300
+echo
+curl -s -o /dev/null -w "%{http_code}\n" localhost:9001/v1/models
+```
+Mong đợi: JSON có `fake-ocr`, và request không token trả `401`.
+
+- [ ] **Step 11: Commit**
+
+```bash
+git add apps/model-host
+git commit -m "feat(model-host): registry lazy-load, evict LRU theo VRAM, bearer token bắt buộc"
+```
+
+---
+
+### Task 9: model-host — runner PaddleOCR thật
+
+**Files:**
+- Create: `apps/model-host/src/model_host/runners/paddle.py`
+- Modify: `apps/model-host/src/model_host/runners/__init__.py`
+- Create: `apps/model-host/Dockerfile`
+- Create: `apps/model-host/docker-compose.yml`
+- Test: `apps/model-host/tests/test_paddle_runner.py`
+
+**Interfaces:**
+- Consumes: `ModelRunner` Protocol, `ModelSpec` từ Task 8
+- Produces: `PaddleOcrRunner` đăng ký dưới khoá `"paddle"` trong `RUNNERS`
+
+- [ ] **Step 1: Viết test (đánh dấu slow — cần GPU)**
+
+`apps/model-host/tests/test_paddle_runner.py`:
+```python
+import pytest
+
+from model_host.runners.paddle import PaddleOcrRunner
+from model_host.spec import ModelSpec
+from vypq_contracts.common import ModelKind, Task
+from vypq_contracts.ocr import RawOcrOutput
+
+pytestmark = pytest.mark.slow
+
+SPEC = ModelSpec(
+    id="paddleocr-v4-vi", task=Task.OCR, kind=ModelKind.OPENSOURCE,
+    runner="paddle", vram_mb=2500, params={"lang": "vi", "use_angle_cls": True},
+)
+
+
+@pytest.fixture(scope="module")
+def runner() -> PaddleOcrRunner:
+    r = PaddleOcrRunner()
+    r.load(SPEC)
+    yield r
+    r.unload()
+
+
+def test_predict_returns_raw_ocr_output(runner, tmp_path_factory):
+    image_path = tmp_path_factory.mktemp("img") / "sample.png"
+    _write_sample_image(image_path, "HOA DON")
+    output = runner.predict(image_path.read_bytes(), SPEC.params)
+    assert isinstance(output, RawOcrOutput)
+    assert len(output.boxes) >= 1
+    assert all(len(b.polygon) >= 4 for b in output.boxes)
+    assert "HOA DON" in " ".join(b.text for b in output.boxes).upper()
+
+
+def _write_sample_image(path, text: str) -> None:
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (400, 120), "white")
+    ImageDraw.Draw(image).text((20, 40), text, fill="black")
+    image.save(path)
+```
+
+Thêm `"pillow>=10.4"` vào `[dependency-groups] dev` của `pyproject.toml` gốc.
+
+- [ ] **Step 2: Viết paddle.py**
+
+`apps/model-host/src/model_host/runners/paddle.py`:
+```python
+import io
+
+from model_host.spec import ModelSpec
+from vypq_contracts.common import Task
+from vypq_contracts.ocr import RawOcrOutput, TextBox
+
+
+class PaddleOcrRunner:
+    task = Task.OCR
+
+    def __init__(self) -> None:
+        self._engine = None
+
+    def load(self, spec: ModelSpec) -> None:
+        from paddleocr import PaddleOCR  # import muộn: chỉ máy GPU mới có gói này
+
+        self._engine = PaddleOCR(
+            lang=spec.params.get("lang", "vi"),
+            use_angle_cls=spec.params.get("use_angle_cls", True),
+            show_log=False,
+        )
+
+    def unload(self) -> None:
+        self._engine = None
+
+    def predict(self, data: bytes, params: dict) -> RawOcrOutput:
+        import numpy as np
+        from PIL import Image
+
+        image = np.array(Image.open(io.BytesIO(data)).convert("RGB"))
+        raw = self._engine.ocr(image, cls=params.get("use_angle_cls", True))
+        lines = raw[0] if raw and raw[0] else []
+        boxes = [
+            TextBox(
+                id=index,
+                polygon=[(float(x), float(y)) for x, y in polygon],
+                text=text,
+                confidence=float(confidence),
+            )
+            for index, (polygon, (text, confidence)) in enumerate(lines)
+        ]
+        return RawOcrOutput(boxes=boxes)
+```
+
+- [ ] **Step 3: Đăng ký runner**
+
+`apps/model-host/src/model_host/runners/__init__.py`:
+```python
+from model_host.runners.fake import FakeAsrRunner, FakeOcrRunner
+
+RUNNERS: dict[str, type] = {
+    "fake": FakeOcrRunner,
+    "fake-asr": FakeAsrRunner,
+}
+
+
+def _register_optional() -> None:
+    # Runner thật cần thư viện nặng, chỉ có trên máy GPU. Vắng mặt thì bỏ qua
+    # để host vẫn chạy được ở chế độ fake trên máy dev.
+    try:
+        from model_host.runners.paddle import PaddleOcrRunner
+    except ImportError:
+        return
+    RUNNERS["paddle"] = PaddleOcrRunner
+
+
+_register_optional()
+```
+
+- [ ] **Step 4: Viết Dockerfile và compose cho máy GPU**
+
+`apps/model-host/Dockerfile`:
+```dockerfile
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      python3.12 python3-pip libgl1 libglib2.0-0 curl \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+COPY packages ./packages
+COPY apps/model-host ./apps/model-host
+RUN uv sync --frozen --package model-host --extra gpu
+
+ENV VYPQ_MODELS_PATH=/app/apps/model-host/models.yaml \
+    VYPQ_PORT=9000
+EXPOSE 9000
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
+  CMD curl -fsS http://localhost:9000/health || exit 1
+CMD ["uv", "run", "uvicorn", "model_host.main:app", "--host", "0.0.0.0", "--port", "9000"]
+```
+
+Thêm vào `apps/model-host/pyproject.toml`:
+```toml
+[project.optional-dependencies]
+gpu = ["paddleocr>=2.9", "paddlepaddle-gpu>=2.6", "pillow>=10.4", "numpy>=1.26"]
+```
+
+`apps/model-host/docker-compose.yml` — chạy trên máy GPU thuê, một container mỗi GPU:
+```yaml
+services:
+  model-host-0:
+    build: {context: ../.., dockerfile: apps/model-host/Dockerfile}
+    environment:
+      CUDA_VISIBLE_DEVICES: "0"
+      VYPQ_HOST_NAME: gpu-0
+      VYPQ_TOKEN: ${VYPQ_TOKEN:?bat buoc dat VYPQ_TOKEN}
+    ports: ["9001:9000"]
+    deploy:
+      resources:
+        reservations:
+          devices: [{driver: nvidia, count: all, capabilities: [gpu]}]
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    command: http model-host-0:9000
+    environment:
+      NGROK_AUTHTOKEN: ${NGROK_AUTHTOKEN:?bat buoc dat NGROK_AUTHTOKEN}
+    ports: ["4040:4040"]
+    depends_on: [model-host-0]
+```
+
+- [ ] **Step 5: Chạy test nhanh xác nhận không vỡ gì**
+
+Chạy: `uv run pytest apps/model-host -v`
+Mong đợi: 17 PASS, 1 skipped (test paddle bị loại vì marker `slow`)
+
+- [ ] **Step 6: Chạy test paddle trên máy GPU**
+
+```bash
+docker compose -f apps/model-host/docker-compose.yml up -d --build
+docker compose -f apps/model-host/docker-compose.yml exec model-host-0 \
+  uv run pytest apps/model-host/tests/test_paddle_runner.py -m slow -v
+curl -s localhost:4040/api/tunnels | grep -o 'https://[a-z0-9-]*\.ngrok[^"]*' | head -1
+```
+Mong đợi: 1 PASS, và lệnh cuối in ra URL ngrok công khai của host.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add apps/model-host
+git commit -m "feat(model-host): runner PaddleOCR, Dockerfile CUDA và compose một container mỗi GPU"
+```
+
+---
+### Task 10: services/ocr — pipeline pre/post-process
+
+Toàn bộ task này là hàm thuần, không mạng, không model. Đây là nơi quyết định chất lượng
+OCR ngang với bản thân model, nên phải có test chặt.
+
+**Files:**
+- Create: `services/ocr/pyproject.toml`
+- Create: `services/ocr/src/ocr_service/{__init__,settings}.py`
+- Create: `services/ocr/src/ocr_service/pipeline/{__init__,preprocess,postprocess}.py`
+- Test: `services/ocr/tests/test_pipeline.py`
+
+**Interfaces:**
+- Consumes: `vypq_contracts.ocr.{TextBox, RawOcrOutput, OcrResult}`
+- Produces:
+  - `PreparedImage(data: bytes, scale: float, width: int, height: int)`
+  - `prepare_image(data: bytes, max_side: int = 2000) -> PreparedImage`
+  - `rescale_boxes(boxes: list[TextBox], factor: float) -> list[TextBox]`
+  - `sort_reading_order(boxes: list[TextBox]) -> list[TextBox]`
+  - `build_full_text(boxes: list[TextBox]) -> str`
+  - `normalize_text(text: str) -> str` — NFC
+  - `to_result(raw: RawOcrOutput, scale: float) -> OcrResult`
+
+- [ ] **Step 1: Tạo pyproject cho service ocr**
+
+`services/ocr/pyproject.toml`:
+```toml
+[project]
+name = "ocr-service"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "vypq-contracts",
+    "vypq-core",
+    "vypq-events",
+    "fastapi>=0.115",
+    "uvicorn[standard]>=0.32",
+    "python-multipart>=0.0.12",
+    "pillow>=10.4",
+    "pyyaml>=6.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/ocr_service"]
+
+[tool.uv.sources]
+vypq-contracts = { workspace = true }
+vypq-core = { workspace = true }
+vypq-events = { workspace = true }
+```
+
+- [ ] **Step 2: Viết test trước**
+
+`services/ocr/tests/test_pipeline.py`:
+```python
+import io
+import unicodedata
+
+from PIL import Image
+
+from ocr_service.pipeline.postprocess import (
+    build_full_text,
+    normalize_text,
+    rescale_boxes,
+    sort_reading_order,
+    to_result,
+)
+from ocr_service.pipeline.preprocess import prepare_image
+from vypq_contracts.ocr import RawOcrOutput, TextBox
+
+
+def _box(id_: int, x: float, y: float, w: float = 50, h: float = 20, text: str = "x") -> TextBox:
+    return TextBox(
+        id=id_, polygon=[(x, y), (x + w, y), (x + w, y + h), (x, y + h)], text=text
+    )
+
+
+def _png(width: int, height: int) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), "white").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def test_prepare_image_keeps_small_image_unchanged():
+    prepared = prepare_image(_png(800, 600), max_side=2000)
+    assert prepared.scale == 1.0
+    assert (prepared.width, prepared.height) == (800, 600)
+
+
+def test_prepare_image_shrinks_long_side_to_max():
+    prepared = prepare_image(_png(4000, 1000), max_side=2000)
+    assert prepared.scale == 0.5
+    assert (prepared.width, prepared.height) == (2000, 500)
+    assert Image.open(io.BytesIO(prepared.data)).size == (2000, 500)
+
+
+def test_rescale_boxes_maps_coordinates_back_to_original():
+    boxes = [_box(0, 100, 200, w=50, h=20)]
+    scaled = rescale_boxes(boxes, 2.0)
+    assert scaled[0].polygon[0] == (200.0, 400.0)
+    assert scaled[0].polygon[2] == (300.0, 440.0)
+
+
+def test_rescale_preserves_text_and_confidence():
+    box = TextBox(
+        id=0, polygon=[(0, 0), (1, 0), (1, 1), (0, 1)], text="ế", confidence=0.5, ignore=True
+    )
+    out = rescale_boxes([box], 3.0)[0]
+    assert (out.text, out.confidence, out.ignore) == ("ế", 0.5, True)
+
+
+def test_sort_reading_order_groups_boxes_on_the_same_line():
+    boxes = [
+        _box(0, 300, 10, text="ba"),
+        _box(1, 10, 12, text="mot"),
+        _box(2, 150, 11, text="hai"),
+    ]
+    assert [b.text for b in sort_reading_order(boxes)] == ["mot", "hai", "ba"]
+
+
+def test_sort_reading_order_orders_lines_top_to_bottom():
+    boxes = [
+        _box(0, 10, 100, text="duoi"),
+        _box(1, 10, 10, text="tren"),
+    ]
+    assert [b.text for b in sort_reading_order(boxes)] == ["tren", "duoi"]
+
+
+def test_sort_reading_order_tolerates_slight_vertical_jitter():
+    # Cùng dòng nhưng lệch vài pixel — không được tách thành hai dòng.
+    boxes = [
+        _box(0, 200, 14, text="sau"),
+        _box(1, 10, 10, text="truoc"),
+    ]
+    assert [b.text for b in sort_reading_order(boxes)] == ["truoc", "sau"]
+
+
+def test_build_full_text_joins_lines_with_newline_and_words_with_space():
+    boxes = [
+        _box(0, 10, 10, text="CONG TY"),
+        _box(1, 200, 11, text="ABC"),
+        _box(2, 10, 100, text="HOA DON"),
+    ]
+    assert build_full_text(sort_reading_order(boxes)) == "CONG TY ABC\nHOA DON"
+
+
+def test_build_full_text_skips_ignored_boxes():
+    boxes = [_box(0, 10, 10, text="giu"), _box(1, 200, 10, text="bo")]
+    boxes[1].ignore = True
+    assert build_full_text(sort_reading_order(boxes)) == "giu"
+
+
+def test_normalize_text_converts_decomposed_vietnamese_to_nfc():
+    decomposed = unicodedata.normalize("NFD", "Hóa đơn tiếng Việt")
+    assert decomposed != "Hóa đơn tiếng Việt"
+    assert normalize_text(decomposed) == "Hóa đơn tiếng Việt"
+    assert unicodedata.is_normalized("NFC", normalize_text(decomposed))
+
+
+def test_to_result_rescales_sorts_and_normalizes_in_one_pass():
+    raw = RawOcrOutput(
+        boxes=[
+            _box(0, 100, 5, text=unicodedata.normalize("NFD", "đơn")),
+            _box(1, 10, 6, text=unicodedata.normalize("NFD", "hóa")),
+        ]
+    )
+    result = to_result(raw, scale=0.5)
+    assert result.full_text == "hóa đơn"
+    assert unicodedata.is_normalized("NFC", result.full_text)
+    assert result.boxes[0].polygon[0] == (20.0, 12.0)   # 10 / 0.5
+
+
+def test_to_result_on_empty_output_gives_empty_text():
+    result = to_result(RawOcrOutput(boxes=[]), scale=1.0)
+    assert result.full_text == ""
+    assert result.boxes == []
+```
+
+- [ ] **Step 3: Chạy test để xác nhận fail**
+
+Chạy: `uv run pytest services/ocr -v`
+Mong đợi: FAIL với `ModuleNotFoundError: No module named 'ocr_service'`
+
+- [ ] **Step 4: Viết preprocess.py**
+
+`services/ocr/src/ocr_service/pipeline/preprocess.py`:
+```python
+import io
+from dataclasses import dataclass
+
+from PIL import Image, ImageOps
+
+from vypq_contracts.common import ErrorCode
+from vypq_core.errors import ServiceError
+
+
+@dataclass(frozen=True)
+class PreparedImage:
+    data: bytes
+    scale: float
+    width: int
+    height: int
+
+
+def prepare_image(data: bytes, max_side: int = 2000) -> PreparedImage:
+    """Xoay theo EXIF và giới hạn cạnh dài. `scale` để postprocess tính ngược toạ độ."""
+    try:
+        image = Image.open(io.BytesIO(data))
+        image = ImageOps.exif_transpose(image).convert("RGB")
+    except Exception as exc:
+        raise ServiceError(ErrorCode.BAD_INPUT, f"không đọc được ảnh: {exc}", 422) from exc
+
+    longest = max(image.size)
+    if longest <= max_side:
+        buf = io.BytesIO()
+        image.save(buf, format="PNG")
+        return PreparedImage(buf.getvalue(), 1.0, image.width, image.height)
+
+    scale = max_side / longest
+    resized = image.resize(
+        (round(image.width * scale), round(image.height * scale)), Image.LANCZOS
+    )
+    buf = io.BytesIO()
+    resized.save(buf, format="PNG")
+    return PreparedImage(buf.getvalue(), scale, resized.width, resized.height)
+```
+
+- [ ] **Step 5: Viết postprocess.py**
+
+`services/ocr/src/ocr_service/pipeline/postprocess.py`:
+```python
+import statistics
+import unicodedata
+
+from vypq_contracts.ocr import OcrResult, RawOcrOutput, TextBox
+
+_LINE_TOLERANCE_RATIO = 0.6
+
+
+def normalize_text(text: str) -> str:
+    """Tiếng Việt phải về NFC, nếu không CER so với ground truth sẽ sai."""
+    return unicodedata.normalize("NFC", text)
+
+
+def rescale_boxes(boxes: list[TextBox], factor: float) -> list[TextBox]:
+    if factor == 1.0:
+        return list(boxes)
+    return [
+        box.model_copy(update={"polygon": [(x * factor, y * factor) for x, y in box.polygon]})
+        for box in boxes
+    ]
+
+
+def _y_center(box: TextBox) -> float:
+    return sum(y for _x, y in box.polygon) / len(box.polygon)
+
+
+def _min_x(box: TextBox) -> float:
+    return min(x for x, _y in box.polygon)
+
+
+def _height(box: TextBox) -> float:
+    ys = [y for _x, y in box.polygon]
+    return max(ys) - min(ys)
+
+
+def sort_reading_order(boxes: list[TextBox]) -> list[TextBox]:
+    """Gom box thành dòng theo tâm y, rồi sắp trái sang phải trong mỗi dòng."""
+    if not boxes:
+        return []
+    tolerance = statistics.median(_height(b) for b in boxes) * _LINE_TOLERANCE_RATIO
+    lines: list[list[TextBox]] = []
+    for box in sorted(boxes, key=_y_center):
+        if lines and abs(_y_center(box) - _y_center(lines[-1][0])) <= tolerance:
+            lines[-1].append(box)
+        else:
+            lines.append([box])
+    ordered: list[TextBox] = []
+    for line in lines:
+        ordered.extend(sorted(line, key=_min_x))
+    return ordered
+
+
+def build_full_text(boxes: list[TextBox]) -> str:
+    """Ghép theo dòng: cùng dòng nối bằng dấu cách, khác dòng xuống hàng."""
+    kept = [b for b in boxes if not b.ignore]
+    if not kept:
+        return ""
+    tolerance = statistics.median(_height(b) for b in kept) * _LINE_TOLERANCE_RATIO
+    lines: list[list[str]] = []
+    previous: TextBox | None = None
+    for box in kept:
+        if previous is not None and abs(_y_center(box) - _y_center(previous)) <= tolerance:
+            lines[-1].append(box.text)
+        else:
+            lines.append([box.text])
+            previous = box
+    return normalize_text("\n".join(" ".join(line) for line in lines))
+
+
+def to_result(raw: RawOcrOutput, scale: float) -> OcrResult:
+    factor = 1.0 / scale if scale else 1.0
+    boxes = rescale_boxes(raw.boxes, factor)
+    boxes = [b.model_copy(update={"text": normalize_text(b.text)}) for b in boxes]
+    boxes = sort_reading_order(boxes)
+    return OcrResult(full_text=build_full_text(boxes), boxes=boxes)
+```
+
+`services/ocr/src/ocr_service/pipeline/__init__.py` và `services/ocr/src/ocr_service/__init__.py`:
+```python
+__all__: list[str] = []
+```
+
+- [ ] **Step 6: Chạy test để xác nhận pass**
+
+Chạy: `uv run pytest services/ocr -v`
+Mong đợi: 12 PASS
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add services/ocr
+git commit -m "feat(ocr): pipeline pre/post-process, sắp thứ tự đọc và chuẩn hoá NFC"
+```
+
+---
+
+### Task 11: services/ocr — backend, handler, HTTP entrypoint
+
+**Files:**
+- Create: `services/ocr/config.yaml`, `services/ocr/service.yaml`, `services/ocr/Dockerfile`
+- Create: `services/ocr/src/ocr_service/settings.py`
+- Create: `services/ocr/src/ocr_service/backend/{__init__,base,remote,fake}.py`
+- Create: `services/ocr/src/ocr_service/{handler,main}.py`
+- Test: `services/ocr/tests/{test_backend_remote,test_handler,test_api}.py`
+
+**Interfaces:**
+- Consumes: `vypq_core.host_registry.{HostRef, StaticHostRegistry}`, `vypq_core.http_client.UpstreamClient`, `vypq_core.breaker.CircuitBreaker`, pipeline từ Task 10
+- Produces:
+  - `OcrBackend` Protocol: `await infer(image: bytes, model_id: str) -> RawOcrOutput`
+  - `FakeOcrBackend(output: RawOcrOutput | None = None, error: Exception | None = None)` — có `.calls: list[tuple[bytes, str]]`
+  - `RemoteOcrBackend(registry, *, timeout_s=60.0, max_attempts=3, failure_threshold=5, recovery_timeout_s=30.0, sleep=asyncio.sleep, jitter=random.random)` — có `.infer()`, `.infer_uri()`, `.open_circuits()`, `.aclose()`
+  - `OcrHandler(backend, *, default_model: str, max_side: int = 2000)` — `await run(image: bytes, model_version: str | None, trace_id: str) -> OcrResponse`
+  - `OcrSettings(default_model, max_side, timeout_s, hosts_path)`
+  - `build_app() -> FastAPI` với `POST /v1/ocr` (multipart)
+
+- [ ] **Step 1: Viết test cho backend remote**
+
+`services/ocr/tests/test_backend_remote.py`:
+```python
+import httpx
+import pytest
+import respx
+
+from ocr_service.backend.remote import RemoteOcrBackend
+from vypq_contracts.common import ModelKind, Task
+from vypq_contracts.hosting import ModelInfo
+from vypq_core.breaker import CircuitOpenError
+from vypq_core.host_registry import HostRef, NoHostAvailableError, StaticHostRegistry
+from vypq_core.http_client import UpstreamError
+
+HOST_A = "http://gpu-a:9000"
+HOST_B = "http://gpu-b:9000"
+
+OK_BODY = {
+    "model_id": "m1",
+    "task": "ocr",
+    "output": {"boxes": [
+        {"id": 0, "polygon": [[0, 0], [10, 0], [10, 5], [0, 5]], "text": "A"}
+    ]},
+    "timing": {"load_ms": 0, "infer_ms": 7},
+}
+
+
+def _host(name: str, url: str) -> HostRef:
+    return HostRef(
+        name=name, url=url, token="tk",
+        models=[ModelInfo(id="m1", task=Task.OCR, kind=ModelKind.OPENSOURCE, runner="paddle")],
+    )
+
+
+async def _noop_sleep(_s: float) -> None:
+    return None
+
+
+def _backend(hosts: list[HostRef], **kw) -> RemoteOcrBackend:
+    return RemoteOcrBackend(
+        StaticHostRegistry(hosts), sleep=_noop_sleep, jitter=lambda: 0.0, **kw
+    )
+
+
+@respx.mock
+async def test_infer_posts_multipart_and_parses_boxes():
+    route = respx.post(f"{HOST_A}/v1/infer/upload").mock(
+        return_value=httpx.Response(200, json=OK_BODY)
+    )
+    backend = _backend([_host("a", HOST_A)])
+    output = await backend.infer(b"\xff\xd8jpeg", "m1")
+    assert output.boxes[0].text == "A"
+    assert route.called
+    assert b"multipart/form-data" in route.calls[0].request.headers["content-type"].encode()
+
+
+@respx.mock
+async def test_infer_sends_bearer_token_of_the_chosen_host():
+    captured: dict[str, str] = {}
+
+    def _record(request: httpx.Request) -> httpx.Response:
+        captured["auth"] = request.headers.get("authorization", "")
+        return httpx.Response(200, json=OK_BODY)
+
+    respx.post(f"{HOST_A}/v1/infer/upload").mock(side_effect=_record)
+    await _backend([_host("a", HOST_A)]).infer(b"x", "m1")
+    assert captured["auth"] == "Bearer tk"
+
+
+@respx.mock
+async def test_infer_uri_posts_json_instead_of_multipart():
+    # Đường uri có sẵn cho Plan B (khi máy GPU cùng mạng với MinIO); Plan A dùng inline.
+    route = respx.post(f"{HOST_A}/v1/infer").mock(return_value=httpx.Response(200, json=OK_BODY))
+    backend = _backend([_host("a", HOST_A)])
+    await backend.infer_uri("https://minio/a.jpg", "m1")
+    assert route.called
+    assert route.calls[0].request.headers["content-type"] == "application/json"
+
+
+async def test_unknown_model_raises_no_host_available():
+    with pytest.raises(NoHostAvailableError):
+        await _backend([_host("a", HOST_A)]).infer(b"x", "khong-co")
+
+
+@respx.mock
+async def test_breaker_is_shared_across_calls_to_the_same_host():
+    # Nếu mỗi lần gọi lại tạo client mới, breaker sẽ reset và không bao giờ mở.
+    respx.post(f"{HOST_A}/v1/infer/upload").mock(side_effect=httpx.ConnectError("chết"))
+    backend = _backend([_host("a", HOST_A)], max_attempts=1, failure_threshold=2)
+    for _ in range(2):
+        with pytest.raises(UpstreamError):
+            await backend.infer(b"x", "m1")
+    with pytest.raises(CircuitOpenError):
+        await backend.infer(b"x", "m1")
+
+
+@respx.mock
+async def test_each_host_has_its_own_breaker():
+    respx.post(f"{HOST_A}/v1/infer/upload").mock(side_effect=httpx.ConnectError("chết"))
+    respx.post(f"{HOST_B}/v1/infer/upload").mock(return_value=httpx.Response(200, json=OK_BODY))
+    hosts = [_host("a", HOST_A), _host("b", HOST_B)]
+    backend = _backend(hosts, max_attempts=1, failure_threshold=1)
+    with pytest.raises(UpstreamError):
+        await backend.infer(b"x", "m1")
+    hosts[0].healthy = False
+    output = await backend.infer(b"x", "m1")
+    assert output.boxes[0].text == "A"
+
+
+@respx.mock
+async def test_inflight_returns_to_zero_after_failure():
+    respx.post(f"{HOST_A}/v1/infer/upload").mock(side_effect=httpx.ConnectError("chết"))
+    hosts = [_host("a", HOST_A)]
+    backend = _backend(hosts, max_attempts=1)
+    with pytest.raises(UpstreamError):
+        await backend.infer(b"x", "m1")
+    assert hosts[0].inflight == 0
+```
+
+- [ ] **Step 2: Viết test cho handler và API**
+
+`services/ocr/tests/test_handler.py`:
+```python
+import io
+
+import pytest
+from PIL import Image
+
+from ocr_service.backend.fake import FakeOcrBackend
+from ocr_service.handler import OcrHandler
+from vypq_contracts.ocr import RawOcrOutput, TextBox
+from vypq_core.errors import ServiceError
+
+
+def _png(width: int = 800, height: int = 600) -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (width, height), "white").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _raw(*texts: str) -> RawOcrOutput:
+    return RawOcrOutput(
+        boxes=[
+            TextBox(
+                id=i,
+                polygon=[(10, 10 + i * 40), (100, 10 + i * 40), (100, 40 + i * 40), (10, 40 + i * 40)],
+                text=t,
+            )
+            for i, t in enumerate(texts)
+        ]
+    )
+
+
+async def test_run_returns_response_with_full_text():
+    handler = OcrHandler(FakeOcrBackend(_raw("dòng một", "dòng hai")), default_model="m1")
+    resp = await handler.run(_png(), model_version=None, trace_id="t1")
+    assert resp.result.full_text == "dòng một\ndòng hai"
+    assert resp.trace_id == "t1"
+    assert resp.model_version == "m1"
+    assert resp.latency_ms >= 0
+
+
+async def test_run_uses_requested_model_version():
+    backend = FakeOcrBackend(_raw("a"))
+    handler = OcrHandler(backend, default_model="m1")
+    resp = await handler.run(_png(), model_version="m2", trace_id="t1")
+    assert resp.model_version == "m2"
+    assert backend.calls[0][1] == "m2"
+
+
+async def test_run_rescales_boxes_when_image_is_downsized():
+    handler = OcrHandler(FakeOcrBackend(_raw("a")), default_model="m1", max_side=100)
+    resp = await handler.run(_png(400, 200), model_version=None, trace_id="t1")
+    # Ảnh bị thu 4 lần → toạ độ trả về phải nhân ngược lại 4.
+    assert resp.result.boxes[0].polygon[0] == (40.0, 40.0)
+
+
+async def test_run_rejects_non_image_input():
+    handler = OcrHandler(FakeOcrBackend(_raw("a")), default_model="m1")
+    with pytest.raises(ServiceError) as exc:
+        await handler.run(b"day-khong-phai-anh", model_version=None, trace_id="t1")
+    assert exc.value.http_status == 422
+
+
+async def test_backend_error_propagates_unchanged():
+    boom = RuntimeError("gpu chết")
+    handler = OcrHandler(FakeOcrBackend(error=boom), default_model="m1")
+    with pytest.raises(RuntimeError):
+        await handler.run(_png(), model_version=None, trace_id="t1")
+```
+
+`services/ocr/tests/test_api.py`:
+```python
+import io
+
+import httpx
+from PIL import Image
+
+from ocr_service.backend.fake import FakeOcrBackend
+from ocr_service.handler import OcrHandler
+from ocr_service.main import build_app_with
+from ocr_service.settings import OcrSettings
+from vypq_contracts.ocr import RawOcrOutput, TextBox
+
+
+def _png() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (200, 100), "white").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _app(backend):
+    settings = OcrSettings(service_name="ocr", default_model="m1")
+    return build_app_with(OcrHandler(backend, default_model=settings.default_model), settings)
+
+
+def _client(app) -> httpx.AsyncClient:
+    return httpx.AsyncClient(transport=httpx.ASGITransport(app=app), base_url="http://t")
+
+
+async def test_post_ocr_returns_result():
+    raw = RawOcrOutput(
+        boxes=[TextBox(id=0, polygon=[(0, 0), (9, 0), (9, 9), (0, 9)], text="HÓA ĐƠN")]
+    )
+    async with _client(_app(FakeOcrBackend(raw))) as c:
+        resp = await c.post("/v1/ocr", files={"file": ("a.png", _png(), "image/png")})
+    body = resp.json()
+    assert resp.status_code == 200
+    assert body["result"]["full_text"] == "HÓA ĐƠN"
+    assert body["model_version"] == "m1"
+
+
+async def test_post_ocr_with_broken_file_returns_422_envelope():
+    async with _client(_app(FakeOcrBackend(RawOcrOutput()))) as c:
+        resp = await c.post("/v1/ocr", files={"file": ("a.png", b"rac", "image/png")})
+    assert resp.status_code == 422
+    assert resp.json()["code"] == "bad_input"
+
+
+async def test_trace_id_header_is_echoed_back():
+    async with _client(_app(FakeOcrBackend(RawOcrOutput()))) as c:
+        resp = await c.post(
+            "/v1/ocr",
+            files={"file": ("a.png", _png(), "image/png")},
+            headers={"x-trace-id": "trace-42"},
+        )
+    assert resp.headers["x-trace-id"] == "trace-42"
+    assert resp.json()["trace_id"] == "trace-42"
+```
+
+- [ ] **Step 3: Chạy test để xác nhận fail**
+
+Chạy: `uv run pytest services/ocr -v`
+Mong đợi: FAIL với `ModuleNotFoundError: No module named 'ocr_service.backend'`
+
+- [ ] **Step 4: Viết backend base và fake**
+
+`services/ocr/src/ocr_service/backend/base.py`:
+```python
+from typing import Protocol
+
+from vypq_contracts.ocr import RawOcrOutput
+
+
+class OcrBackend(Protocol):
+    async def infer(self, image: bytes, model_id: str) -> RawOcrOutput: ...
+```
+
+`services/ocr/src/ocr_service/backend/fake.py`:
+```python
+from vypq_contracts.ocr import RawOcrOutput
+
+
+class FakeOcrBackend:
+    """Backend không cần mạng, không cần GPU. Lý do chính khiến backend là interface."""
+
+    def __init__(
+        self, output: RawOcrOutput | None = None, error: Exception | None = None
+    ) -> None:
+        self._output = output or RawOcrOutput()
+        self._error = error
+        self.calls: list[tuple[bytes, str]] = []
+
+    async def infer(self, image: bytes, model_id: str) -> RawOcrOutput:
+        self.calls.append((image, model_id))
+        if self._error is not None:
+            raise self._error
+        return self._output
+```
+
+- [ ] **Step 5: Viết backend remote**
+
+`services/ocr/src/ocr_service/backend/remote.py`:
+```python
+import asyncio
+import random
+from collections.abc import Awaitable, Callable
+
+from vypq_contracts.hosting import InferRequest, InferResponse
+from vypq_contracts.ocr import RawOcrOutput
+from vypq_core.breaker import CircuitBreaker
+from vypq_core.host_registry import HostRef, StaticHostRegistry
+from vypq_core.http_client import UpstreamClient
+
+
+class RemoteOcrBackend:
+    """Gọi model-host qua HTTP. Giữ một UpstreamClient cho mỗi host để circuit
+    breaker sống xuyên suốt các lần gọi — tạo client mới mỗi lần sẽ reset breaker
+    và nó không bao giờ mở được."""
+
+    def __init__(
+        self,
+        registry: StaticHostRegistry,
+        *,
+        timeout_s: float = 60.0,
+        max_attempts: int = 3,
+        failure_threshold: int = 5,
+        recovery_timeout_s: float = 30.0,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        jitter: Callable[[], float] = random.random,
+    ) -> None:
+        self._registry = registry
+        self._timeout_s = timeout_s
+        self._max_attempts = max_attempts
+        self._failure_threshold = failure_threshold
+        self._recovery_timeout_s = recovery_timeout_s
+        self._sleep = sleep
+        self._jitter = jitter
+        self._clients: dict[str, UpstreamClient] = {}
+
+    def _client_for(self, host: HostRef) -> UpstreamClient:
+        if host.name not in self._clients:
+            self._clients[host.name] = UpstreamClient(
+                host.url,
+                token=host.token,
+                timeout_s=self._timeout_s,
+                max_attempts=self._max_attempts,
+                breaker=CircuitBreaker(
+                    failure_threshold=self._failure_threshold,
+                    recovery_timeout_s=self._recovery_timeout_s,
+                ),
+                sleep=self._sleep,
+                jitter=self._jitter,
+            )
+        return self._clients[host.name]
+
+    async def infer(self, image: bytes, model_id: str) -> RawOcrOutput:
+        host = await self._registry.pick(model_id)
+        async with self._registry.lease(host):
+            response = await self._client_for(host).request(
+                "POST",
+                "/v1/infer/upload",
+                data={"model_id": model_id},
+                files={"file": ("input", image, "application/octet-stream")},
+            )
+        return self._parse(response.json())
+
+    async def infer_uri(self, uri: str, model_id: str) -> RawOcrOutput:
+        host = await self._registry.pick(model_id)
+        payload = InferRequest(model_id=model_id, input_uri=uri)
+        async with self._registry.lease(host):
+            response = await self._client_for(host).request(
+                "POST", "/v1/infer", json=payload.model_dump(mode="json")
+            )
+        return self._parse(response.json())
+
+    @staticmethod
+    def _parse(body: dict) -> RawOcrOutput:
+        parsed = InferResponse.model_validate(body)
+        assert isinstance(parsed.output, RawOcrOutput)
+        return parsed.output
+
+    def open_circuits(self) -> list[str]:
+        """Tên các host đang bị circuit chặn — dùng cho /ready."""
+        return [n for n, c in self._clients.items() if c.breaker.is_open()]
+
+    async def aclose(self) -> None:
+        for client in self._clients.values():
+            await client.aclose()
+        self._clients.clear()
+```
+
+- [ ] **Step 6: Viết settings, handler, main**
+
+`services/ocr/src/ocr_service/settings.py`:
+```python
+from pathlib import Path
+
+import yaml
+from pydantic import BaseModel, Field
+
+from vypq_core.config import BaseServiceSettings
+from vypq_core.host_registry import HostRef
+
+
+class OcrSettings(BaseServiceSettings):
+    service_name: str = "ocr"
+    port: int = 8001
+    default_model: str = "paddleocr-v4-vi"
+    max_side: int = 2000
+    timeout_s: float = 60.0
+    hosts_path: Path = Path("config.yaml")
+
+
+class HostDiscovery(BaseModel):
+    source: str = "static"
+    url: str | None = None
+    refresh_s: int = 15
+    fallback_static: list[HostRef] = Field(default_factory=list)
+
+
+class HostsFile(BaseModel):
+    host_discovery: HostDiscovery = Field(default_factory=HostDiscovery)
+
+
+def load_hosts(path: Path) -> list[HostRef]:
+    """Plan A chỉ đọc fallback_static. Plan B thêm nhánh source == 'gateway'."""
+    if not path.is_file():
+        return []
+    parsed = HostsFile.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
+    return parsed.host_discovery.fallback_static
+```
+
+`services/ocr/src/ocr_service/handler.py`:
+```python
+import time
+
+from ocr_service.backend.base import OcrBackend
+from ocr_service.pipeline.postprocess import to_result
+from ocr_service.pipeline.preprocess import prepare_image
+from vypq_contracts.ocr import OcrResponse
+
+
+class OcrHandler:
+    """Logic dùng chung cho cả HTTP lẫn Kafka worker."""
+
+    def __init__(self, backend: OcrBackend, *, default_model: str, max_side: int = 2000) -> None:
+        self._backend = backend
+        self._default_model = default_model
+        self._max_side = max_side
+
+    async def run(
+        self, image: bytes, model_version: str | None, trace_id: str
+    ) -> OcrResponse:
+        model_id = model_version or self._default_model
+        started = time.monotonic()
+        prepared = prepare_image(image, max_side=self._max_side)
+        raw = await self._backend.infer(prepared.data, model_id)
+        result = to_result(raw, prepared.scale)
+        return OcrResponse(
+            trace_id=trace_id,
+            model_version=model_id,
+            result=result,
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
+```
+
+`services/ocr/src/ocr_service/main.py`:
+```python
+from fastapi import APIRouter, File, Form, Request, UploadFile
+
+from ocr_service.backend.remote import RemoteOcrBackend
+from ocr_service.handler import OcrHandler
+from ocr_service.settings import OcrSettings, load_hosts
+from vypq_contracts.common import HealthStatus
+from vypq_contracts.ocr import OcrResponse
+from vypq_core.app import create_app
+from vypq_core.host_registry import StaticHostRegistry
+from vypq_core.logging import get_trace_id
+
+
+def build_app_with(handler: OcrHandler, settings: OcrSettings, backend=None):
+    router = APIRouter(prefix="/v1")
+
+    @router.post("/ocr", response_model=OcrResponse)
+    async def ocr(
+        request: Request,
+        file: UploadFile = File(...),
+        model_version: str | None = Form(default=None),
+    ) -> OcrResponse:
+        trace_id = request.headers.get("x-trace-id") or get_trace_id()
+        return await handler.run(await file.read(), model_version, trace_id)
+
+    async def _upstream_ready() -> tuple[HealthStatus, str]:
+        if backend is None:
+            return HealthStatus.OK, "fake backend"
+        open_hosts = backend.open_circuits()
+        if open_hosts:
+            return HealthStatus.DOWN, f"circuit đang mở: {', '.join(open_hosts)}"
+        return HealthStatus.OK, "model-host phản hồi bình thường"
+
+    return create_app(settings, routers=[router], readiness={"model_host": _upstream_ready})
+
+
+def build_app():
+    settings = OcrSettings()
+    registry = StaticHostRegistry(load_hosts(settings.hosts_path))
+    backend = RemoteOcrBackend(registry, timeout_s=settings.timeout_s)
+    handler = OcrHandler(
+        backend, default_model=settings.default_model, max_side=settings.max_side
+    )
+    return build_app_with(handler, settings, backend=backend)
+
+
+app = build_app()
+```
+
+`services/ocr/src/ocr_service/backend/__init__.py`:
+```python
+__all__: list[str] = []
+```
+
+- [ ] **Step 7: Viết config.yaml và service.yaml**
+
+`services/ocr/config.yaml` — dùng đúng shape mà spec mục 3.3 quy định, để bước 8 (Plan B)
+chỉ phải đổi `source: static` thành `source: gateway`, không phải viết lại file:
+```yaml
+host_discovery:
+  source: static              # Plan B đổi thành: gateway
+  url: http://gateway:8080/v1/hosts
+  refresh_s: 15
+  fallback_static:
+    - name: gpu-1
+      url: https://doi-url-ngrok-tai-day.ngrok.app
+      token: ${VYPQ_MODEL_HOST_TOKEN}
+      models:
+        - {id: paddleocr-v4-vi, task: ocr, kind: opensource, runner: paddle}
+```
+
+`services/ocr/service.yaml`:
+```yaml
+name: ocr
+port: 8001
+capability: {input: image, output: text_boxes}
+consumes: [infer.ocr.requests]
+produces: [infer.ocr.results]
+```
+
+- [ ] **Step 8: Chạy toàn bộ test service ocr**
+
+Chạy: `uv run pytest services/ocr -v`
+Mong đợi: 12 + 7 + 5 + 3 = 27 PASS
+
+- [ ] **Step 9: Chạy thử end-to-end với model-host fake**
+
+```bash
+# cửa sổ 1: model-host chế độ fake
+cd apps/model-host && VYPQ_TOKEN=sekret VYPQ_MODELS_PATH=models.dev.yaml \
+  uv run uvicorn model_host.main:app --port 9001 &
+
+# cửa sổ 2: ocr service trỏ vào đó
+cd services/ocr
+cat > config.dev.yaml <<'YAML'
+hosts:
+  - name: gpu-dev
+    url: http://localhost:9001
+    token: sekret
+    models: [{id: fake-ocr, task: ocr, kind: opensource, runner: fake}]
+YAML
+VYPQ_HOSTS_PATH=config.dev.yaml VYPQ_DEFAULT_MODEL=fake-ocr \
+  uv run uvicorn ocr_service.main:app --port 8001 &
+sleep 3
+uv run python -c "
+from PIL import Image; Image.new('RGB',(300,200),'white').save('/tmp/a.png')"
+curl -s -F file=@/tmp/a.png localhost:8001/v1/ocr | head -c 400
+```
+Mong đợi: JSON có `full_text` là `"XIN CHÀO\nthế giới"`.
+
+- [ ] **Step 10: Commit**
+
+```bash
+git add services/ocr
+git commit -m "feat(ocr): backend remote/fake, handler dùng chung và HTTP entrypoint"
+```
+
+---
+### Task 12: services/ocr — Kafka worker
+
+**Files:**
+- Create: `services/ocr/src/ocr_service/worker.py`
+- Modify: `services/ocr/src/ocr_service/settings.py` (thêm `brokers`, `model_version`, `group_prefix`)
+- Test: `services/ocr/tests/test_worker.py`
+
+**Interfaces:**
+- Consumes: `vypq_events.consumer.EventConsumer`, `vypq_events.producer.EventProducer`, `OcrHandler` từ Task 11
+- Produces:
+  - `group_id(prefix: str, model_version: str | None) -> str`
+  - `OcrWorkerHandler(handler: OcrHandler, producer, *, forced_model: str | None, fetch)` — `await __call__(envelope: RawEnvelope) -> None`
+  - `build_worker() -> EventConsumer`
+
+- [ ] **Step 1: Viết test trước**
+
+`services/ocr/tests/test_worker.py`:
+```python
+import io
+
+import pytest
+from PIL import Image
+
+from ocr_service.backend.fake import FakeOcrBackend
+from ocr_service.handler import OcrHandler
+from ocr_service.worker import OcrWorkerHandler, group_id
+from vypq_contracts.common import Task
+from vypq_contracts.ocr import RawOcrOutput, TextBox
+from vypq_core.http_client import UpstreamError
+from vypq_events.envelope import EventEnvelope, RawEnvelope
+from vypq_events.schemas.inference import InferenceRequested
+
+
+def _png() -> bytes:
+    buf = io.BytesIO()
+    Image.new("RGB", (200, 100), "white").save(buf, format="PNG")
+    return buf.getvalue()
+
+
+def _raw() -> RawOcrOutput:
+    return RawOcrOutput(
+        boxes=[TextBox(id=0, polygon=[(0, 0), (9, 0), (9, 9), (0, 9)], text="HÓA ĐƠN")]
+    )
+
+
+def _envelope(model_version: str | None = None) -> RawEnvelope:
+    env = EventEnvelope[InferenceRequested].new(
+        "inference.requested",
+        InferenceRequested(
+            task=Task.OCR,
+            input_uri="https://minio/a.png",
+            model_version=model_version,
+            eval_job_id="e1",
+            dataset_item_id="item-7",
+        ),
+    )
+    return RawEnvelope.model_validate_json(env.model_dump_json())
+
+
+class FakeProducer:
+    def __init__(self) -> None:
+        self.published: list[tuple] = []
+
+    async def publish(self, topic, envelope, key=None):
+        self.published.append((topic, envelope, key))
+
+
+async def _fetch(_uri: str) -> bytes:
+    return _png()
+
+
+def test_group_id_is_default_when_no_model_version_forced():
+    assert group_id("ocr", None) == "ocr-default"
+
+
+def test_group_id_includes_forced_model_version():
+    # Mỗi model version một consumer group → cùng event được mọi model xử lý.
+    assert group_id("ocr", "vietocr-ft-invoice") == "ocr-vietocr-ft-invoice"
+
+
+async def test_worker_publishes_completed_event_to_result_topic():
+    producer = FakeProducer()
+    worker = OcrWorkerHandler(
+        OcrHandler(FakeOcrBackend(_raw()), default_model="m1"),
+        producer,
+        forced_model=None,
+        fetch=_fetch,
+    )
+    envelope = _envelope()
+    await worker(envelope)
+
+    topic, published, key = producer.published[0]
+    assert topic == "infer.ocr.results"
+    assert key == envelope.trace_id
+    assert published.payload.model_version == "m1"
+    assert published.payload.output["full_text"] == "HÓA ĐƠN"
+    assert published.payload.eval_job_id == "e1"
+    assert published.payload.dataset_item_id == "item-7"
+    assert published.trace_id == envelope.trace_id
+
+
+async def test_event_model_version_is_used_when_nothing_is_forced():
+    backend = FakeOcrBackend(_raw())
+    worker = OcrWorkerHandler(
+        OcrHandler(backend, default_model="m1"), FakeProducer(), forced_model=None, fetch=_fetch
+    )
+    await worker(_envelope(model_version="m2"))
+    assert backend.calls[0][1] == "m2"
+
+
+async def test_forced_model_overrides_the_event_field():
+    backend = FakeOcrBackend(_raw())
+    worker = OcrWorkerHandler(
+        OcrHandler(backend, default_model="m1"),
+        FakeProducer(),
+        forced_model="vietocr-ft",
+        fetch=_fetch,
+    )
+    await worker(_envelope(model_version="m2"))
+    assert backend.calls[0][1] == "vietocr-ft"
+
+
+async def test_upstream_error_is_not_swallowed():
+    # Worker phải để lỗi bay lên EventConsumer, nếu không consumer sẽ không
+    # bao giờ biết mà pause — và message sẽ rơi vào DLQ.
+    worker = OcrWorkerHandler(
+        OcrHandler(FakeOcrBackend(error=UpstreamError("gpu chết")), default_model="m1"),
+        FakeProducer(),
+        forced_model=None,
+        fetch=_fetch,
+    )
+    with pytest.raises(UpstreamError):
+        await worker(_envelope())
+
+
+async def test_nothing_is_published_when_inference_fails():
+    producer = FakeProducer()
+    worker = OcrWorkerHandler(
+        OcrHandler(FakeOcrBackend(error=UpstreamError("gpu chết")), default_model="m1"),
+        producer,
+        forced_model=None,
+        fetch=_fetch,
+    )
+    with pytest.raises(UpstreamError):
+        await worker(_envelope())
+    assert producer.published == []
+```
+
+- [ ] **Step 2: Chạy test để xác nhận fail**
+
+Chạy: `uv run pytest services/ocr/tests/test_worker.py -v`
+Mong đợi: FAIL với `ModuleNotFoundError: No module named 'ocr_service.worker'`
+
+- [ ] **Step 3: Bổ sung settings cho worker**
+
+Thêm vào `services/ocr/src/ocr_service/settings.py`, trong class `OcrSettings`:
+```python
+    brokers: str = "localhost:9092"
+    group_prefix: str = "ocr"
+    model_version: str | None = None   # VYPQ_MODEL_VERSION — đặt để bật shadow-run
+```
+
+- [ ] **Step 4: Viết worker.py**
+
+`services/ocr/src/ocr_service/worker.py`:
+```python
+import asyncio
+from collections.abc import Awaitable, Callable
+
+import httpx
+
+from ocr_service.backend.remote import RemoteOcrBackend
+from ocr_service.handler import OcrHandler
+from ocr_service.settings import OcrSettings, load_hosts
+from vypq_contracts.common import Task
+from vypq_core.host_registry import StaticHostRegistry
+from vypq_core.logging import get_logger, setup_logging
+from vypq_events.consumer import EventConsumer
+from vypq_events.envelope import EventEnvelope, RawEnvelope
+from vypq_events.producer import EventProducer
+from vypq_events.schemas.inference import InferenceCompleted, InferenceRequested
+from vypq_events.topics import dlq_topic, request_topic, result_topic
+
+log = get_logger(__name__)
+
+
+def group_id(prefix: str, model_version: str | None) -> str:
+    """Không đặt MODEL_VERSION → group mặc định. Có đặt → group riêng cho model đó,
+    nên cùng một event được mọi model version đang bật xử lý (shadow-run)."""
+    return f"{prefix}-{model_version}" if model_version else f"{prefix}-default"
+
+
+async def fetch_bytes(uri: str) -> bytes:
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        response = await client.get(uri)
+    response.raise_for_status()
+    return response.content
+
+
+class OcrWorkerHandler:
+    def __init__(
+        self,
+        handler: OcrHandler,
+        producer,
+        *,
+        forced_model: str | None,
+        fetch: Callable[[str], Awaitable[bytes]] = fetch_bytes,
+    ) -> None:
+        self._handler = handler
+        self._producer = producer
+        self._forced_model = forced_model
+        self._fetch = fetch
+
+    async def __call__(self, envelope: RawEnvelope) -> None:
+        request = InferenceRequested.model_validate(envelope.payload)
+        image = await self._fetch(request.input_uri)
+        # Lỗi upstream ở đây cố ý bay lên EventConsumer để nó pause thay vì DLQ.
+        response = await self._handler.run(
+            image,
+            self._forced_model or request.model_version,
+            envelope.trace_id,
+        )
+        completed = InferenceCompleted(
+            task=Task.OCR,
+            model_version=response.model_version,
+            input_uri=request.input_uri,
+            output=response.result.model_dump(mode="json"),
+            latency_ms=response.latency_ms,
+            eval_job_id=request.eval_job_id,
+            dataset_item_id=request.dataset_item_id,
+        )
+        await self._producer.publish(
+            result_topic(Task.OCR),
+            EventEnvelope[InferenceCompleted].new(
+                "inference.completed", completed, trace_id=envelope.trace_id
+            ),
+            key=envelope.trace_id,
+        )
+
+
+async def main() -> None:
+    settings = OcrSettings()
+    setup_logging(settings.log_level)
+    registry = StaticHostRegistry(load_hosts(settings.hosts_path))
+    backend = RemoteOcrBackend(registry, timeout_s=settings.timeout_s)
+    handler = OcrHandler(
+        backend, default_model=settings.default_model, max_side=settings.max_side
+    )
+    producer = EventProducer(settings.brokers)
+    await producer.start()
+
+    consumer = EventConsumer(
+        topic=request_topic(Task.OCR),
+        group_id=group_id(settings.group_prefix, settings.model_version),
+        handler=OcrWorkerHandler(handler, producer, forced_model=settings.model_version),
+        dlq_topic=dlq_topic(Task.OCR),
+        producer=producer,
+        brokers=settings.brokers,
+    )
+    await consumer.start()
+    log.info("worker_started", group=group_id(settings.group_prefix, settings.model_version))
+    try:
+        await consumer.run()
+    finally:
+        await consumer.stop()
+        await producer.stop()
+        await backend.aclose()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+```
+
+- [ ] **Step 5: Chạy test để xác nhận pass**
+
+Chạy: `uv run pytest services/ocr -v`
+Mong đợi: 27 + 7 = 34 PASS
+
+- [ ] **Step 6: Viết Dockerfile cho service**
+
+`services/ocr/Dockerfile`:
+```dockerfile
+FROM python:3.12-slim
+
+RUN apt-get update && apt-get install -y --no-install-recommends curl libgl1 \
+    && rm -rf /var/lib/apt/lists/*
+COPY --from=ghcr.io/astral-sh/uv:0.11 /uv /usr/local/bin/uv
+WORKDIR /app
+
+COPY pyproject.toml uv.lock ./
+COPY packages ./packages
+COPY services/ocr ./services/ocr
+RUN uv sync --frozen --package ocr-service
+
+ENV VYPQ_PORT=8001 VYPQ_HOSTS_PATH=/app/services/ocr/config.yaml
+EXPOSE 8001
+HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
+  CMD curl -fsS http://localhost:8001/health || exit 1
+CMD ["uv", "run", "uvicorn", "ocr_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
+```
+
+- [ ] **Step 7: Kiểm chứng thủ công — worker pause khi model-host chết**
+
+Đây là hành vi quan trọng nhất của Plan A, phải xem tận mắt.
+
+```bash
+docker compose -f infra/compose/docker-compose.dev.yml up -d redpanda
+cd apps/model-host && VYPQ_TOKEN=sekret VYPQ_MODELS_PATH=models.dev.yaml \
+  uv run uvicorn model_host.main:app --port 9001 &
+cd services/ocr && VYPQ_HOSTS_PATH=config.dev.yaml VYPQ_DEFAULT_MODEL=fake-ocr \
+  uv run python -m ocr_service.worker &
+
+# đẩy 5 event vào topic
+uv run python - <<'PY'
+import asyncio
+from vypq_contracts.common import Task
+from vypq_events.envelope import EventEnvelope
+from vypq_events.producer import EventProducer
+from vypq_events.schemas.inference import InferenceRequested
+from vypq_events.topics import request_topic
+
+async def main():
+    p = EventProducer("localhost:9092"); await p.start()
+    for i in range(5):
+        env = EventEnvelope[InferenceRequested].new(
+            "inference.requested",
+            InferenceRequested(task=Task.OCR, input_uri="http://localhost:9001/health"))
+        await p.publish(request_topic(Task.OCR), env)
+    await p.stop()
+asyncio.run(main())
+PY
+
+# giết model-host giữa chừng rồi xem log worker
+kill %1
+```
+
+Mong đợi trong log worker: dòng `consumer_paused`, và **không có** dòng `event_dead_lettered`.
+Bật lại model-host → xuất hiện `consumer_resumed` và các event còn lại được xử lý tiếp.
+Kiểm tra topic DLQ rỗng tại http://localhost:8090 (Redpanda Console).
+
+- [ ] **Step 8: Commit**
+
+```bash
+git add services/ocr
+git commit -m "feat(ocr): kafka worker, consumer group theo model version cho shadow-run"
+```
+
+---
+
+### Task 13: Template và script sinh service mới
+
+**Files:**
+- Create: `services/_template/` (bản sao rút gọn của `services/ocr`, đổi tên bằng token)
+- Create: `scripts/new-service.sh`
+- Test: `tests/test_new_service_script.py`
+
+**Interfaces:**
+- Consumes: cấu trúc `services/ocr` từ Task 10–12
+- Produces: `scripts/new-service.sh <slug> <task>` sinh ra `services/<slug>/` chạy được, test pass ngay
+
+Token thay thế trong template — **phải phủ cả tên kiểu**, không chỉ tên gói. Template được
+chép từ `services/ocr` nên còn dính `RawOcrOutput`, `OcrResponse`, `vypq_contracts.ocr`; bỏ sót
+thì service `asr` sinh ra sẽ import sai kiểu:
+
+| Token | Với `asr` | Với `ocr` |
+|---|---|---|
+| `__SLUG__` | `asr` | `ocr` |
+| `__PKG__` | `asr_service` | `ocr_service` |
+| `__TASK__` | `asr` | `ocr` |
+| `__TASKUPPER__` | `ASR` | `OCR` |
+| `__RAWOUT__` | `RawAsrOutput` | `RawOcrOutput` |
+| `__RESP__` | `AsrResponse` | `OcrResponse` |
+| `__BACKEND__` | `AsrBackend` | `OcrBackend` |
+| `__HANDLER__` | `AsrHandler` | `OcrHandler` |
+| `__PORT__` | `8002` | `8001` |
+
+- [ ] **Step 1: Viết test trước**
+
+`tests/test_new_service_script.py`:
+```python
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+
+REPO = Path(__file__).resolve().parents[1]
+SCRIPT = REPO / "scripts" / "new-service.sh"
+
+
+@pytest.fixture
+def generated():
+    target = REPO / "services" / "tmptest"
+    if target.exists():
+        shutil.rmtree(target)
+    yield target
+    if target.exists():
+        shutil.rmtree(target)
+
+
+def test_script_generates_a_service_that_passes_its_own_tests(generated):
+    subprocess.run(
+        [str(SCRIPT), "tmptest", "ocr", "8099"], cwd=REPO, check=True, capture_output=True
+    )
+    assert (generated / "src" / "tmptest_service" / "handler.py").is_file()
+    assert (generated / "src" / "tmptest_service" / "worker.py").is_file()
+    assert (generated / "service.yaml").is_file()
+
+    result = subprocess.run(
+        ["uv", "run", "pytest", f"services/tmptest", "-q"],
+        cwd=REPO, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_script_leaves_no_unreplaced_tokens(generated):
+    subprocess.run(
+        [str(SCRIPT), "tmptest", "ocr", "8099"], cwd=REPO, check=True, capture_output=True
+    )
+    for path in generated.rglob("*"):
+        if path.is_file():
+            text = path.read_text(encoding="utf-8", errors="ignore")
+            for token in (
+                "__SLUG__", "__PKG__", "__TASK__", "__TASKUPPER__",
+                "__RAWOUT__", "__RESP__", "__BACKEND__", "__HANDLER__", "__PORT__",
+            ):
+                assert token not in text, f"{path} còn sót {token}"
+
+
+def test_script_refuses_to_overwrite_existing_service(generated):
+    subprocess.run(
+        [str(SCRIPT), "tmptest", "ocr", "8099"], cwd=REPO, check=True, capture_output=True
+    )
+    result = subprocess.run(
+        [str(SCRIPT), "tmptest", "ocr", "8099"], cwd=REPO, capture_output=True, text=True
+    )
+    assert result.returncode != 0
+    assert "đã tồn tại" in result.stderr
+```
+
+- [ ] **Step 2: Tạo template từ service ocr**
+
+```bash
+mkdir -p services/_template/src/__PKG__/{backend,pipeline} services/_template/tests
+cp services/ocr/src/ocr_service/backend/{base,fake}.py services/_template/src/__PKG__/backend/
+cp services/ocr/src/ocr_service/backend/remote.py services/_template/src/__PKG__/backend/
+cp services/ocr/src/ocr_service/{handler,main,worker,settings}.py services/_template/src/__PKG__/
+cp services/ocr/src/ocr_service/pipeline/__init__.py services/_template/src/__PKG__/pipeline/
+cp services/ocr/{pyproject.toml,service.yaml,config.yaml,Dockerfile} services/_template/
+cp services/ocr/tests/test_handler.py services/_template/tests/
+```
+
+Sau đó thay mọi chuỗi cố định bằng token (`sed -i ''` là cú pháp BSD trên macOS):
+```bash
+cd services/_template
+find . -type f -print0 | while IFS= read -r -d '' f; do
+  sed -i '' \
+    -e 's/ocr_service/__PKG__/g' \
+    -e 's/ocr-service/__SLUG__-service/g' \
+    -e 's/vypq_contracts\.ocr/vypq_contracts.__TASK__/g' \
+    -e 's/RawOcrOutput/__RAWOUT__/g' \
+    -e 's/OcrResponse/__RESP__/g' \
+    -e 's/OcrBackend/__BACKEND__/g' \
+    -e 's/OcrHandler/__HANDLER__/g' \
+    -e 's/Task\.OCR/Task.__TASKUPPER__/g' \
+    -e 's/8001/__PORT__/g' \
+    "$f"
+done
+touch src/__PKG__/__init__.py src/__PKG__/backend/__init__.py
+# Kiểm tra không còn sót chữ 'ocr' viết thường hay 'Ocr' viết hoa nào:
+! grep -rn 'ocr\|Ocr\|OCR' . --include='*.py' --include='*.toml' --include='*.yaml'
+```
+
+Thay `services/_template/tests/test_handler.py` bằng bản trung tính — bản chép từ OCR dùng
+PIL và ảnh PNG, không dùng được cho service audio:
+```python
+import pytest
+
+from __PKG__.backend.fake import Fake__BACKEND__
+from __PKG__.handler import __HANDLER__
+from vypq_contracts.__TASK__ import __RAWOUT__
+
+
+async def test_run_returns_response_with_default_model():
+    handler = __HANDLER__(Fake__BACKEND__(__RAWOUT__()), default_model="m1")
+    response = await handler.run(b"payload", model_version=None, trace_id="t1")
+    assert response.model_version == "m1"
+    assert response.trace_id == "t1"
+    assert response.latency_ms >= 0
+
+
+async def test_run_uses_requested_model_version():
+    backend = Fake__BACKEND__(__RAWOUT__())
+    handler = __HANDLER__(backend, default_model="m1")
+    response = await handler.run(b"payload", model_version="m2", trace_id="t1")
+    assert response.model_version == "m2"
+    assert backend.calls[0][1] == "m2"
+
+
+async def test_backend_error_propagates_unchanged():
+    handler = __HANDLER__(Fake__BACKEND__(error=RuntimeError("hỏng")), default_model="m1")
+    with pytest.raises(RuntimeError):
+        await handler.run(b"payload", model_version=None, trace_id="t1")
+```
+
+Template `handler.py` cũng phải trung tính (không có `prepare_image`, không có `scale`) —
+service cụ thể tự nối pipeline của mình vào, như Task 14 làm với `asr`:
+```python
+import time
+
+from __PKG__.backend.base import __BACKEND__
+from vypq_contracts.__TASK__ import __RESP__, __RAWOUT__
+
+
+class __HANDLER__:
+    def __init__(self, backend: __BACKEND__, *, default_model: str) -> None:
+        self._backend = backend
+        self._default_model = default_model
+
+    async def run(self, data: bytes, model_version: str | None, trace_id: str) -> __RESP__:
+        model_id = model_version or self._default_model
+        started = time.monotonic()
+        raw = await self._backend.infer(data, model_id)
+        return __RESP__(
+            trace_id=trace_id,
+            model_version=model_id,
+            result=self.to_result(raw),
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
+
+    def to_result(self, raw: __RAWOUT__):
+        raise NotImplementedError("service cụ thể phải nối pipeline postprocess của mình")
+```
+
+Rút gọn `services/_template/src/__PKG__/pipeline/__init__.py` thành pipeline trung tính:
+```python
+"""Pipeline mặc định: không biến đổi gì. Service cụ thể tự thay bằng logic của mình."""
+
+
+def prepare_input(data: bytes, **_kwargs):
+    from dataclasses import dataclass
+
+    @dataclass(frozen=True)
+    class Prepared:
+        data: bytes
+        scale: float = 1.0
+
+    return Prepared(data=data)
+```
+
+- [ ] **Step 3: Viết scripts/new-service.sh**
+
+`scripts/new-service.sh`:
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+  echo "dùng: $0 <slug> <task: ocr|asr> [port]" >&2
+  exit 2
+fi
+
+SLUG="$1"
+TASK="$2"
+PORT="${3:-8010}"
+PKG="${SLUG}_service"
+TASKUPPER="$(echo "$TASK" | tr '[:lower:]' '[:upper:]')"
+TITLE="$(echo "${TASK:0:1}" | tr '[:lower:]' '[:upper:]')${TASK:1}"
+RAWOUT="Raw${TITLE}Output"
+RESP="${TITLE}Response"
+BACKEND="${TITLE}Backend"
+HANDLER="${TITLE}Handler"
+
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+SRC="$ROOT/services/_template"
+DST="$ROOT/services/$SLUG"
+
+if [[ -e "$DST" ]]; then
+  echo "services/$SLUG đã tồn tại — dừng lại để không ghi đè" >&2
+  exit 1
+fi
+
+cp -R "$SRC" "$DST"
+mv "$DST/src/__PKG__" "$DST/src/$PKG"
+
+find "$DST" -type f -print0 | while IFS= read -r -d '' file; do
+  sed -i '' \
+    -e "s/__PKG__/$PKG/g" \
+    -e "s/__SLUG__/$SLUG/g" \
+    -e "s/__TASKUPPER__/$TASKUPPER/g" \
+    -e "s/__RAWOUT__/$RAWOUT/g" \
+    -e "s/__RESP__/$RESP/g" \
+    -e "s/__BACKEND__/$BACKEND/g" \
+    -e "s/__HANDLER__/$HANDLER/g" \
+    -e "s/__TASK__/$TASK/g" \
+    -e "s/__PORT__/$PORT/g" \
+    "$file"
+done
+
+echo "đã tạo services/$SLUG (task=$TASK, port=$PORT)"
+echo "bước tiếp: viết pipeline và runner tương ứng, rồi chạy: uv run pytest services/$SLUG"
+```
+
+```bash
+chmod +x scripts/new-service.sh
+```
+
+- [ ] **Step 4: Chạy test script**
+
+Chạy: `uv run pytest tests/test_new_service_script.py -v`
+Mong đợi: 3 PASS
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add services/_template scripts tests
+git commit -m "feat(template): khung service và script sinh service mới"
+```
+
+---
+
+### Task 14: services/asr và runner Whisper
+
+**Files:**
+- Create: `services/asr/` (sinh bằng `scripts/new-service.sh`)
+- Create: `services/asr/src/asr_service/pipeline/postprocess.py`
+- Modify: `services/asr/src/asr_service/handler.py`
+- Create: `apps/model-host/src/model_host/runners/whisper.py`
+- Modify: `apps/model-host/src/model_host/runners/__init__.py`
+- Test: `services/asr/tests/test_pipeline.py`, `apps/model-host/tests/test_whisper_runner.py`
+
+**Interfaces:**
+- Consumes: template từ Task 13, `RawAsrOutput`/`AsrResult`/`Segment` từ Task 2
+- Produces:
+  - `merge_segments(segments: list[Segment], gap_s: float = 0.3) -> list[Segment]`
+  - `build_transcript(segments: list[Segment]) -> str` — chuẩn hoá NFC
+  - `to_result(raw: RawAsrOutput) -> AsrResult`
+  - `WhisperRunner` đăng ký dưới khoá `"whisper"` trong `RUNNERS`
+
+- [ ] **Step 1: Sinh service asr từ template**
+
+```bash
+./scripts/new-service.sh asr asr 8002
+uv run pytest services/asr -q
+```
+Mong đợi: test sinh kèm PASS ngay, chưa cần sửa gì.
+
+- [ ] **Step 2: Viết test cho pipeline asr**
+
+`services/asr/tests/test_pipeline.py`:
+```python
+import unicodedata
+
+from asr_service.pipeline.postprocess import build_transcript, merge_segments, to_result
+from vypq_contracts.asr import RawAsrOutput, Segment
+
+
+def _seg(start: float, end: float, text: str, speaker: str | None = None) -> Segment:
+    return Segment(start=start, end=end, text=text, speaker=speaker)
+
+
+def test_merge_joins_segments_separated_by_a_short_gap():
+    merged = merge_segments([_seg(0.0, 1.0, "xin"), _seg(1.1, 2.0, "chào")], gap_s=0.3)
+    assert len(merged) == 1
+    assert merged[0].text == "xin chào"
+    assert (merged[0].start, merged[0].end) == (0.0, 2.0)
+
+
+def test_merge_keeps_segments_separated_by_a_long_gap():
+    merged = merge_segments([_seg(0.0, 1.0, "xin"), _seg(5.0, 6.0, "chào")], gap_s=0.3)
+    assert len(merged) == 2
+
+
+def test_merge_never_joins_across_different_speakers():
+    merged = merge_segments(
+        [_seg(0.0, 1.0, "xin", "A"), _seg(1.1, 2.0, "chào", "B")], gap_s=0.3
+    )
+    assert len(merged) == 2
+
+
+def test_merge_on_empty_input_returns_empty():
+    assert merge_segments([]) == []
+
+
+def test_build_transcript_joins_with_single_space_and_normalizes_nfc():
+    decomposed = unicodedata.normalize("NFD", "tiếng Việt")
+    transcript = build_transcript([_seg(0.0, 1.0, "xin chào"), _seg(1.2, 2.0, decomposed)])
+    assert transcript == "xin chào tiếng Việt"
+    assert unicodedata.is_normalized("NFC", transcript)
+
+
+def test_to_result_merges_then_builds_text():
+    raw = RawAsrOutput(segments=[_seg(0.0, 1.0, "xin"), _seg(1.1, 2.0, "chào")])
+    result = to_result(raw)
+    assert result.text == "xin chào"
+    assert len(result.segments) == 1
+```
+
+- [ ] **Step 3: Viết postprocess.py cho asr**
+
+`services/asr/src/asr_service/pipeline/postprocess.py`:
+```python
+import unicodedata
+
+from vypq_contracts.asr import AsrResult, RawAsrOutput, Segment
+
+
+def normalize_text(text: str) -> str:
+    return unicodedata.normalize("NFC", text)
+
+
+def merge_segments(segments: list[Segment], gap_s: float = 0.3) -> list[Segment]:
+    """Gộp các đoạn liền nhau của cùng một người nói, cách nhau dưới `gap_s` giây."""
+    merged: list[Segment] = []
+    for segment in segments:
+        previous = merged[-1] if merged else None
+        joinable = (
+            previous is not None
+            and previous.speaker == segment.speaker
+            and segment.start - previous.end <= gap_s
+        )
+        if joinable:
+            merged[-1] = previous.model_copy(
+                update={"end": segment.end, "text": f"{previous.text} {segment.text}".strip()}
+            )
+        else:
+            merged.append(segment)
+    return merged
+
+
+def build_transcript(segments: list[Segment]) -> str:
+    return normalize_text(" ".join(s.text for s in segments if s.text).strip())
+
+
+def to_result(raw: RawAsrOutput) -> AsrResult:
+    segments = [
+        s.model_copy(update={"text": normalize_text(s.text)})
+        for s in merge_segments(raw.segments)
+    ]
+    return AsrResult(text=build_transcript(segments), segments=segments)
+```
+
+- [ ] **Step 4: Nối postprocess vào handler asr**
+
+Sửa `services/asr/src/asr_service/handler.py` — thay thân hàm `run`:
+```python
+import time
+
+from asr_service.backend.base import AsrBackend
+from asr_service.pipeline.postprocess import to_result
+from vypq_contracts.asr import AsrResponse
+
+
+class AsrHandler:
+    def __init__(self, backend: AsrBackend, *, default_model: str) -> None:
+        self._backend = backend
+        self._default_model = default_model
+
+    async def run(
+        self, audio: bytes, model_version: str | None, trace_id: str
+    ) -> AsrResponse:
+        model_id = model_version or self._default_model
+        started = time.monotonic()
+        # Audio không cần resize như ảnh — gửi nguyên bytes sang model-host.
+        raw = await self._backend.infer(audio, model_id)
+        return AsrResponse(
+            trace_id=trace_id,
+            model_version=model_id,
+            result=to_result(raw),
+            latency_ms=int((time.monotonic() - started) * 1000),
+        )
+```
+
+- [ ] **Step 5: Chạy test asr**
+
+Chạy: `uv run pytest services/asr -v`
+Mong đợi: 6 test pipeline + các test sinh từ template, tất cả PASS
+
+- [ ] **Step 6: Viết runner Whisper**
+
+`apps/model-host/src/model_host/runners/whisper.py`:
+```python
+import io
+
+from model_host.spec import ModelSpec
+from vypq_contracts.asr import RawAsrOutput, Segment
+from vypq_contracts.common import Task
+
+
+class WhisperRunner:
+    task = Task.ASR
+
+    def __init__(self) -> None:
+        self._model = None
+
+    def load(self, spec: ModelSpec) -> None:
+        from faster_whisper import WhisperModel  # import muộn: chỉ máy GPU mới có
+
+        self._model = WhisperModel(
+            spec.source.get("repo", "large-v3"),
+            device=spec.params.get("device", "cuda"),
+            compute_type=spec.params.get("compute_type", "float16"),
+        )
+
+    def unload(self) -> None:
+        self._model = None
+
+    def predict(self, data: bytes, params: dict) -> RawAsrOutput:
+        segments, _info = self._model.transcribe(
+            io.BytesIO(data),
+            language=params.get("language", "vi"),
+            vad_filter=params.get("vad_filter", True),
+        )
+        return RawAsrOutput(
+            segments=[
+                Segment(start=float(s.start), end=float(s.end), text=s.text.strip())
+                for s in segments
+            ]
+        )
+```
+
+Cập nhật `_register_optional()` trong `apps/model-host/src/model_host/runners/__init__.py`:
+```python
+def _register_optional() -> None:
+    try:
+        from model_host.runners.paddle import PaddleOcrRunner
+    except ImportError:
+        pass
+    else:
+        RUNNERS["paddle"] = PaddleOcrRunner
+
+    try:
+        from model_host.runners.whisper import WhisperRunner
+    except ImportError:
+        pass
+    else:
+        RUNNERS["whisper"] = WhisperRunner
+```
+
+Thêm vào `[project.optional-dependencies] gpu` của `apps/model-host/pyproject.toml`:
+`"faster-whisper>=1.0"`.
+
+- [ ] **Step 7: Viết test cho WhisperRunner**
+
+`apps/model-host/tests/test_whisper_runner.py`:
+```python
+import math
+import struct
+import wave
+
+import pytest
+
+from model_host.runners.whisper import WhisperRunner
+from model_host.spec import ModelSpec
+from vypq_contracts.asr import RawAsrOutput
+from vypq_contracts.common import ModelKind, Task
+
+pytestmark = pytest.mark.slow
+
+SPEC = ModelSpec(
+    id="whisper-large-v3", task=Task.ASR, kind=ModelKind.OPENSOURCE, runner="whisper",
+    vram_mb=6000, source={"repo": "large-v3"}, params={"language": "vi"},
+)
+
+
+def test_predict_returns_segments_with_increasing_timestamps(tmp_path):
+    path = tmp_path / "tone.wav"
+    _write_tone(path)
+    runner = WhisperRunner()
+    runner.load(SPEC)
+    try:
+        output = runner.predict(path.read_bytes(), SPEC.params)
+    finally:
+        runner.unload()
+    assert isinstance(output, RawAsrOutput)
+    for earlier, later in zip(output.segments, output.segments[1:], strict=False):
+        assert earlier.end <= later.start
+
+
+def _write_tone(path, seconds: float = 2.0, rate: int = 16000) -> None:
+    with wave.open(str(path), "wb") as handle:
+        handle.setnchannels(1)
+        handle.setsampwidth(2)
+        handle.setframerate(rate)
+        frames = b"".join(
+            struct.pack("<h", int(12000 * math.sin(2 * math.pi * 220 * t / rate)))
+            for t in range(int(rate * seconds))
+        )
+        handle.writeframes(frames)
+```
+
+- [ ] **Step 8: Chạy toàn bộ test của Plan A**
+
+Chạy: `uv run pytest -v`
+Mong đợi: tất cả PASS, các test `slow` được bỏ qua.
+
+Chạy trên máy GPU: `uv run pytest -m slow -v`
+Mong đợi: test paddle và whisper PASS.
+
+- [ ] **Step 9: Commit**
+
+```bash
+git add services/asr apps/model-host
+git commit -m "feat(asr): service asr sinh từ template và runner Whisper"
+```
+
+---
+
+## Hoàn tất Plan A
+
+Sau task 14, kiểm chứng lần cuối bằng `scripts/smoke-test.sh`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+echo "== unit test =="
+uv run pytest -q
+echo "== lint =="
+uv run ruff check .
+echo "== model-host lên =="
+curl -fsS localhost:9001/v1/models -H "Authorization: Bearer ${VYPQ_TOKEN}" >/dev/null
+echo "== không token phải bị 401 =="
+[[ "$(curl -s -o /dev/null -w '%{http_code}' localhost:9001/v1/models)" == "401" ]]
+echo "== ocr trả kết quả =="
+curl -fsS -F file=@tests/fixtures/sample.png localhost:8001/v1/ocr | grep -q full_text
+echo "TẤT CẢ ĐẠT"
+```
+
+Plan B bắt đầu từ đây: gateway giữ host registry, và service đổi
+`host_discovery.source` từ `static` sang `gateway`.
