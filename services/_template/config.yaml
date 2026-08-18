@@ -1,0 +1,10 @@
+host_discovery:
+  source: static              # Plan B đổi thành: gateway
+  url: http://gateway:8080/v1/hosts
+  refresh_s: 15
+  fallback_static:
+    - name: gpu-1
+      url: https://doi-url-ngrok-tai-day.ngrok.app
+      token: ${VYPQ_MODEL_HOST_TOKEN}
+      models:
+        - {id: __TASK__-model-v1, task: __TASK__, kind: opensource, runner: generic}

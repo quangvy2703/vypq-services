@@ -6,6 +6,9 @@ dependencies = []
 
 [tool.uv.workspace]
 members = ["packages/*", "apps/*", "services/*"]
+# _template không phải service thật (token chưa thay thế) — loại khỏi workspace
+# để "uv sync" không cố build nó như một package thật.
+exclude = ["services/_template"]
 
 [dependency-groups]
 dev = [
@@ -35,6 +38,9 @@ ocr-service = { workspace = true }
 [tool.ruff]
 line-length = 100
 target-version = "py312"
+# _template chứa token __XXX__ chưa thay thế — không phải Python thật (vd.
+# "port: int = __PORT__" là undefined-name), nên loại khỏi lint thay vì sửa nó.
+extend-exclude = ["services/_template"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
