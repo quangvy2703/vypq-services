@@ -13,7 +13,9 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-gpu = ["paddleocr>=2.9", "paddlepaddle-gpu>=2.6", "pillow>=10.4", "numpy>=1.26"]
+# Chặn trần paddleocr ở 3.0: bản 3.x đổi .ocr() thành .predict() với shape kết quả
+# khác hẳn, `uv lock --upgrade` sẽ âm thầm làm hỏng predict() nếu không khoá.
+gpu = ["paddleocr>=2.9,<3", "paddlepaddle-gpu>=2.6", "pillow>=10.4", "numpy>=1.26"]
 
 [build-system]
 requires = ["hatchling"]
