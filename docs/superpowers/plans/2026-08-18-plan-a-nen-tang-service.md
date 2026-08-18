@@ -25,7 +25,9 @@
   `[dependency-groups] dev` lẫn `[tool.uv.sources]`. `uv sync` chỉ cài những gì được tham
   chiếu tới; member không ai tham chiếu sẽ không có trong venv và `import` sẽ hỏng. Root
   `pyproject.toml` có hai dòng đánh dấu `# <<< workspace members` và `# <<< workspace sources`
-  để chèn vào đúng chỗ.
+  để chèn vào đúng chỗ. Nếu `uv sync` chạy lúc `src/` còn rỗng, uv cache lại kết quả
+  đó — lần sync sau sẽ không cài lại. Gặp `ModuleNotFoundError` dù đã đăng ký đúng thì
+  chạy `uv sync --reinstall-package <tên-package>`.
 - **`uv run ruff check .` phải sạch trước khi commit** (chạy `--fix` cho phần tự sửa được).
   Không để cảnh báo tích lũy sang task sau.
 - Commit sau mỗi task. Message theo Conventional Commits, tiếng Anh cho prefix, mô tả tiếng Việt.
@@ -3449,14 +3451,17 @@ Mong đợi: 8 + 9 = 17 PASS
 
 - [ ] **Step 10: Chạy thử host thật bằng fake runner**
 
-```bash
-cd apps/model-host
-cat > models.dev.yaml <<'YAML'
+`apps/model-host/models.dev.yaml` — **commit file này**, Task 11 dùng lại để chạy
+end-to-end trên máy không có GPU:
+```yaml
 host_name: gpu-dev
 vram_budget_mb: 4000
 models:
   - {id: fake-ocr, task: ocr, kind: opensource, runner: fake, vram_mb: 100, pinned: true}
-YAML
+```
+
+```bash
+cd apps/model-host
 VYPQ_TOKEN=sekret VYPQ_MODELS_PATH=models.dev.yaml \
   uv run uvicorn model_host.main:app --port 9001 &
 sleep 3

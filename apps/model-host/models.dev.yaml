@@ -1,0 +1,6 @@
+# Cấu hình chạy thử trên máy không có GPU: dùng runner giả.
+# Task 11 dùng lại file này cho phần kiểm tra end-to-end.
+host_name: gpu-dev
+vram_budget_mb: 4000
+models:
+  - {id: fake-ocr, task: ocr, kind: opensource, runner: fake, vram_mb: 100, pinned: true}
