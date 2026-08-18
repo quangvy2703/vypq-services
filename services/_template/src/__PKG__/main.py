@@ -1,11 +1,13 @@
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, File, Form, Request, UploadFile
-from vypq_contracts.common import HealthStatus
+from vypq_contracts.common import HealthStatus, Task
+from vypq_contracts.gateway import ServiceInfo
 from vypq_contracts.__TASK__ import __RESP__
 from vypq_core.app import create_app
 from vypq_core.host_registry import StaticHostRegistry
 from vypq_core.logging import get_trace_id
+from vypq_core.service_info import build_info_router
 
 from __PKG__.backend.remote import Remote__BACKEND__
 from __PKG__.handler import __HANDLER__
@@ -32,8 +34,21 @@ def build_app_with(handler: __HANDLER__, settings: __SETTINGS__, backend=None, l
             return HealthStatus.DOWN, f"circuit đang mở: {', '.join(open_hosts)}"
         return HealthStatus.OK, "model-host phản hồi bình thường"
 
+    info = ServiceInfo(
+        name=settings.service_name,
+        task=Task.__TASKUPPER__,
+        capability_input="bytes",
+        capability_output="json",
+        version=settings.version,
+        invoke_path="/v1/__TASK__",
+        default_model=settings.default_model,
+    )
+
     return create_app(
-        settings, routers=[router], readiness={"model_host": _upstream_ready}, lifespan=lifespan
+        settings,
+        routers=[router, build_info_router(info)],
+        readiness={"model_host": _upstream_ready},
+        lifespan=lifespan,
     )
 
 
