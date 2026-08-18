@@ -5281,6 +5281,13 @@ cd apps/model-host && VYPQ_TOKEN=sekret VYPQ_MODELS_PATH=models.dev.yaml \
 cd services/ocr && VYPQ_HOSTS_PATH=config.dev.yaml VYPQ_DEFAULT_MODEL=fake-ocr \
   uv run python -m ocr_service.worker &
 
+# Phải là ẢNH THẬT. Nếu input_uri trỏ vào JSON (ví dụ /health), prepare_image()
+# ở PHÍA SERVICE từ chối ngay với BAD_INPUT — lỗi vĩnh viễn, vào DLQ lập tức,
+# không bao giờ chạm tới đường pause. Kịch bản sẽ không chứng minh được gì cả.
+uv run python -c "from PIL import Image; Image.new('RGB',(300,200),'white').save('/tmp/e2e.png')"
+(cd /tmp && uv run python -m http.server 8899 >/dev/null 2>&1 &)
+sleep 1
+
 # đẩy 5 event vào topic
 uv run python - <<'PY'
 import asyncio
@@ -5295,17 +5302,19 @@ async def main():
     for i in range(5):
         env = EventEnvelope[InferenceRequested].new(
             "inference.requested",
-            InferenceRequested(task=Task.OCR, input_uri="http://localhost:9001/health"))
+            InferenceRequested(task=Task.OCR, input_uri="http://localhost:8899/e2e.png"))
         await p.publish(request_topic(Task.OCR), env)
     await p.stop()
 asyncio.run(main())
 PY
 
 # giết model-host giữa chừng rồi xem log worker
-kill %1
+pkill -f "model_host.main:app"
 ```
 
-Mong đợi trong log worker: dòng `consumer_paused`, và **không có** dòng `event_dead_lettered`.
+Mong đợi trong log worker: dòng `retry_exhausted_pausing` rồi `consumer_paused`, và
+**không có** dòng `event_dead_lettered`. Kiểm luôn topic DLQ cho chắc:
+`docker exec compose-redpanda-1 rpk topic consume infer.ocr.dlq -o start -n 10`
 Bật lại model-host → xuất hiện `consumer_resumed` và các event còn lại được xử lý tiếp.
 Kiểm tra topic DLQ rỗng tại http://localhost:8090 (Redpanda Console).
 
