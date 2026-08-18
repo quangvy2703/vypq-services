@@ -15,11 +15,14 @@ dev = [
     "respx>=0.21",
     "ruff>=0.7",
     "vypq-contracts",
+    "asgi-lifespan>=2.1",
+    "vypq-core",
     # <<< workspace members
 ]
 
 [tool.uv.sources]
 vypq-contracts = { workspace = true }
+vypq-core = { workspace = true }
 # <<< workspace sources
 
 [tool.ruff]
