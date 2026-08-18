@@ -1150,6 +1150,35 @@ def test_stale_probe_does_not_wedge_the_circuit_forever():
     assert b.allow() is True                  # tự hồi phục, cấp probe mới
 
 
+def test_late_success_from_a_reclaimed_probe_does_not_close_the_circuit():
+    clock = FakeClock()
+    b = _breaker(clock)
+    for _ in range(3):
+        b.record_failure()
+    clock.advance(31.0)
+    assert b.allow() is True          # probe đi ra
+    clock.advance(31.0)
+    b.allow()                         # probe bị thu hồi → OPEN
+    assert b.state is CircuitState.OPEN
+    b.record_success()                # caller cũ mới báo về
+    assert b.state is CircuitState.OPEN
+
+
+def test_late_failure_from_a_reclaimed_probe_does_not_push_back_the_deadline():
+    clock = FakeClock()
+    b = _breaker(clock)
+    for _ in range(3):
+        b.record_failure()
+    clock.advance(31.0)
+    b.allow()
+    clock.advance(31.0)
+    b.allow()                         # thu hồi probe, hạn chờ tính từ đây
+    clock.advance(5.0)
+    b.record_failure()                # caller cũ báo về muộn
+    clock.advance(25.0)
+    assert b.allow() is True          # đúng hạn 30s, không bị đẩy lùi thêm 5s
+
+
 def test_half_open_allows_only_one_probe():
     clock = FakeClock()
     b = _breaker(clock)
@@ -1236,12 +1265,26 @@ class CircuitBreaker:
             return True
         return False
 
+    def _is_late_report(self) -> bool:
+        """Báo cáo đến từ một request không còn được phép tồn tại.
+
+        OPEN mà không có probe nào đang bay nghĩa là allow() đang chặn tất cả —
+        nên mọi record_* lúc này đều từ caller cũ báo về muộn: probe đã bị thu
+        hồi, hoặc request đi qua trước lúc mạch mở. Nhận vào thì một caller treo
+        lâu có thể đóng lại mạch đang mở, hoặc đẩy lùi hạn chờ vô cớ.
+        """
+        return self._opened_at is not None and self._probe_started_at is None
+
     def record_success(self) -> None:
+        if self._is_late_report():
+            return
         self._failures = 0
         self._opened_at = None
         self._probe_started_at = None
 
     def record_failure(self) -> None:
+        if self._is_late_report():
+            return
         if self._probe_started_at is not None:
             # Probe hỏng → mở lại ngay, tính lại thời gian chờ.
             self._probe_started_at = None
@@ -1263,7 +1306,7 @@ class CircuitBreaker:
 - [ ] **Step 4: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-core/tests/test_breaker.py -v`
-Mong đợi: 8 PASS
+Mong đợi: 10 PASS
 
 - [ ] **Step 5: Commit**
 
