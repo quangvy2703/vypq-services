@@ -2,13 +2,15 @@ import asyncio
 import random
 from collections.abc import Awaitable, Callable
 
+import httpx
+import pydantic
 from vypq_contracts.asr import RawAsrOutput
 from vypq_contracts.common import ErrorCode
 from vypq_contracts.hosting import InferRequest, InferResponse
 from vypq_core.breaker import CircuitBreaker
 from vypq_core.errors import ServiceError
 from vypq_core.host_registry import HostRef, StaticHostRegistry
-from vypq_core.http_client import UpstreamClient
+from vypq_core.http_client import UpstreamClient, UpstreamError
 
 
 class RemoteAsrBackend:
@@ -79,7 +81,7 @@ class RemoteAsrBackend:
                 data={"model_id": model_id},
                 files={"file": ("input", image, "application/octet-stream")},
             )
-        return self._parse(response.json())
+        return self._parse(response)
 
     async def infer_uri(self, uri: str, model_id: str) -> RawAsrOutput:
         host = await self._registry.pick(model_id)
@@ -89,11 +91,23 @@ class RemoteAsrBackend:
             response = await client.request(
                 "POST", "/v1/infer", json=payload.model_dump(mode="json")
             )
-        return self._parse(response.json())
+        return self._parse(response)
 
     @staticmethod
-    def _parse(body: dict) -> RawAsrOutput:
-        parsed = InferResponse.model_validate(body)
+    def _parse(response: httpx.Response) -> RawAsrOutput:
+        # 200 nhưng thân trang không phải JSON hợp lệ (trang xen ngrok trả HTML
+        # kèm status 200), hoặc JSON nhưng lệch hợp đồng (model-host phát trường
+        # mới trước khi vypq-contracts được nâng cấp, hoặc task lạ) — cả hai đều
+        # là lệch hạ tầng/hợp đồng chứ không phải dữ liệu hỏng của request này:
+        # phải dừng chờ (UpstreamError) chứ không dead-letter.
+        try:
+            body = response.json()
+        except ValueError as exc:
+            raise UpstreamError(f"model-host trả thân trang không phải JSON: {exc}") from exc
+        try:
+            parsed = InferResponse.model_validate(body)
+        except pydantic.ValidationError as exc:
+            raise UpstreamError(f"model-host trả dữ liệu lệch hợp đồng: {exc}") from exc
         if not isinstance(parsed.output, RawAsrOutput):
             # assert sẽ bị python -O gỡ bỏ; đây là dữ liệu từ máy khác nên phải
             # kiểm thật và báo lỗi rõ thay vì AssertionError rơi vào handler 500.
