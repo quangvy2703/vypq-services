@@ -110,3 +110,25 @@ async def test_models_for_task_filters_and_dedupes():
     )
     ids = sorted(m.id for m in reg.models_for_task(Task.OCR))
     assert ids == ["m1", "m2"]
+
+
+async def test_concurrent_leases_spread_across_hosts():
+    # pick() đọc inflight, lease() mới tăng. `await` bên trong lease mô phỏng I/O
+    # thật — đó là lúc coroutine khác chạy và phải nhìn thấy con số đã tăng.
+    import asyncio
+
+    hosts = [_host("a", [_model("m1")]), _host("b", [_model("m1")])]
+    reg = StaticHostRegistry(hosts)
+    seen: list[str] = []
+
+    async def one_request():
+        host = await reg.pick("m1")
+        async with reg.lease(host):
+            await asyncio.sleep(0)
+            seen.append(host.name)
+
+    await asyncio.gather(*(one_request() for _ in range(20)))
+
+    assert set(seen) == {"a", "b"}, f"dồn hết vào một host: {seen}"
+    assert abs(seen.count("a") - seen.count("b")) <= 2, f"lệch quá nhiều: {seen}"
+    assert all(h.inflight == 0 for h in hosts)

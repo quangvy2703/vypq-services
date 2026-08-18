@@ -67,10 +67,9 @@ class Remote__BACKEND__:
 
     async def infer(self, image: bytes, model_id: str) -> __RAWOUT__:
         # Thứ tự bắt buộc: pick() -> lease() -> mọi thứ khác. `inflight` chỉ tăng
-        # lúc vào lease, nên bất kỳ await nào chen giữa pick và lease đều cho các
-        # coroutine khác đọc lại con số cũ và dồn hết vào cùng một host.
-        # _client_for() có await (đóng client cũ khi host đổi URL) nên phải nằm
-        # TRONG lease, không phải trước.
+        # lúc vào lease, nên mọi await phải nằm TRONG lease. Hành vi trải tải được
+        # kiểm ở test_host_registry.py::test_concurrent_leases_spread_across_hosts —
+        # không kiểm được ở tầng này vì mock transport không nhường lượt.
         host = await self._registry.pick(model_id)
         async with self._registry.lease(host):
             client = await self._client_for(host)
