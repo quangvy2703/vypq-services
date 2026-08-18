@@ -11,6 +11,10 @@ from vypq_core.logging import get_logger
 
 log = get_logger(__name__)
 
+# 408 và 429 là 4xx nhưng nói về tình trạng upstream chứ không phải lỗi của request:
+# hết giờ và quá tải đều đáng thử lại có backoff, giống 5xx.
+_RETRYABLE_STATUS = frozenset({408, 429})
+
 
 class UpstreamError(ServiceError):
     """Lỗi tạm thời phía upstream — đáng retry và làm sập circuit."""
@@ -57,38 +61,50 @@ class UpstreamClient:
         if not self.breaker.allow():
             raise CircuitOpenError(self.base_url)
 
-        last: Exception | None = None
-        for attempt in range(1, self._max_attempts + 1):
-            try:
-                response = await self._client.request(method, path, **kwargs)
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                code = (
-                    ErrorCode.UPSTREAM_TIMEOUT
-                    if isinstance(exc, httpx.TimeoutException)
-                    else ErrorCode.UPSTREAM_ERROR
-                )
-                last = UpstreamError(f"{self.base_url}: {exc}", code)
-            else:
-                if response.status_code < 400:
-                    self.breaker.record_success()
-                    return response
-                if response.status_code < 500:
-                    # 4xx là lỗi của request, thử lại vẫn sai → không retry.
-                    # Nhưng host RỔI SỐNG mới trả được 4xx, nên phải record_success:
-                    # thoát ra mà không báo gì sẽ để probe half-open treo vĩnh viễn.
-                    self.breaker.record_success()
-                    raise ServiceError(
-                        ErrorCode.BAD_INPUT,
-                        f"upstream từ chối ({response.status_code}): {response.text[:200]}",
-                        http_status=response.status_code,
+        reported = False
+        try:
+            last: Exception | None = None
+            for attempt in range(1, self._max_attempts + 1):
+                try:
+                    response = await self._client.request(method, path, **kwargs)
+                except (httpx.TimeoutException, httpx.TransportError) as exc:
+                    code = (
+                        ErrorCode.UPSTREAM_TIMEOUT
+                        if isinstance(exc, httpx.TimeoutException)
+                        else ErrorCode.UPSTREAM_ERROR
                     )
-                last = UpstreamError(f"{self.base_url} trả {response.status_code}")
+                    last = UpstreamError(f"{self.base_url}: {exc}", code)
+                else:
+                    if response.status_code < 400:
+                        self.breaker.record_success()
+                        reported = True
+                        return response
+                    if response.status_code >= 500 or response.status_code in _RETRYABLE_STATUS:
+                        last = UpstreamError(f"{self.base_url} trả {response.status_code}")
+                    else:
+                        # 4xx còn lại là lỗi của request, thử lại vẫn sai → không retry.
+                        # Nhưng host phải còn sống mới trả được 4xx, nên record_success:
+                        # thoát ra mà không báo gì sẽ để probe half-open treo.
+                        self.breaker.record_success()
+                        reported = True
+                        raise ServiceError(
+                            ErrorCode.BAD_INPUT,
+                            f"upstream từ chối ({response.status_code}): {response.text[:200]}",
+                            http_status=response.status_code,
+                        )
 
-            if attempt < self._max_attempts:
-                delay = self._base_delay * (2 ** (attempt - 1))
-                await self._sleep(delay + self._jitter() * delay * 0.1)
-                log.warning("upstream_retry", url=self.base_url, attempt=attempt)
+                if attempt < self._max_attempts:
+                    delay = self._base_delay * (2 ** (attempt - 1))
+                    await self._sleep(delay + self._jitter() * delay * 0.1)
+                    log.warning("upstream_retry", url=self.base_url, attempt=attempt)
 
-        self.breaker.record_failure()
-        assert last is not None
-        raise last
+            self.breaker.record_failure()
+            reported = True
+            assert last is not None
+            raise last
+        finally:
+            if not reported:
+                # Lối thoát bất thường: CancelledError khi caller huỷ, lỗi lập trình,
+                # KeyboardInterrupt. Không báo lại thì probe half-open bị bỏ treo và
+                # phải mất hai chu kỳ recovery mới phục vụ lại được.
+                self.breaker.record_failure()

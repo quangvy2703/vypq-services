@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 import pytest
 import respx
@@ -119,6 +121,31 @@ async def test_4xx_during_half_open_probe_closes_the_circuit():
         with pytest.raises(ServiceError):
             await c.request("GET", "/v1/models")
     assert breaker.state is CircuitState.CLOSED
+
+
+@respx.mock
+async def test_429_is_retried_like_a_5xx():
+    route = respx.get(f"{BASE}/v1/models").mock(
+        side_effect=[httpx.Response(429), httpx.Response(200, json={"ok": True})]
+    )
+    async with _client(max_attempts=3) as c:
+        resp = await c.request("GET", "/v1/models")
+    assert resp.status_code == 200
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_cancelled_request_still_reports_to_the_breaker():
+    # Không báo lại thì probe half-open treo và mất hai chu kỳ recovery.
+    def _cancel(_request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError
+
+    respx.get(f"{BASE}/v1/models").mock(side_effect=_cancel)
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_s=30.0)
+    async with _client(max_attempts=1, breaker=breaker) as c:
+        with pytest.raises(asyncio.CancelledError):
+            await c.request("GET", "/v1/models")
+    assert breaker.state is CircuitState.OPEN
 
 
 @respx.mock
