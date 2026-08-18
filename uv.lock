@@ -9,6 +9,7 @@ resolution-markers = [
 [manifest]
 members = [
     "model-host",
+    "ocr-service",
     "vypq-contracts",
     "vypq-core",
     "vypq-events",
@@ -510,6 +511,33 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/36/33/29208b8b075bde62d26a81d14b358c42b0f69b6cabd98d4ff97f37f22b05/numpy-2.5.2-cp312-cp312-win32.whl", hash = "sha256:d6a48072864e3324e194a8fbb3c657bcc5b5c869dbc64c9537b1d5c862572c0a", size = 6072817, upload-time = "2026-08-09T13:45:17.867Z" },
     { url = "https://files.pythonhosted.org/packages/7f/b9/87fea2769fe1c47c1b5b01d8310772c9d1a85d485de7cf386ef7a3332b02/numpy-2.5.2-cp312-cp312-win_amd64.whl", hash = "sha256:28ac63476ec7651484215ee7fa15a1f78b57c14621f01e392afe17b9a1390ce4", size = 12464674, upload-time = "2026-08-09T13:45:20.734Z" },
     { url = "https://files.pythonhosted.org/packages/14/52/032b97e00461ab0809bbe4c588b035620e5a14b8cdee47ecddefc7b17d33/numpy-2.5.2-cp312-cp312-win_arm64.whl", hash = "sha256:27650bb0e7140fa3d37b9923b4803645e0b125d190f326eecfd3f4dad8e8ade1", size = 10397131, upload-time = "2026-08-09T13:45:23.73Z" },
+]
+
+[[package]]
+name = "ocr-service"
+version = "0.1.0"
+source = { editable = "services/ocr" }
+dependencies = [
+    { name = "fastapi" },
+    { name = "pillow" },
+    { name = "python-multipart" },
+    { name = "pyyaml" },
+    { name = "uvicorn", extra = ["standard"] },
+    { name = "vypq-contracts" },
+    { name = "vypq-core" },
+    { name = "vypq-events" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "fastapi", specifier = ">=0.115" },
+    { name = "pillow", specifier = ">=10.4" },
+    { name = "python-multipart", specifier = ">=0.0.12" },
+    { name = "pyyaml", specifier = ">=6.0" },
+    { name = "uvicorn", extras = ["standard"], specifier = ">=0.32" },
+    { name = "vypq-contracts", editable = "packages/vypq-contracts" },
+    { name = "vypq-core", editable = "packages/vypq-core" },
+    { name = "vypq-events", editable = "packages/vypq-events" },
 ]
 
 [[package]]
@@ -1225,6 +1253,7 @@ source = { virtual = "." }
 dev = [
     { name = "asgi-lifespan" },
     { name = "model-host" },
+    { name = "ocr-service" },
     { name = "pillow" },
     { name = "pytest" },
     { name = "pytest-asyncio" },
@@ -1242,6 +1271,7 @@ dev = [
 dev = [
     { name = "asgi-lifespan", specifier = ">=2.1" },
     { name = "model-host", editable = "apps/model-host" },
+    { name = "ocr-service", editable = "services/ocr" },
     { name = "pillow", specifier = ">=10.4" },
     { name = "pytest", specifier = ">=8.3" },
     { name = "pytest-asyncio", specifier = ">=0.24" },
