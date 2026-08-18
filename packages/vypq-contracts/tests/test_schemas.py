@@ -85,6 +85,39 @@ def test_infer_response_discriminates_asr_output():
     assert isinstance(parsed.output, RawAsrOutput)
 
 
+def test_infer_response_uses_task_when_output_is_empty():
+    # Payload rỗng khớp cả hai member của union; chỉ `task` mới phân biệt được.
+    resp = InferResponse.model_validate(
+        {"model_id": "m", "task": "asr", "output": {}, "timing": {"infer_ms": 1}}
+    )
+    assert isinstance(resp.output, RawAsrOutput)
+
+
+def test_infer_response_rejects_output_that_contradicts_task():
+    with pytest.raises(ValidationError):
+        InferResponse.model_validate(
+            {
+                "model_id": "m",
+                "task": "asr",
+                "output": {"boxes": [{"id": 0, "polygon": [[0, 0], [1, 0], [1, 1], [0, 1]],
+                                      "text": "a"}]},
+                "timing": {"infer_ms": 1},
+            }
+        )
+
+
+def test_infer_response_does_not_silently_drop_half_of_a_mixed_payload():
+    with pytest.raises(ValidationError):
+        InferResponse.model_validate(
+            {
+                "model_id": "m",
+                "task": "asr",
+                "output": {"boxes": [], "segments": [{"start": 0, "end": 1, "text": "a"}]},
+                "timing": {"infer_ms": 1},
+            }
+        )
+
+
 def test_model_info_defaults():
     info = ModelInfo(id="m1", task=Task.OCR, kind="opensource", runner="fake")
     assert info.loaded is False
