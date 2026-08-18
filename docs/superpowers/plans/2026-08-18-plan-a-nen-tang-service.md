@@ -2694,6 +2694,11 @@ BROKERS = "localhost:9092"
 
 
 async def test_roundtrip_through_real_redpanda():
+    # Topic và group phải là DUY NHẤT mỗi lần chạy. Dùng topic dùng chung thì test
+    # nuốt luôn message của lần chạy trước (hoặc của người khác đang thử tay) và
+    # fail ngẫu nhiên — "xanh khi môi trường sạch" là loại test tệ hơn không có.
+    suffix = str(int(time.time() * 1000))
+    topic = f"infer.ocr.requests.roundtrip.{suffix}"
     producer = EventProducer(BROKERS)
     await producer.start()
     received: list = []
@@ -2702,8 +2707,8 @@ async def test_roundtrip_through_real_redpanda():
         received.append(env)
 
     consumer = EventConsumer(
-        topic=request_topic(Task.OCR),
-        group_id="test-ocr",
+        topic=topic,
+        group_id=f"test-roundtrip-{suffix}",
         handler=handler,
         dlq_topic=dlq_topic(Task.OCR),
         producer=producer,
@@ -2715,7 +2720,7 @@ async def test_roundtrip_through_real_redpanda():
             "inference.requested",
             InferenceRequested(task=Task.OCR, input_uri="s3://b/a.jpg"),
         )
-        await producer.publish(request_topic(Task.OCR), env)
+        await producer.publish(topic, env)
         for _ in range(20):
             if await consumer.run_once():
                 break
