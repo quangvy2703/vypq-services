@@ -3593,7 +3593,7 @@ DLQ hỏng vĩnh viễn sẽ kẹt cả partition, im lặng.
 - Modify: `packages/vypq-events/src/vypq_events/consumer.py` (đếm pause và DLQ)
 - Modify: `apps/gateway/src/gateway/main.py` (gắn `/metrics`)
 - Create: `infra/prometheus/prometheus.yml`, `infra/prometheus/alerts.yml`
-- Test: `packages/vypq-events/tests/test_consumer_metrics.py`
+- Test: bổ sung vào `packages/vypq-events/tests/test_consumer.py` (không tạo file mới)
 
 **Interfaces:**
 - Produces:
@@ -3603,14 +3603,14 @@ DLQ hỏng vĩnh viễn sẽ kẹt cả partition, im lặng.
 
 - [ ] **Step 1: Viết test trước**
 
-`packages/vypq-events/tests/test_consumer_metrics.py`:
+Thêm vào CUỐI `packages/vypq-events/tests/test_consumer.py`. Đặt ở đây chứ không
+tạo file mới: `--import-mode=importlib` không cho import chéo giữa các file test,
+nên file mới sẽ phải chép lại nguyên khối `FakeConsumer`/`FakeProducer`/`_msg`/
+`_consumer`/`TP` — hai bản chép tay sẽ trôi khỏi nhau. Các helper đó đã có sẵn ở
+đầu file này.
+
 ```python
 from prometheus_client import REGISTRY
-
-from vypq_core.http_client import UpstreamError
-# (dùng lại FakeConsumer/FakeProducer/_msg/_consumer/TP đặt ở đầu test_consumer.py —
-#  chép nguyên khối helper đó vào file này vì --import-mode=importlib không cho
-#  import chéo giữa các file test)
 
 
 def _value(name: str, topic: str) -> float:
@@ -3657,8 +3657,8 @@ async def test_failing_dlq_publish_increments_its_own_counter():
 
 - [ ] **Step 2: Chạy test để xác nhận fail**
 
-Chạy: `uv run pytest packages/vypq-events/tests/test_consumer_metrics.py -v`
-Mong đợi: FAIL — counter chưa tồn tại.
+Chạy: `uv run pytest packages/vypq-events/tests/test_consumer.py -v`
+Mong đợi: ba test mới FAIL vì counter chưa tồn tại; các test cũ vẫn PASS.
 
 - [ ] **Step 3: Viết vypq_core/metrics.py**
 
