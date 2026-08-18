@@ -1335,6 +1335,8 @@ git commit -m "feat(core): circuit breaker với đồng hồ tiêm được"
 
 `packages/vypq-core/tests/test_http_client.py`:
 ```python
+import asyncio
+
 import httpx
 import pytest
 import respx
@@ -1460,6 +1462,31 @@ async def test_4xx_during_half_open_probe_closes_the_circuit():
 
 
 @respx.mock
+async def test_429_is_retried_like_a_5xx():
+    route = respx.get(f"{BASE}/v1/models").mock(
+        side_effect=[httpx.Response(429), httpx.Response(200, json={"ok": True})]
+    )
+    async with _client(max_attempts=3) as c:
+        resp = await c.request("GET", "/v1/models")
+    assert resp.status_code == 200
+    assert route.call_count == 2
+
+
+@respx.mock
+async def test_cancelled_request_still_reports_to_the_breaker():
+    # Không báo lại thì probe half-open treo và mất hai chu kỳ recovery.
+    def _cancel(_request: httpx.Request) -> httpx.Response:
+        raise asyncio.CancelledError
+
+    respx.get(f"{BASE}/v1/models").mock(side_effect=_cancel)
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_s=30.0)
+    async with _client(max_attempts=1, breaker=breaker) as c:
+        with pytest.raises(asyncio.CancelledError):
+            await c.request("GET", "/v1/models")
+    assert breaker.state is CircuitState.OPEN
+
+
+@respx.mock
 async def test_bearer_token_is_sent():
     captured: dict[str, str] = {}
 
@@ -1512,6 +1539,10 @@ from vypq_core.logging import get_logger
 
 log = get_logger(__name__)
 
+# 408 và 429 là 4xx nhưng nói về tình trạng upstream chứ không phải lỗi của request:
+# hết giờ và quá tải đều đáng thử lại có backoff, giống 5xx.
+_RETRYABLE_STATUS = frozenset({408, 429})
+
 
 class UpstreamError(ServiceError):
     """Lỗi tạm thời phía upstream — đáng retry và làm sập circuit."""
@@ -1558,47 +1589,59 @@ class UpstreamClient:
         if not self.breaker.allow():
             raise CircuitOpenError(self.base_url)
 
-        last: Exception | None = None
-        for attempt in range(1, self._max_attempts + 1):
-            try:
-                response = await self._client.request(method, path, **kwargs)
-            except (httpx.TimeoutException, httpx.TransportError) as exc:
-                code = (
-                    ErrorCode.UPSTREAM_TIMEOUT
-                    if isinstance(exc, httpx.TimeoutException)
-                    else ErrorCode.UPSTREAM_ERROR
-                )
-                last = UpstreamError(f"{self.base_url}: {exc}", code)
-            else:
-                if response.status_code < 400:
-                    self.breaker.record_success()
-                    return response
-                if response.status_code < 500:
-                    # 4xx là lỗi của request, thử lại vẫn sai → không retry.
-                    # Nhưng host RỔI SỐNG mới trả được 4xx, nên phải record_success:
-                    # thoát ra mà không báo gì sẽ để probe half-open treo vĩnh viễn.
-                    self.breaker.record_success()
-                    raise ServiceError(
-                        ErrorCode.BAD_INPUT,
-                        f"upstream từ chối ({response.status_code}): {response.text[:200]}",
-                        http_status=response.status_code,
+        reported = False
+        try:
+            last: Exception | None = None
+            for attempt in range(1, self._max_attempts + 1):
+                try:
+                    response = await self._client.request(method, path, **kwargs)
+                except (httpx.TimeoutException, httpx.TransportError) as exc:
+                    code = (
+                        ErrorCode.UPSTREAM_TIMEOUT
+                        if isinstance(exc, httpx.TimeoutException)
+                        else ErrorCode.UPSTREAM_ERROR
                     )
-                last = UpstreamError(f"{self.base_url} trả {response.status_code}")
+                    last = UpstreamError(f"{self.base_url}: {exc}", code)
+                else:
+                    if response.status_code < 400:
+                        self.breaker.record_success()
+                        reported = True
+                        return response
+                    if response.status_code >= 500 or response.status_code in _RETRYABLE_STATUS:
+                        last = UpstreamError(f"{self.base_url} trả {response.status_code}")
+                    else:
+                        # 4xx còn lại là lỗi của request, thử lại vẫn sai → không retry.
+                        # Nhưng host phải còn sống mới trả được 4xx, nên record_success:
+                        # thoát ra mà không báo gì sẽ để probe half-open treo.
+                        self.breaker.record_success()
+                        reported = True
+                        raise ServiceError(
+                            ErrorCode.BAD_INPUT,
+                            f"upstream từ chối ({response.status_code}): {response.text[:200]}",
+                            http_status=response.status_code,
+                        )
 
-            if attempt < self._max_attempts:
-                delay = self._base_delay * (2 ** (attempt - 1))
-                await self._sleep(delay + self._jitter() * delay * 0.1)
-                log.warning("upstream_retry", url=self.base_url, attempt=attempt)
+                if attempt < self._max_attempts:
+                    delay = self._base_delay * (2 ** (attempt - 1))
+                    await self._sleep(delay + self._jitter() * delay * 0.1)
+                    log.warning("upstream_retry", url=self.base_url, attempt=attempt)
 
-        self.breaker.record_failure()
-        assert last is not None
-        raise last
+            self.breaker.record_failure()
+            reported = True
+            assert last is not None
+            raise last
+        finally:
+            if not reported:
+                # Lối thoát bất thường: CancelledError khi caller huỷ, lỗi lập trình,
+                # KeyboardInterrupt. Không báo lại thì probe half-open bị bỏ treo và
+                # phải mất hai chu kỳ recovery mới phục vụ lại được.
+                self.breaker.record_failure()
 ```
 
 - [ ] **Step 4: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-core/tests/test_http_client.py -v`
-Mong đợi: 10 PASS
+Mong đợi: 12 PASS
 
 - [ ] **Step 5: Commit**
 
