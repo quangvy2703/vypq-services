@@ -23,6 +23,7 @@ dev = [
     "vypq-events",
     "model-host",
     "ocr-service",
+    "asr-service",
     # <<< workspace members
     "pillow>=10.4",
 ]
@@ -33,6 +34,7 @@ vypq-core = { workspace = true }
 vypq-events = { workspace = true }
 model-host = { workspace = true }
 ocr-service = { workspace = true }
+asr-service = { workspace = true }
 # <<< workspace sources
 
 [tool.ruff]

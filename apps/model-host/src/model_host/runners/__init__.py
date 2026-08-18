@@ -17,13 +17,23 @@ def _register_optional() -> None:
     không bao giờ đánh dấu unavailable — tệ hơn hẳn.
 
     `try/except ImportError` dưới đây chỉ phòng trường hợp chính file runner
-    hỏng (ví dụ ai đó thêm import nặng lên top level).
+    hỏng (ví dụ ai đó thêm import nặng lên top level). Mỗi runner có khối
+    try/except riêng — module này hỏng không được kéo theo module kia không
+    đăng ký được.
     """
     try:
         from model_host.runners.paddle import PaddleOcrRunner
     except ImportError:
-        return
-    RUNNERS["paddle"] = PaddleOcrRunner
+        pass
+    else:
+        RUNNERS["paddle"] = PaddleOcrRunner
+
+    try:
+        from model_host.runners.whisper import WhisperRunner
+    except ImportError:
+        pass
+    else:
+        RUNNERS["whisper"] = WhisperRunner
 
 
 _register_optional()
