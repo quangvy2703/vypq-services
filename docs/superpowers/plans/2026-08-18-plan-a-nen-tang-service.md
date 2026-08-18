@@ -1133,6 +1133,23 @@ def test_half_open_failure_reopens_immediately():
     assert b.allow() is False
 
 
+def test_stale_probe_does_not_wedge_the_circuit_forever():
+    # Caller nhận probe rồi biến mất, không record_success cũng không record_failure.
+    clock = FakeClock()
+    b = _breaker(clock)
+    for _ in range(3):
+        b.record_failure()
+    clock.advance(31.0)
+    assert b.allow() is True
+
+    clock.advance(31.0)
+    assert b.allow() is False                 # probe treo bị thu hồi, circuit mở lại
+    assert b.state is CircuitState.OPEN
+
+    clock.advance(31.0)
+    assert b.allow() is True                  # tự hồi phục, cấp probe mới
+
+
 def test_half_open_allows_only_one_probe():
     clock = FakeClock()
     b = _breaker(clock)
@@ -1189,36 +1206,45 @@ class CircuitBreaker:
         self._clock = clock
         self._failures = 0
         self._opened_at: float | None = None
-        self._probe_in_flight = False
+        self._probe_started_at: float | None = None
 
     @property
     def state(self) -> CircuitState:
         if self._opened_at is None:
             return CircuitState.CLOSED
-        if self._probe_in_flight:
+        if self._probe_started_at is not None:
             return CircuitState.HALF_OPEN
         return CircuitState.OPEN
 
     def allow(self) -> bool:
         if self._opened_at is None:
             return True
-        if self._probe_in_flight:
-            # Half-open chỉ cho đúng một request thăm dò đi qua.
+        now = self._clock()
+        if self._probe_started_at is not None:
+            if now - self._probe_started_at < self._recovery:
+                # Half-open chỉ cho đúng một request thăm dò đi qua.
+                return False
+            # Probe treo: caller đi ra mà không bao giờ báo lại (exception thoát ở
+            # nhánh không record, task bị cancel, tiến trình chết giữa chừng).
+            # Không có mốc thời gian này thì breaker kẹt HALF_OPEN vĩnh viễn và
+            # chặn mọi request về sau, im lặng, không cách nào tự hồi phục.
+            self._probe_started_at = None
+            self._opened_at = now
             return False
-        if self._clock() - self._opened_at >= self._recovery:
-            self._probe_in_flight = True
+        if now - self._opened_at >= self._recovery:
+            self._probe_started_at = now
             return True
         return False
 
     def record_success(self) -> None:
         self._failures = 0
         self._opened_at = None
-        self._probe_in_flight = False
+        self._probe_started_at = None
 
     def record_failure(self) -> None:
-        if self._probe_in_flight:
+        if self._probe_started_at is not None:
             # Probe hỏng → mở lại ngay, tính lại thời gian chờ.
-            self._probe_in_flight = False
+            self._probe_started_at = None
             self._opened_at = self._clock()
             return
         self._failures += 1
@@ -1226,13 +1252,18 @@ class CircuitBreaker:
             self._opened_at = self._clock()
 
     def is_open(self) -> bool:
+        """True cả khi OPEN lẫn HALF_OPEN — dùng để báo /ready degraded.
+
+        Đừng dùng hàm này để chặn vòng lặp: HALF_OPEN chính là lúc phải cho một
+        request đi qua. Nơi nào cần quyết định gửi hay không thì gọi `allow()`.
+        """
         return self.state is not CircuitState.CLOSED
 ```
 
 - [ ] **Step 4: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-core/tests/test_breaker.py -v`
-Mong đợi: 7 PASS
+Mong đợi: 8 PASS
 
 - [ ] **Step 5: Commit**
 
@@ -1270,6 +1301,17 @@ from vypq_core.errors import ServiceError
 from vypq_core.http_client import UpstreamClient, UpstreamError
 
 BASE = "http://gpu-box:9001"
+
+
+class _FakeClock:
+    def __init__(self) -> None:
+        self.now = 1000.0
+
+    def __call__(self) -> float:
+        return self.now
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
 
 
 async def _noop_sleep(_seconds: float) -> None:
@@ -1352,6 +1394,25 @@ async def test_4xx_does_not_trip_the_breaker():
         for _ in range(3):
             with pytest.raises(ServiceError):
                 await c.request("GET", "/v1/models")
+    assert breaker.state is CircuitState.CLOSED
+
+
+@respx.mock
+async def test_4xx_during_half_open_probe_closes_the_circuit():
+    # Host trả 4xx nghĩa là host còn sống. Nếu đường này thoát ra mà không báo
+    # gì cho breaker, probe treo lại và circuit kẹt vĩnh viễn.
+    respx.get(f"{BASE}/v1/models").mock(side_effect=httpx.ConnectError("chết"))
+    clock = _FakeClock()
+    breaker = CircuitBreaker(failure_threshold=1, recovery_timeout_s=30.0, clock=clock)
+    async with _client(max_attempts=1, breaker=breaker) as c:
+        with pytest.raises(UpstreamError):
+            await c.request("GET", "/v1/models")
+        assert breaker.state is CircuitState.OPEN
+
+        respx.get(f"{BASE}/v1/models").mock(return_value=httpx.Response(404))
+        clock.advance(31.0)
+        with pytest.raises(ServiceError):
+            await c.request("GET", "/v1/models")
     assert breaker.state is CircuitState.CLOSED
 
 
@@ -1470,8 +1531,10 @@ class UpstreamClient:
                     self.breaker.record_success()
                     return response
                 if response.status_code < 500:
-                    # 4xx là lỗi của request, thử lại vẫn sai. Không retry,
-                    # không tính vào circuit breaker.
+                    # 4xx là lỗi của request, thử lại vẫn sai → không retry.
+                    # Nhưng host RỔI SỐNG mới trả được 4xx, nên phải record_success:
+                    # thoát ra mà không báo gì sẽ để probe half-open treo vĩnh viễn.
+                    self.breaker.record_success()
                     raise ServiceError(
                         ErrorCode.BAD_INPUT,
                         f"upstream từ chối ({response.status_code}): {response.text[:200]}",
@@ -1492,7 +1555,7 @@ class UpstreamClient:
 - [ ] **Step 4: Chạy test để xác nhận pass**
 
 Chạy: `uv run pytest packages/vypq-core/tests/test_http_client.py -v`
-Mong đợi: 9 PASS
+Mong đợi: 10 PASS
 
 - [ ] **Step 5: Commit**
 
