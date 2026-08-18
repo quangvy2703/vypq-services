@@ -66,12 +66,26 @@ class CircuitBreaker:
             return True
         return False
 
+    def _is_late_report(self) -> bool:
+        """Báo cáo đến từ một request không còn được phép tồn tại.
+
+        OPEN mà không có probe nào đang bay nghĩa là allow() đang chặn tất cả —
+        nên mọi record_* lúc này đều từ caller cũ báo về muộn: probe đã bị thu
+        hồi, hoặc request đi qua trước lúc mạch mở. Nhận vào thì một caller treo
+        lâu có thể đóng lại mạch đang mở, hoặc đẩy lùi hạn chờ vô cớ.
+        """
+        return self._opened_at is not None and self._probe_started_at is None
+
     def record_success(self) -> None:
+        if self._is_late_report():
+            return
         self._failures = 0
         self._opened_at = None
         self._probe_started_at = None
 
     def record_failure(self) -> None:
+        if self._is_late_report():
+            return
         if self._probe_started_at is not None:
             # Probe hỏng → mở lại ngay, tính lại thời gian chờ.
             self._probe_started_at = None

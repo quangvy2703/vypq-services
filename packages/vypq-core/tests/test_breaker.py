@@ -92,6 +92,35 @@ def test_stale_probe_does_not_wedge_the_circuit_forever():
     assert b.allow() is True                  # tự hồi phục, cấp probe mới
 
 
+def test_late_success_from_a_reclaimed_probe_does_not_close_the_circuit():
+    clock = FakeClock()
+    b = _breaker(clock)
+    for _ in range(3):
+        b.record_failure()
+    clock.advance(31.0)
+    assert b.allow() is True          # probe đi ra
+    clock.advance(31.0)
+    b.allow()                         # probe bị thu hồi → OPEN
+    assert b.state is CircuitState.OPEN
+    b.record_success()                # caller cũ mới báo về
+    assert b.state is CircuitState.OPEN
+
+
+def test_late_failure_from_a_reclaimed_probe_does_not_push_back_the_deadline():
+    clock = FakeClock()
+    b = _breaker(clock)
+    for _ in range(3):
+        b.record_failure()
+    clock.advance(31.0)
+    b.allow()
+    clock.advance(31.0)
+    b.allow()                         # thu hồi probe, hạn chờ tính từ đây
+    clock.advance(5.0)
+    b.record_failure()                # caller cũ báo về muộn
+    clock.advance(25.0)
+    assert b.allow() is True          # đúng hạn 30s, không bị đẩy lùi thêm 5s
+
+
 def test_half_open_allows_only_one_probe():
     clock = FakeClock()
     b = _breaker(clock)
