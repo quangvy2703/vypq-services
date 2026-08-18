@@ -267,6 +267,114 @@ async def test_pause_stops_fetching_then_resumes_and_carries_on():
     assert producer.published == []           # suốt quá trình không DLQ cái nào
 
 
+async def test_poison_message_is_dead_lettered_after_pause_limit_then_progress_resumes():
+    # input_uri trỏ tới host đã biến mất vĩnh viễn: handler luôn lỗi retryable cho
+    # đúng message này; mọi message khác (không trùng uri) xử lý bình thường.
+    dead_host = "s3://dead-host/permanently-gone.jpg"
+
+    async def handler(env):
+        if env.payload["input_uri"] == dead_host:
+            raise UpstreamError("host đã biến mất vĩnh viễn")
+
+    clock = Clock()
+    producer = FakeProducer()
+    poison_rounds = [{TOPIC_TP: [_msg(0, uri=dead_host)]} for _ in range(4)]
+    kafka = FakeConsumer(batches=poison_rounds + [{TOPIC_TP: [_msg(1)]}])
+    c = _consumer(
+        kafka,
+        producer,
+        handler,
+        clock=clock,
+        max_attempts=1,
+        pause_seconds=10.0,
+        max_pause_rounds=3,
+    )
+
+    for _ in range(4):
+        await c.run_once()
+        clock.advance(11.0)
+
+    assert len(producer.published) == 1
+    assert producer.published[0][0] == "infer.ocr.dlq"
+    assert kafka.paused_tps == set()          # không còn treo ở message này nữa
+
+    processed = await c.run_once()            # batch kế tiếp trong hàng đợi
+    assert processed == 1                     # được xử lý bình thường, không bị chặn
+    assert len(producer.published) == 1       # không có DLQ nào phát sinh thêm
+
+
+async def test_pause_round_counter_resets_when_head_offset_changes():
+    # offset 0 lỗi 2 lần rồi thành công; offset 1 lỗi 2 lần sau đó. Nếu bộ đếm
+    # không reset theo offset đang đứng đầu, hai lần lỗi của offset 1 sẽ cộng dồn
+    # lên hai lần lỗi trước đó của offset 0 và có thể vượt ngưỡng oan.
+    uri_a, uri_b = "s3://gpu-a/img.jpg", "s3://gpu-b/img.jpg"
+    attempts_a = [0]
+
+    async def handler(env):
+        uri = env.payload["input_uri"]
+        if uri == uri_a:
+            if attempts_a[0] < 2:
+                attempts_a[0] += 1
+                raise UpstreamError("gpu-a chập chờn")
+            return
+        if uri == uri_b:
+            raise UpstreamError("gpu-b chập chờn")
+
+    clock = Clock()
+    producer = FakeProducer()
+    kafka = FakeConsumer(
+        batches=[
+            {TOPIC_TP: [_msg(0, uri=uri_a)]},
+            {TOPIC_TP: [_msg(0, uri=uri_a)]},
+            {TOPIC_TP: [_msg(0, uri=uri_a)]},  # lần thứ 3 mới thành công
+            {TOPIC_TP: [_msg(1, uri=uri_b)]},
+            {TOPIC_TP: [_msg(1, uri=uri_b)]},
+        ]
+    )
+    c = _consumer(
+        kafka,
+        producer,
+        handler,
+        clock=clock,
+        max_attempts=1,
+        pause_seconds=10.0,
+        max_pause_rounds=3,
+    )
+
+    for _ in range(5):
+        await c.run_once()
+        clock.advance(11.0)
+
+    assert producer.published == []           # không message nào bị dead-letter
+
+
+async def test_default_pause_rounds_rides_out_a_handful_of_rounds_without_dlq():
+    # Sự cố hạ tầng bình thường (vài vòng pause) không được phép làm rơi message
+    # vào DLQ — đây chính là hành vi "lossless" mà cơ chế pause tồn tại để giữ.
+    async def handler(_env):
+        raise UpstreamError("outage hạ tầng kéo dài nhưng chưa vượt ngưỡng")
+
+    clock = Clock()
+    producer = FakeProducer()
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]} for _ in range(5)])
+    c = _consumer(
+        kafka,
+        producer,
+        handler,
+        clock=clock,
+        max_attempts=1,
+        pause_seconds=30.0,
+        max_pause_rounds=40,
+    )
+
+    for _ in range(5):
+        await c.run_once()
+        clock.advance(31.0)
+
+    assert producer.published == []            # vẫn lossless, chưa gần tới ngưỡng
+    assert TOPIC_TP in kafka.paused_tps         # vẫn đang chờ hạ tầng, không bỏ cuộc
+
+
 async def test_producer_wraps_broker_failure_as_upstream_error():
     # Broker trục trặc lúc publish kết quả không được coi là dữ liệu hỏng:
     # inference đã chạy xong rồi, dead-letter là vứt mất kết quả đã trả tiền.

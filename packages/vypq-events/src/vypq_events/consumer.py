@@ -29,6 +29,14 @@ def default_is_retryable(exc: Exception) -> bool:
 class _PauseSignal(Exception):
     """Nội bộ: báo run_once dừng consume thay vì đẩy message vào DLQ."""
 
+    def __init__(self, envelope=None) -> None:
+        super().__init__()
+        self.envelope = envelope
+
+
+class PauseLimitExceeded(Exception):
+    """Message này đã khiến consumer pause quá max_pause_rounds vòng liên tiếp."""
+
 
 class EventConsumer:
     def __init__(
@@ -49,6 +57,7 @@ class EventConsumer:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         is_retryable: Callable[[Exception], bool] = default_is_retryable,
+        max_pause_rounds: int = 40,
     ) -> None:
         self._handler = handler
         self._dlq_topic = dlq_topic
@@ -61,7 +70,11 @@ class EventConsumer:
         self._sleep = sleep
         self._clock = clock
         self._is_retryable = is_retryable
+        self._max_pause_rounds = max_pause_rounds
         self._paused_until: float | None = None
+        # Offset đang bị kẹt ở đầu batch và số vòng pause liên tiếp nó đã gây ra.
+        self._pause_offset_key: tuple | None = None
+        self._pause_round_count: int = 0
         self._consumer = consumer or AIOKafkaConsumer(
             topic,
             bootstrap_servers=brokers,
@@ -95,7 +108,48 @@ class EventConsumer:
             for message in messages:
                 try:
                     await self._process(message)
-                except _PauseSignal:
+                except _PauseSignal as sig:
+                    key = (tp, message.offset)
+                    if key != self._pause_offset_key:
+                        self._pause_offset_key = key
+                        self._pause_round_count = 1
+                    else:
+                        self._pause_round_count += 1
+
+                    # Chỉ message ở ĐẦU batch (head) mới tích luỹ vòng pause — các
+                    # message phía sau nó trong cùng partition chưa bao giờ được
+                    # thử, vì mỗi lần pause consumer đều tua về đúng offset này rồi
+                    # dừng lại. Vì thế bộ đếm này KHÔNG phân biệt được "message hỏng
+                    # vĩnh viễn" với "hạ tầng đang gặp sự cố kéo dài": nó chỉ đo được
+                    # message đứng đầu hàng đợi bao lâu, không đo bản chất lỗi. Đặt
+                    # ngưỡng thấp (kiểu 3 vòng) sẽ khiến consumer bắt đầu dead-letter
+                    # cả hàng đợi, mỗi cửa sổ pause một message, ngay khi hạ tầng chỉ
+                    # mới gián đoạn vài phút — chính là mất dữ liệu mà cơ chế
+                    # pause/rewind này sinh ra để ngăn. Ngưỡng phải đủ rộng để chịu
+                    # được MỌI sự cố hạ tầng thực tế (đổi máy GPU thuê, object store
+                    # phục hồi, v.v.); nó chỉ tồn tại để chặn tình huống kẹt VÔ HẠN,
+                    # không phải để lọc message lỗi.
+                    if self._pause_round_count > self._max_pause_rounds:
+                        log.error(
+                            "pause_limit_exceeded",
+                            topic=tp.topic,
+                            offset=message.offset,
+                            rounds=self._pause_round_count,
+                        )
+                        reason = PauseLimitExceeded(
+                            f"vượt quá {self._max_pause_rounds} vòng pause liên tiếp "
+                            f"tại offset {message.offset}; lỗi gần nhất: {sig.__cause__}"
+                        )
+                        await self._to_dlq(
+                            message, sig.envelope, reason, attempts=self._max_attempts
+                        )
+                        pending[tp] = message.offset + 1
+                        processed += 1
+                        await self._consumer.commit()
+                        self._pause_offset_key = None
+                        self._pause_round_count = 0
+                        continue
+
                     # Tua lại MỌI partition trong batch, không chỉ cái đang lỗi:
                     # commit() không tham số commit vị trí của TẤT CẢ partition
                     # được gán, kể cả những partition mà getmany() đã trả record
@@ -109,6 +163,8 @@ class EventConsumer:
                     return processed
                 pending[tp] = message.offset + 1
                 processed += 1
+                self._pause_offset_key = None
+                self._pause_round_count = 0
         if processed:
             await self._consumer.commit()
         return processed
@@ -150,7 +206,7 @@ class EventConsumer:
                     return
                 if attempt == self._max_attempts:
                     log.warning("retry_exhausted_pausing", error=str(exc))
-                    raise _PauseSignal from exc
+                    raise _PauseSignal(envelope) from exc
                 await self._sleep(self._base_delay * (2 ** (attempt - 1)))
 
     async def _to_dlq(self, message, envelope, exc: Exception, attempts: int) -> None:
