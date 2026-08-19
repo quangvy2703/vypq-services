@@ -53,7 +53,11 @@ class ServiceInfo(BaseModel):
 
 
 class ServiceState(BaseModel):
-    info: ServiceInfo
+    # None nghĩa là gateway CHƯA TỪNG poll thành công service này — không có
+    # ServiceInfo thật để đọc, nên tuyệt đối không được đoán task hay
+    # invoke_path (đoán = có thể gọi/định tuyến sai service, ví dụ publish
+    # nhầm sang topic Kafka của task khác).
+    info: ServiceInfo | None = None
     base_url: str
     status: HealthStatus = HealthStatus.DOWN
     last_seen_at: datetime | None = None

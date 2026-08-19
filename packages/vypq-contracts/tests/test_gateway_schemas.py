@@ -96,6 +96,14 @@ def test_service_state_carries_health():
     assert state.info.default_model is None
 
 
+def test_service_state_info_defaults_to_none():
+    # Chưa từng poll thành công thì không có ServiceInfo thật để gắn vào —
+    # info phải construct được mà không truyền, và mặc định là None chứ
+    # không phải một giá trị đoán (vd hardcode Task.OCR).
+    state = ServiceState(base_url="http://ocr:8001")
+    assert state.info is None
+
+
 def test_invoke_defaults_to_sync():
     req = InvokeRequest(service="ocr")
     assert req.mode is InvokeMode.SYNC

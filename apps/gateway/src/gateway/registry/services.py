@@ -5,7 +5,7 @@ from pathlib import Path
 import httpx
 import yaml
 from pydantic import BaseModel, Field
-from vypq_contracts.common import HealthStatus, Task
+from vypq_contracts.common import HealthStatus
 from vypq_contracts.gateway import ServiceInfo, ServiceState
 from vypq_core.logging import get_logger
 
@@ -30,14 +30,11 @@ def load_services(path: Path) -> list[ServiceEntry]:
 
 
 def _placeholder(entry: ServiceEntry) -> ServiceState:
-    return ServiceState(
-        info=ServiceInfo(
-            name=entry.name, task=Task.OCR, capability_input="unknown",
-            capability_output="unknown", version="unknown", invoke_path="/v1/unknown",
-        ),
-        base_url=entry.base_url,
-        status=HealthStatus.DOWN,
-    )
+    # info=None: gateway chưa nói chuyện được với service này lần nào, nên
+    # không có gì để đoán task hay invoke_path. Đoán từng là bug: hardcode
+    # Task.OCR khiến một service khác OCR chưa poll được có thể bị định
+    # tuyến/publish nhầm sang topic của OCR.
+    return ServiceState(info=None, base_url=entry.base_url, status=HealthStatus.DOWN)
 
 
 class ServiceRegistry:
@@ -56,9 +53,29 @@ class ServiceRegistry:
         return self._states.get(name)
 
     async def refresh(self) -> None:
-        await asyncio.gather(*(self._refresh_one(e) for e in self._entries))
+        # return_exceptions=True là bảo đảm CẤU TRÚC, giống HostPoller: một
+        # _refresh_one hỏng ở đâu đó ngoài dự tính cũng chỉ hạ đúng service
+        # đó, không giết cả gather và làm registry đứng im, âm thầm.
+        results = await asyncio.gather(
+            *(self._refresh_one(e) for e in self._entries),
+            return_exceptions=True,
+        )
+        for entry, result in zip(self._entries, results, strict=True):
+            if isinstance(result, asyncio.CancelledError):
+                # Huỷ là tín hiệu tắt máy, không phải lỗi của service — phải
+                # bay tiếp, nếu không lifespan sẽ treo khi shutdown.
+                raise result
+            if isinstance(result, BaseException):
+                log.exception("service_refresh_crashed", service=entry.name, error=str(result))
 
     async def _refresh_one(self, entry: ServiceEntry) -> None:
+        """Poll một service và cập nhật trạng thái của nó.
+
+        Lưu ý: `last_seen_at` được set ngay khi GET /v1/info thành công, kể cả
+        khi bước /ready ngay sau đó thất bại. Vậy nó có nghĩa là "lần cuối
+        GATEWAY CHẠM ĐƯỢC service" (last reached), KHÔNG phải "lần cuối service
+        khoẻ" (last healthy) — status mới là trường mang tình trạng khoẻ mạnh.
+        """
         base = entry.base_url.rstrip("/")
         previous = self._states[entry.name]
         try:
