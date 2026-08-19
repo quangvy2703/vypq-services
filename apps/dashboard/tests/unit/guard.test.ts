@@ -12,7 +12,7 @@ beforeAll(async () => {
 });
 
 describe("decideAccess", () => {
-  it.each(["/login", "/api/login"])("cho %s đi qua khi chưa đăng nhập", async (pathname) => {
+  it.each(["/login", "/api/login", "/api/logout"])("cho %s đi qua khi chưa đăng nhập", async (pathname) => {
     const decision = await decideAccess({
       pathname, sessionToken: undefined, sessionSecret: SECRET, nowMs: NOW,
     });
@@ -31,6 +31,16 @@ describe("decideAccess", () => {
       pathname: "/hosts", sessionToken: undefined, sessionSecret: SECRET, nowMs: NOW,
     });
     expect(decision.kind).toBe("redirect-login");
+  });
+
+  it("cho đăng xuất đi qua kể cả khi phiên đã hết hạn", async () => {
+    // Bấm Đăng xuất với phiên hết hạn mà nhận 401 JSON thô giữa trang là ngõ cụt:
+    // người dùng không xoá được cookie hỏng bằng chính nút để làm việc đó.
+    const expired = await signSession(SECRET, NOW - 1);
+    const decision = await decideAccess({
+      pathname: "/api/logout", sessionToken: expired, sessionSecret: SECRET, nowMs: NOW,
+    });
+    expect(decision.kind).toBe("allow");
   });
 
   it("trả 401 cho API chứ không redirect — fetch() không đọc được trang HTML đăng nhập", async () => {

@@ -6,8 +6,14 @@ export type GuardDecision =
   | { kind: "unauthorized-api" }
   | { kind: "redirect-login" };
 
-/** So khớp chính xác, không dùng startsWith: "/loginhacker" không phải "/login". */
-const PUBLIC_PATHS = new Set(["/login", "/api/login"]);
+/**
+ * So khớp chính xác, không dùng startsWith: "/loginhacker" không phải "/login".
+ *
+ * /api/logout công khai vì đăng xuất phải luôn thành công: phiên hết hạn rồi mà
+ * bấm Đăng xuất sẽ nhận 401 JSON thô ngay giữa trang. Route đó chỉ xoá cookie,
+ * không đọc dữ liệu gì nên mở ra không lộ thứ gì.
+ */
+const PUBLIC_PATHS = new Set(["/login", "/api/login", "/api/logout"]);
 
 export interface AccessInput {
   pathname: string;
