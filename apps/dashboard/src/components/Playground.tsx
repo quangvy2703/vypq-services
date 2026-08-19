@@ -56,13 +56,23 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
     [hosts, service],
   );
 
+  // Lượt chạy đang bay. Tăng số này là tuyên bố "mọi kết quả chưa về đều lỗi
+  // thời": đổi service hay đổi file xong mà kết quả cũ về trễ rồi tự hiện lên
+  // thì người dùng đang nhìn output của service này qua viewer của service kia.
+  const runToken = useRef(0);
+
   useEffect(() => {
-    // Object URL sống tới khi tab đóng nếu không thu hồi — mỗi ảnh thử là một
-    // bản sao nằm lại trong bộ nhớ.
-    return () => {
-      if (objectUrl) URL.revokeObjectURL(objectUrl);
-    };
-  }, [objectUrl]);
+    if (!file) {
+      setObjectUrl(null);
+      return;
+    }
+    // Tạo trong effect chứ không trong updater của setState: updater phải thuần,
+    // và React Strict Mode gọi nó hai lần ở chế độ dev — URL của lần gọi bị bỏ
+    // đi sẽ không bao giờ được thu hồi. Đặt ở đây thì cleanup luôn khớp một-một.
+    const url = URL.createObjectURL(file);
+    setObjectUrl(url);
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
 
   if (!service) {
     return <EmptyState>Chưa có service nào dùng được — kiểm tra trang Services.</EmptyState>;
@@ -71,26 +81,35 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
   // xuyên qua closure `run` bên dưới dù nó không bao giờ đổi giá trị.
   const activeService: ServiceInfo = service;
 
+  /** Bỏ mọi lượt chạy đang bay: kết quả của chúng không còn thuộc về màn hình này. */
+  function discardInFlight(): void {
+    runToken.current += 1;
+    setOutcome(null);
+    setPending(false);
+  }
+
   function selectService(name: string): void {
     setServiceName(name);
     // Kết quả cũ thuộc về service cũ; giữ lại là ghép nhầm output với capability.
-    setOutcome(null);
+    discardInFlight();
     setModel("");
   }
 
   function selectFile(next: File | null): void {
-    setOutcome(null);
+    discardInFlight();
     setFile(next);
-    setObjectUrl((previous) => {
-      if (previous) URL.revokeObjectURL(previous);
-      return next ? URL.createObjectURL(next) : null;
-    });
   }
 
   async function run(): Promise<void> {
     if (!file) return;
+    const token = runToken.current + 1;
+    runToken.current = token;
     setPending(true);
-    setOutcome(await runOne(activeService.name, file, model));
+    const result = await runOne(activeService.name, file, model);
+    // Lượt này đã bị bỏ trong lúc chờ. Không đụng vào state: lượt mới (nếu có)
+    // tự quản pending của nó, còn discardInFlight đã dọn sạch phần hiển thị.
+    if (token !== runToken.current) return;
+    setOutcome(result);
     setPending(false);
   }
 

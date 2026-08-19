@@ -1,5 +1,6 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { StrictMode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import { Playground } from "@/components/Playground";
@@ -162,6 +163,63 @@ describe("Playground", () => {
     await user.click(screen.getByRole("button", { name: "Chạy thử" }));
     expect(await screen.findByRole("button", { name: /đang chạy/i })).toBeDisabled();
     release(invokeOk());
+  });
+
+  it("bỏ kết quả về trễ của service cũ khi người dùng đã đổi service", async () => {
+    // Race thật: bấm Chạy trên OCR, đổi sang ASR trong lúc request còn bay, rồi
+    // kết quả OCR mới về. Ghi thẳng vào state thì người dùng đang nhìn output
+    // OCR qua viewer của ASR — đúng thứ mà việc xoá kết quả khi đổi service tồn
+    // tại để ngăn.
+    let release: (value: Response) => void = () => {};
+    fetchMock.mockImplementation((url: string) =>
+      url === "/api/invoke"
+        ? new Promise<Response>((resolve) => {
+            release = resolve;
+          })
+        : Promise.resolve(new Response(JSON.stringify({ id: "r1", latency_ms: 320 }), { status: 200 })),
+    );
+    const user = userEvent.setup();
+    render(<Playground services={[ocrService, asrService]} hosts={hosts} />);
+    await pickFile(user);
+    await user.click(screen.getByRole("button", { name: "Chạy thử" }));
+    await user.selectOptions(screen.getByLabelText("Service"), "asr");
+
+    await act(async () => {
+      release(invokeOk());
+    });
+
+    expect(screen.queryByText("t1")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Chạy thử" })).toBeEnabled();
+  });
+
+  it("không rò object URL khi React Strict Mode gọi effect hai lần", () => {
+    // reactStrictMode đang bật trong next.config.ts. Đặt createObjectURL trong
+    // updater của setState thì lần gọi thừa sinh ra một URL không ai thu hồi.
+    const created: string[] = [];
+    const revoked: string[] = [];
+    let seq = 0;
+    vi.stubGlobal("URL", Object.assign(URL, {
+      createObjectURL: vi.fn(() => {
+        seq += 1;
+        const url = `blob:u${seq}`;
+        created.push(url);
+        return url;
+      }),
+      revokeObjectURL: vi.fn((url: string) => revoked.push(url)),
+    }));
+
+    const { unmount } = render(
+      <StrictMode>
+        <Playground services={[ocrService]} hosts={hosts} />
+      </StrictMode>,
+    );
+    fireEvent.change(screen.getByLabelText(/tệp đầu vào/i), {
+      target: { files: [new File([new Uint8Array([1])], "hoadon.png", { type: "image/png" })] },
+    });
+    unmount();
+
+    expect(created.length).toBeGreaterThan(0);
+    expect([...revoked].sort()).toEqual([...created].sort());
   });
 
   it("thu hồi object URL của ảnh cũ khi chọn file khác", async () => {
