@@ -587,6 +587,12 @@ tranh luận lại — và để Plan B, C không vấp phải.
   nhận trace_id từ chính gateway nên "sai id" không phải tình huống thực tế của
   họ; nhu cầu thật của Plan C (biết việc nào hỏng hẳn) đi qua `InferenceFailed`
   đã ghi ở trên.
+- **Redpanda v24.2.7 KHÔNG phát metric consumer lag.** Đã kiểm cả `/public_metrics`
+  lẫn `/metrics` trên broker thật: không series nào khớp `lag`. Nên alert lag bị bỏ
+  hẳn thay vì ship một rule trỏ vào thứ không tồn tại — rule như vậy không bao giờ
+  kêu và tạo cảm giác an toàn giả. Muốn có lag thì tính bằng PromQL từ hai gauge
+  sẵn có: `redpanda_kafka_max_offset - redpanda_kafka_consumer_group_committed_offset`,
+  join theo topic/partition/group. Kiểm bằng query thật trước khi đặt ngưỡng.
 - **Cần metric và alert trên `dlq_publish_failed` + `consumer_paused`** trước khi
   chạy không người trông. DLQ hỏng vĩnh viễn sẽ kẹt cả partition, im lặng.
   Đây là bước 10 trong lộ trình Plan B.
