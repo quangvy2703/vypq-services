@@ -23,6 +23,12 @@ export function LoginForm() {
     // và mọi thứ Router Cache phía client ghi lại lúc CHƯA có phiên (mọi trang
     // đều bị middleware đẩy về /login) đều đã sai kể từ giây này. Tải lại cả
     // trang là cách duy nhất chắc chắn vứt hết đống đó đi.
+    //
+    // Nhóm route (dashboard) — không render Nav trên /login — tự nó cũng đủ sửa
+    // lỗi "đăng nhập không đi đâu cả", đã kiểm bằng cách hoàn nguyên riêng từng
+    // lớp. Giữ cả hai là cố ý: lớp kia chỉ chặn ĐÚNG MỘT nguồn làm hỏng cache
+    // (prefetch của Nav), còn dòng này chặn mọi nguồn khác, kể cả những cái sẽ
+    // sinh ra khi ai đó thêm một Link mới ở đâu đó trong tương lai.
     window.location.assign("/hosts");
   }
 

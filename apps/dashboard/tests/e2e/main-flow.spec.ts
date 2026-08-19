@@ -90,6 +90,24 @@ test("so sánh hai model trên cùng một ảnh", async ({ page }) => {
   await expect(page.getByText("Số vùng chữ").first()).toBeVisible();
 });
 
+test("gỡ host đi qua được route có params bất đồng bộ của Next 15", async ({ page }) => {
+  // DELETE /api/hosts/{name} là route thứ hai dùng `await context.params`. Unit
+  // test tự dựng Promise.resolve({name}) — đúng hình dạng nhưng chưa bao giờ
+  // chạy trên router thật. Đây là chỗ duy nhất chứng minh nó hoạt động.
+  await login(page);
+  await page.getByLabel("Tên").fill("a100-sap-tra-may");
+  await page.getByLabel("URL").fill("https://a100-sap-tra-may.ngrok.app");
+  await page.getByRole("button", { name: "Cắm host" }).click();
+  await expect(page.getByRole("row", { name: /a100-sap-tra-may/ })).toBeVisible();
+
+  // Gỡ host hỏi lại trước — máy thuê hết giờ là chuyện thường, nhưng gỡ nhầm
+  // thì mọi service mất một đường định tuyến ngay lập tức.
+  page.once("dialog", (dialog) => void dialog.accept());
+  await page.getByRole("button", { name: /Gỡ a100-sap-tra-may/i }).click();
+
+  await expect(page.getByRole("row", { name: /a100-sap-tra-may/ })).toHaveCount(0);
+});
+
 test("đăng xuất thì phiên hết hiệu lực", async ({ page }) => {
   await login(page);
   await page.getByRole("button", { name: "Đăng xuất" }).click();
