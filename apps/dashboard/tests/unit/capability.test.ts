@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { acceptForInput, isUsable, statusTone, viewerFor } from "@/lib/capability";
+import { acceptForInput, capabilityOutputFor, isUsable, statusTone, viewerFor } from "@/lib/capability";
 import type { ServiceState } from "@/lib/types";
 
 describe("acceptForInput", () => {
@@ -73,5 +73,45 @@ describe("statusTone", () => {
     ["down", "bad"],
   ] as const)("ánh xạ %s sang tone %s", (status, tone) => {
     expect(statusTone(status)).toBe(tone);
+  });
+});
+
+describe("capabilityOutputFor", () => {
+  const asr: ServiceState = {
+    info: {
+      name: "asr", task: "asr", capability_input: "audio", capability_output: "transcript",
+      version: "0.1.0", invoke_path: "/v1/asr", default_model: "whisper-large-v3",
+    },
+    base_url: "http://asr:8000",
+    status: "ok",
+    last_seen_at: null,
+  };
+
+  it("đọc capability từ chính service đã chạy run", () => {
+    expect(capabilityOutputFor([usable, asr], "asr")).toBe("transcript");
+  });
+
+  it("KHÔNG suy từ tên service — service tên 'ocr' vẫn phải đọc capability đã khai", () => {
+    // Tên chỉ là nhãn trong config/services.yaml; capability là thứ service tự
+    // khai qua /v1/info. Đoán từ tên làm dashboard hiện output qua viewer của
+    // task khác ngay khi hai thứ đó lệch nhau.
+    const doiTen: ServiceState = {
+      ...usable,
+      info: { ...usable.info!, name: "ocr", capability_output: "transcript" },
+    };
+    expect(capabilityOutputFor([doiTen], "ocr")).toBe("transcript");
+  });
+
+  it("rơi về json khi không khớp service nào", () => {
+    expect(capabilityOutputFor([usable], "khong-ton-tai")).toBe("json");
+  });
+
+  it("rơi về json khi service chưa từng được poll (info=null)", () => {
+    const chuaBiet: ServiceState = { info: null, base_url: "http://ner:8000", status: "down", last_seen_at: null };
+    expect(capabilityOutputFor([chuaBiet], "ner")).toBe("json");
+  });
+
+  it("rơi về json khi danh sách service rỗng", () => {
+    expect(capabilityOutputFor([], "ocr")).toBe("json");
   });
 });

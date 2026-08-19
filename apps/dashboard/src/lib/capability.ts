@@ -30,3 +30,19 @@ export function statusTone(status: HealthStatus): Tone {
   if (status === "degraded") return "warn";
   return "bad";
 }
+
+/**
+ * Capability output của service đã chạy một run, đọc từ chính danh sách service
+ * gateway trả về.
+ *
+ * KHÔNG suy từ tên service: tên chỉ là nhãn người vận hành đặt trong
+ * config/services.yaml, còn capability là thứ service tự khai qua /v1/info. Hai
+ * cái trùng nhau hôm nay không có nghĩa là trùng mãi, và đoán sai ở đây làm
+ * dashboard hiển thị output qua viewer của task khác.
+ *
+ * Không khớp được service nào (service đã bị gỡ khỏi cấu hình, hoặc gateway
+ * chưa từng poll được nên info=null) thì trả "json" — xem thô còn hơn đoán.
+ */
+export function capabilityOutputFor(services: ServiceState[], serviceName: string): string {
+  return services.find((state) => state.info?.name === serviceName)?.info?.capability_output ?? "json";
+}

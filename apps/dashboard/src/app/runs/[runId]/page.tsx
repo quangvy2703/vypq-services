@@ -4,17 +4,12 @@ import { notFound } from "next/navigation";
 import { Badge, Card } from "@/components/ui";
 import { ResultViewer } from "@/components/viewers/ResultViewer";
 import { GatewayError } from "@/lib/errors";
+import { capabilityOutputFor } from "@/lib/capability";
 import { formatMs, formatTimestamp } from "@/lib/format";
 import { gateway } from "@/lib/gateway";
-import type { RunRecord, ServiceState } from "@/lib/types";
+import type { RunRecord } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
-
-function capabilityOf(services: ServiceState[], run: RunRecord): string {
-  // Đọc capability từ chính service đã chạy run này; không suy từ tên. Service
-  // chưa poll được (info=null) thì để "json" — xem thô còn hơn đoán sai viewer.
-  return services.find((state) => state.info?.name === run.service)?.info?.capability_output ?? "json";
-}
 
 export default async function RunDetailPage({ params }: { params: Promise<{ runId: string }> }) {
   const { runId } = await params;
@@ -53,7 +48,7 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
 
       <Card title="Kết quả">
         <ResultViewer
-          capabilityOutput={capabilityOf(services, run)}
+          capabilityOutput={capabilityOutputFor(services, run.service)}
           output={run.output}
           imageUrl={null}
           audioUrl={null}
