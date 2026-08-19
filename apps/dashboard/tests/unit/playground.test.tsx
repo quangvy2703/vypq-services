@@ -47,7 +47,11 @@ function invokeOk(): Response {
 }
 
 beforeEach(() => {
-  fetchMock = vi.fn().mockResolvedValue(invokeOk());
+  fetchMock = vi.fn(async (url: string) =>
+    url === "/api/invoke"
+      ? invokeOk()
+      : new Response(JSON.stringify({ id: "r1", latency_ms: 320 }), { status: 200 }),
+  );
   vi.stubGlobal("fetch", fetchMock);
   vi.stubGlobal("URL", Object.assign(URL, {
     createObjectURL: vi.fn(() => "blob:gia-lap"),
@@ -91,15 +95,15 @@ describe("Playground", () => {
   it("chỉ liệt kê model đúng task của service đang chọn", async () => {
     const user = userEvent.setup();
     render(<Playground services={[ocrService, asrService]} hosts={hosts} />);
-    expect(screen.getByLabelText(/model/i)).toHaveTextContent("paddleocr-v4-vi");
+    expect(screen.getByLabelText(/^Model$/)).toHaveTextContent("paddleocr-v4-vi");
     await user.selectOptions(screen.getByLabelText("Service"), "asr");
-    const select = screen.getByLabelText(/model/i) as HTMLSelectElement;
+    const select = screen.getByLabelText(/^Model$/) as HTMLSelectElement;
     expect([...select.options].map((o) => o.value)).toEqual(["", "whisper-large-v3"]);
   });
 
   it("mặc định để trống model, tức là dùng default_model của service", () => {
     render(<Playground services={[ocrService]} hosts={hosts} />);
-    expect((screen.getByLabelText(/model/i) as HTMLSelectElement).value).toBe("");
+    expect((screen.getByLabelText(/^Model$/) as HTMLSelectElement).value).toBe("");
   });
 
   it("chưa chọn file thì không cho chạy", () => {
@@ -111,11 +115,12 @@ describe("Playground", () => {
     const user = userEvent.setup();
     render(<Playground services={[ocrService]} hosts={hosts} />);
     await pickFile(user);
-    await user.selectOptions(screen.getByLabelText(/model/i), "vietocr-ft-invoice");
+    await user.selectOptions(screen.getByLabelText(/^Model$/), "vietocr-ft-invoice");
     await user.click(screen.getByRole("button", { name: "Chạy thử" }));
 
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const invokeCall = fetchMock.mock.calls.find((call) => call[0] === "/api/invoke");
+    const [url, init] = invokeCall as [string, RequestInit];
     expect(url).toBe("/api/invoke");
     const body = init.body as FormData;
     expect(body.get("service")).toBe("ocr");
