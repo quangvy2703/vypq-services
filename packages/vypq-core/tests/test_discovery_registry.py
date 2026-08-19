@@ -141,3 +141,71 @@ async def test_lease_tracks_inflight_across_refreshes():
 
 async def test_satisfies_the_protocol():
     assert isinstance(DiscoveryHostRegistry(URL), HostRegistry)
+
+
+@respx.mock
+async def test_host_object_is_updated_in_place_on_refresh():
+    # Máy GPU thuê theo giờ: giữ nguyên tên nhưng đổi URL ngrok và token mỗi
+    # lần thuê lại. Registry phải giữ nguyên đối tượng HostRef (để lease() đang
+    # mở không bị lạc sang bản mới) NHƯNG vẫn phải ghi đè url/token bằng giá
+    # trị mới nhất — giữ đối tượng mà quên cập nhật giá trị thì còn tệ hơn cả
+    # bug inflight mà nó sửa, vì service sẽ tiếp tục gọi vào một tunnel không
+    # còn tồn tại nữa.
+    route = respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(200, json=_body(_host("a"))),
+            httpx.Response(
+                200,
+                json=_body({**_host("a"), "url": "http://a-moi:7000", "token": "token-moi"}),
+            ),
+        ]
+    )
+    clock = Clock()
+    reg = DiscoveryHostRegistry(URL, refresh_s=15.0, clock=clock)
+    before = await reg.pick("m1")
+    clock.now = 20.0
+    refreshed = await reg.hosts()
+    assert refreshed[0] is before  # cùng đối tượng: lease() đang mở không bị lạc
+
+    after = await reg.pick("m1")
+    assert after.url == "http://a-moi:7000"
+    assert after.token == "token-moi"
+    assert route.call_count == 2
+    await reg.aclose()
+
+
+@respx.mock
+async def test_host_removed_from_gateway_response_is_dropped():
+    # Máy thuê theo giờ hết hạn thuê thì biến mất hẳn khỏi danh sách gateway
+    # trả về. Registry phải bỏ nó ra khỏi cache, không được giữ lại làm host
+    # "ma" — nếu không, pick() sẽ tiếp tục định tuyến việc vào một máy không
+    # còn thuê nữa, dẫn tới lỗi kết nối thay vì lỗi định tuyến sạch.
+    route = respx.get(URL).mock(
+        side_effect=[
+            httpx.Response(200, json=_body(_host("a", model="m1"), _host("b", model="m2"))),
+            httpx.Response(200, json=_body(_host("b", model="m2"))),
+        ]
+    )
+    clock = Clock()
+    reg = DiscoveryHostRegistry(URL, refresh_s=15.0, clock=clock)
+    await reg.hosts()
+    clock.now = 20.0
+    remaining = await reg.hosts()
+    assert [h.name for h in remaining] == ["b"]
+    with pytest.raises(NoHostAvailableError):
+        await reg.pick("m1")
+    assert route.call_count == 2
+    await reg.aclose()
+
+
+@respx.mock
+async def test_first_fetch_failing_without_fallback_raises_domain_error():
+    # Không cấu hình fallback mà để lộ thẳng ConnectError của httpx ra ngoài
+    # thì caller không phân biệt được "model này hiện không có host nào phục
+    # vụ" với "bản thân registry đang hỏng" — cả hai tình huống phải quy về
+    # cùng một domain error để service xử lý thống nhất.
+    respx.get(URL).mock(side_effect=httpx.ConnectError("gateway chưa lên"))
+    reg = DiscoveryHostRegistry(URL)
+    with pytest.raises(NoHostAvailableError):
+        await reg.pick("m1")
+    await reg.aclose()
