@@ -77,7 +77,7 @@ export function HostsPanel({ hosts }: { hosts: HostState[] }) {
   return (
     <div className="space-y-6">
       <Card title="Cắm một máy GPU vừa thuê">
-        <form onSubmit={register} className="grid gap-3 md:grid-cols-4 md:items-end">
+        <form onSubmit={register} className="grid gap-4 md:grid-cols-[repeat(3,minmax(0,1fr))_auto] md:items-end">
           <TextField label="Tên" value={name} onChange={(e) => setName(e.target.value)} placeholder="a100-vast" />
           <TextField label="URL" value={url} onChange={(e) => setUrl(e.target.value)} placeholder="https://abc.ngrok.app" />
           <TextField label="Token" type="password" value={token} onChange={(e) => setToken(e.target.value)} placeholder="VYPQ_MODEL_HOST_TOKEN" />
@@ -85,26 +85,26 @@ export function HostsPanel({ hosts }: { hosts: HostState[] }) {
             {pending ? "Đang cắm…" : "Cắm host"}
           </Button>
         </form>
-        {error ? <p role="alert" className="mt-3 text-sm text-red-600">{error}</p> : null}
-        <p className="mt-3 text-xs text-slate-500">
+        {error ? <p role="alert" className="mt-4 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700 ring-1 ring-rose-600/15 ring-inset">{error}</p> : null}
+        <p className="mt-4 text-xs text-slate-500">
           Gateway poll mỗi 15 giây và coi host là chết sau 45 giây không phản hồi — host mới cắm cần khoảng một chu kỳ để chuyển xanh.
         </p>
       </Card>
 
-      <Card title="Host đang có">
+      <Card title="Host đang có" flush>
         {hosts.length === 0 ? (
-          <EmptyState>Chưa cắm máy GPU nào. Thuê máy, chạy model-host, mở ngrok rồi dán URL vào ô trên.</EmptyState>
+          <div className="p-5"><EmptyState>Chưa cắm máy GPU nào. Thuê máy, chạy model-host, mở ngrok rồi dán URL vào ô trên.</EmptyState></div>
         ) : (
           <DataTable headers={["Host", "Trạng thái", "Model", "Thấy lần cuối", ""]}>
             {hosts.map((host) => (
               <tr key={host.name}>
                 <td className="px-3 py-2 align-top">
                   <div className="font-medium">{host.name}</div>
-                  <div className="text-xs text-slate-500">{host.url}</div>
+                  <div className="ma mt-0.5 text-slate-500">{host.url}</div>
                 </td>
                 <td className="px-3 py-2 align-top">
-                  <Badge tone={host.healthy ? "ok" : "bad"}>{host.healthy ? "khoẻ" : "chết"}</Badge>
-                  {host.last_error ? <div className="mt-1 text-xs text-red-600">{host.last_error}</div> : null}
+                  <Badge dot tone={host.healthy ? "ok" : "bad"}>{host.healthy ? "khoẻ" : "chết"}</Badge>
+                  {host.last_error ? <div className="mt-1.5 max-w-xs text-xs text-rose-600">{host.last_error}</div> : null}
                 </td>
                 <td className="px-3 py-2 align-top">
                   {host.models.length === 0 ? (

@@ -17,7 +17,15 @@ CORE=(postgres redpanda gateway ocr asr dashboard)
 die() { echo "LỖI: $*" >&2; exit 1; }
 
 sinh_env() {
-  [ -f "$ENV_FILE" ] && return 0
+  if [ -f "$ENV_FILE" ]; then
+    # File sinh từ bản cũ chưa có khoá này. Thêm vào thay vì bắt người dùng tự
+    # sửa, và mặc định "off" cho khớp với bản mới.
+    grep -q '^DASHBOARD_AUTH=' "$ENV_FILE" || {
+      echo "Bổ sung DASHBOARD_AUTH=off vào $ENV_FILE"
+      printf '\n# off = vào thẳng, không hỏi mật khẩu. Đổi thành "on" trước khi\n# mở cổng 3001 ra ngoài.\nDASHBOARD_AUTH=off\n' >> "$ENV_FILE"
+    }
+    return 0
+  fi
   command -v openssl >/dev/null || die "cần openssl để sinh bí mật"
   echo "Chưa có $ENV_FILE — sinh bí mật mới."
   local matkhau="${DASHBOARD_PASSWORD:-$(openssl rand -hex 8)}"
@@ -25,7 +33,10 @@ sinh_env() {
 # Sinh tự động bởi scripts/stack.sh. File này KHÔNG vào git.
 # Token gateway: dashboard và mọi service dùng nó để gọi /v1/* của gateway.
 VYPQ_TOKEN=$(openssl rand -hex 16)
-# Mật khẩu vào dashboard ở http://localhost:3001
+# off = vào thẳng, không hỏi mật khẩu. Đúng cho máy của mình; đổi thành "on"
+# trước khi mở cổng 3001 ra ngoài, vì dashboard cầm token của gateway.
+DASHBOARD_AUTH=off
+# Chỉ dùng khi DASHBOARD_AUTH=on.
 DASHBOARD_PASSWORD=$matkhau
 # Khoá ký cookie phiên. Đổi giá trị này là đá mọi phiên đang đăng nhập.
 SESSION_SECRET=$(openssl rand -hex 32)
@@ -91,7 +102,8 @@ cmd_up() {
   . "$ENV_FILE"
   cat <<EOF
 
-  Dashboard   http://localhost:3001     mật khẩu: $DASHBOARD_PASSWORD
+  Dashboard   http://localhost:3001     $([ "${DASHBOARD_AUTH:-on}" = off ] \
+    && echo "vào thẳng, không cần mật khẩu" || echo "mật khẩu: $DASHBOARD_PASSWORD")
   Gateway     http://localhost:8080     token:    $VYPQ_TOKEN
 
   OCR         http://localhost:8001

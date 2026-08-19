@@ -80,4 +80,37 @@ describe("decideAccess", () => {
     });
     expect(decision.kind).toBe("redirect-login");
   });
+
+  describe("DASHBOARD_AUTH=off", () => {
+    it("cho mọi trang đi qua khi tắt xác thực", async () => {
+      const decision = await decideAccess({
+        pathname: "/hosts", sessionToken: undefined, sessionSecret: undefined,
+        nowMs: NOW, authDisabled: true,
+      });
+      expect(decision.kind).toBe("allow");
+    });
+
+    it("cho cả /api/* đi qua — nếu không thì trang gọi được mà API thì không", async () => {
+      const decision = await decideAccess({
+        pathname: "/api/hosts", sessionToken: undefined, sessionSecret: undefined,
+        nowMs: NOW, authDisabled: true,
+      });
+      expect(decision.kind).toBe("allow");
+    });
+
+    it("không cần SESSION_SECRET nữa — đó là bí mật của riêng cổng đăng nhập", async () => {
+      const decision = await decideAccess({
+        pathname: "/runs", sessionToken: undefined, sessionSecret: undefined,
+        nowMs: NOW, authDisabled: true,
+      });
+      expect(decision.kind).not.toBe("misconfigured");
+    });
+
+    it("KHÔNG tắt khi cờ vắng mặt — quên cấu hình không được biến thành mở khoá", async () => {
+      const decision = await decideAccess({
+        pathname: "/hosts", sessionToken: undefined, sessionSecret: SECRET, nowMs: NOW,
+      });
+      expect(decision.kind).toBe("redirect-login");
+    });
+  });
 });

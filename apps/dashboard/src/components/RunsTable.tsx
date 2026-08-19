@@ -1,6 +1,6 @@
 import Link from "next/link";
 
-import { Badge, Card, DataTable, EmptyState } from "@/components/ui";
+import { Badge, Button, Card, DataTable, EmptyState, SelectField, TextField } from "@/components/ui";
 import { formatMs, formatTimestamp } from "@/lib/format";
 import { buildRunsHref, type RunsFilters } from "@/lib/pagination";
 import type { RunRecord, RunStatus } from "@/lib/types";
@@ -8,7 +8,7 @@ import type { RunRecord, RunStatus } from "@/lib/types";
 const STATUS_TONE = { ok: "ok", pending: "warn", failed: "bad" } as const;
 
 function StatusBadge({ status }: { status: RunStatus }) {
-  return <Badge tone={STATUS_TONE[status]}>{status}</Badge>;
+  return <Badge dot tone={STATUS_TONE[status]}>{status}</Badge>;
 }
 
 function PageLink({ href, children }: { href: string | null; children: string }) {
@@ -40,53 +40,44 @@ export function RunsTable({
   return (
     <div className="space-y-4">
       <Card title="Lọc">
-        <form method="get" className="grid gap-3 md:grid-cols-5 md:items-end">
-          <label className="block space-y-1">
-            <span className="text-sm text-slate-600">Service</span>
-            <input name="service" defaultValue={filters.service ?? ""} className="w-full rounded border border-slate-300 px-3 py-1.5 text-sm" />
-          </label>
-          <label className="block space-y-1">
-            <span className="text-sm text-slate-600">Trạng thái</span>
-            <select name="status" defaultValue={filters.status ?? ""} className="w-full rounded border border-slate-300 px-3 py-1.5 text-sm">
-              <option value="">tất cả</option>
-              <option value="ok">ok</option>
-              <option value="failed">failed</option>
-              <option value="pending">pending</option>
-            </select>
-          </label>
-          <label className="block space-y-1">
-            <span className="text-sm text-slate-600">Trace ID</span>
-            <input name="trace_id" defaultValue={filters.trace_id ?? ""} className="w-full rounded border border-slate-300 px-3 py-1.5 text-sm" />
-          </label>
+        <form method="get" className="grid gap-4 md:grid-cols-[repeat(3,minmax(0,1fr))_auto] md:items-end">
+          <TextField name="service" label="Service" defaultValue={filters.service ?? ""} placeholder="ocr" />
+          <SelectField name="status" label="Trạng thái" defaultValue={filters.status ?? ""}>
+            <option value="">tất cả</option>
+            <option value="ok">ok</option>
+            <option value="failed">failed</option>
+            <option value="pending">pending</option>
+          </SelectField>
+          <TextField name="trace_id" label="Trace ID" defaultValue={filters.trace_id ?? ""} placeholder="52df9a2c…" />
           <input type="hidden" name="limit" value={filters.limit} />
-          <button type="submit" className="rounded bg-slate-900 px-3 py-1.5 text-sm text-white">Lọc</button>
+          <Button type="submit">Lọc</Button>
         </form>
       </Card>
 
-      <Card>
+      <Card flush>
         {runs.length === 0 ? (
-          <EmptyState>Không có run nào khớp bộ lọc.</EmptyState>
+          <div className="p-5"><EmptyState>Không có run nào khớp bộ lọc.</EmptyState></div>
         ) : (
           <DataTable headers={["Thời điểm", "Service", "Model", "Mode", "Trạng thái", "Độ trễ", "Trace", ""]}>
             {runs.map((run) => (
               <tr key={run.id}>
-                <td className="whitespace-nowrap px-3 py-2 text-xs text-slate-600">{formatTimestamp(run.created_at)}</td>
-                <td className="px-3 py-2">{run.service}</td>
-                <td className="px-3 py-2 text-xs">{run.model_version ?? "—"}</td>
-                <td className="px-3 py-2 text-xs">{run.mode}</td>
-                <td className="px-3 py-2">
+                <td className="whitespace-nowrap px-5 py-3 text-xs text-slate-600">{formatTimestamp(run.created_at)}</td>
+                <td className="px-5 py-3">{run.service}</td>
+                <td className="px-5 py-3 text-xs">{run.model_version ?? "—"}</td>
+                <td className="px-5 py-3 text-xs">{run.mode}</td>
+                <td className="px-5 py-3">
                   <StatusBadge status={run.status} />
-                  {run.error ? <div className="mt-1 max-w-xs truncate text-xs text-red-600" title={run.error}>{run.error}</div> : null}
+                  {run.error ? <div className="mt-1 max-w-[22rem] truncate text-xs text-rose-600/90" title={run.error}>{run.error}</div> : null}
                 </td>
-                <td className="px-3 py-2 text-xs">{formatMs(run.latency_ms)}</td>
-                <td className="px-3 py-2 text-xs">
+                <td className="px-5 py-3 text-xs">{formatMs(run.latency_ms)}</td>
+                <td className="px-5 py-3 text-xs">
                   {/* Bấm trace_id ra mọi run cùng trace — đó là cách nhìn shadow-run:
                       một event, nhiều model version, mỗi cái một dòng. */}
-                  <Link href={buildRunsHref({ trace_id: run.trace_id, limit: filters.limit }, 0)} className="underline">
-                    {run.trace_id}
+                  <Link href={buildRunsHref({ trace_id: run.trace_id, limit: filters.limit }, 0)} className="ma text-brand-700 hover:underline" title={run.trace_id}>
+                    {run.trace_id.length > 12 ? `${run.trace_id.slice(0, 12)}…` : run.trace_id}
                   </Link>
                 </td>
-                <td className="px-3 py-2 text-xs">
+                <td className="px-5 py-3 text-right text-xs whitespace-nowrap">
                   <Link href={`/runs/${run.id}`} className="underline">
                     {/* Mỗi dòng đều có link "Chi tiết" giống hệt nhau về mặt chữ —
                         với người dùng trình đọc màn hình, nghe lặp lại "Chi tiết"
@@ -100,7 +91,7 @@ export function RunsTable({
             ))}
           </DataTable>
         )}
-        <div className="mt-4 flex items-center gap-3">
+        <div className="flex items-center gap-3 border-t border-slate-100 px-5 py-3">
           <PageLink href={previous}>Trước</PageLink>
           <PageLink href={next}>Sau</PageLink>
           <span className="text-xs text-slate-500">

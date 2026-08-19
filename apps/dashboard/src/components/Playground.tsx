@@ -3,7 +3,7 @@
 import Link from "next/link";
 import { useEffect, useMemo, useRef, useState } from "react";
 
-import { Badge, Button, Card, EmptyState } from "@/components/ui";
+import { Badge, Button, Card, EmptyState, SelectField } from "@/components/ui";
 import { ResultViewer } from "@/components/viewers/ResultViewer";
 import { acceptForInput, isUsable } from "@/lib/capability";
 import { formatMs } from "@/lib/format";
@@ -168,45 +168,31 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
   return (
     <div className="space-y-6">
       <Card title="Chạy thử">
-        <div className="grid gap-3 md:grid-cols-4 md:items-end">
-          <label className="block space-y-1">
-            <span className="text-sm text-slate-600">Service</span>
-            <select
-              value={service.key}
-              onChange={(event) => selectService(event.target.value)}
-              className="w-full rounded border border-slate-300 px-3 py-1.5 text-sm"
-            >
+        <div className="grid gap-4 md:grid-cols-[repeat(3,minmax(0,1fr))_auto] md:items-end">
+          <SelectField label="Service" value={service.key} onChange={(event) => selectService(event.target.value)}>
               {usable.map((entry) => (
                 <option key={entry.key} value={entry.key}>
                   {entry.info.name === entry.key ? entry.key : `${entry.key} (khai là ${entry.info.name})`}
                 </option>
               ))}
-            </select>
-          </label>
+          </SelectField>
 
-          <label className="block space-y-1">
-            <span className="text-sm text-slate-600">Model</span>
-            <select
-              value={model}
-              onChange={(event) => setModel(event.target.value)}
-              className="w-full rounded border border-slate-300 px-3 py-1.5 text-sm"
-            >
+          <SelectField label="Model" value={model} onChange={(event) => setModel(event.target.value)}>
               <option value="">mặc định ({service.info.default_model ?? "service tự chọn"})</option>
               {models.map((option) => (
                 <option key={option.id} value={option.id} disabled={!option.available}>
                   {option.id}{option.kind === "finetuned" ? " · fine-tune" : ""}{option.available ? "" : " · không dùng được"}
                 </option>
               ))}
-            </select>
-          </label>
+          </SelectField>
 
-          <label className="block space-y-1">
-            <span className="text-sm text-slate-600">Tệp đầu vào</span>
+          <label className="block space-y-1.5">
+            <span className="block text-xs font-medium text-slate-600">Tệp đầu vào</span>
             <input
               type="file"
               accept={acceptForInput(service.info.capability_input)}
               onChange={(event) => selectFile(event.target.files?.[0] ?? null)}
-              className="w-full text-sm"
+              className="w-full text-sm text-slate-600 file:mr-3 file:rounded-lg file:border-0 file:bg-slate-100 file:px-3 file:py-1.5 file:text-sm file:font-medium file:text-slate-700 hover:file:bg-slate-200"
             />
           </label>
 
@@ -214,14 +200,14 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
             {pending ? "Đang chạy…" : "Chạy thử"}
           </Button>
         </div>
-        <p className="mt-3 text-xs text-slate-500">Tệp tối đa 25 MB, khớp giới hạn inline của service.</p>
+        <p className="mt-4 text-xs text-slate-500">Tệp tối đa 25 MB, khớp giới hạn inline của service.</p>
 
         {models.length > 0 ? (
           <fieldset className="mt-4 border-t border-slate-100 pt-3">
-            <legend className="text-xs text-slate-500">So sánh thêm với</legend>
-            <div className="flex flex-wrap gap-x-4 gap-y-1">
+            <legend className="text-xs font-medium text-slate-600">So sánh thêm với</legend>
+            <div className="mt-2 flex flex-wrap gap-x-5 gap-y-2">
               {models.map((option) => (
-                <label key={option.id} className="flex items-center gap-1.5 text-sm">
+                <label key={option.id} className="flex items-center gap-2 text-sm text-slate-700">
                   <input
                     type="checkbox"
                     checked={extras.includes(option.id)}
@@ -261,7 +247,7 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
                   {entry.invoke ? <span>{entry.invoke.trace_id}</span> : null}
                 </div>
                 {entry.error ? (
-                  <p role="alert" className="text-sm text-red-600">{entry.error}</p>
+                  <p role="alert" className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700 ring-1 ring-rose-600/15 ring-inset">{entry.error}</p>
                 ) : (
                   <div className="space-y-3">
                     <dl className="flex flex-wrap gap-x-6 gap-y-1 text-xs">

@@ -20,9 +20,20 @@ export interface AccessInput {
   sessionToken: string | undefined;
   sessionSecret: string | undefined;
   nowMs: number;
+  /**
+   * true khi DASHBOARD_AUTH=off — mở toang mọi trang, không hỏi mật khẩu.
+   *
+   * Phải là lựa chọn TƯỜNG MINH, không phải hệ quả của việc quên đặt biến: mở
+   * cổng 3001 là mở đường tới GATEWAY_TOKEN, mà token đó đọc được
+   * endpoint discovery của gateway — nơi chứa token của mọi máy GPU đang
+   * thuê. Ai đó quên
+   * cấu hình mà hệ thống tự bỏ khoá thì đúng là kiểu hỏng tệ nhất.
+   */
+  authDisabled?: boolean;
 }
 
 export async function decideAccess(input: AccessInput): Promise<GuardDecision> {
+  if (input.authDisabled) return { kind: "allow" };
   // Kiểm cấu hình TRƯỚC danh sách công khai: thiếu secret thì cả trang đăng nhập
   // cũng vô nghĩa (ký xong không ai kiểm được), nên nói thẳng lỗi cấu hình.
   if (!input.sessionSecret) return { kind: "misconfigured" };

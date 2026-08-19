@@ -9,6 +9,9 @@ export async function middleware(request: NextRequest): Promise<NextResponse> {
     sessionToken: request.cookies.get(SESSION_COOKIE)?.value,
     sessionSecret: process.env.SESSION_SECRET?.trim() || undefined,
     nowMs: Date.now(),
+    // So khớp CHÍNH XÁC chuỗi "off": mọi giá trị khác — kể cả "false", "0",
+    // hay một lỗi gõ — đều giữ nguyên xác thực. Nghiêng về phía khoá.
+    authDisabled: process.env.DASHBOARD_AUTH?.trim().toLowerCase() === "off",
   });
 
   switch (decision.kind) {

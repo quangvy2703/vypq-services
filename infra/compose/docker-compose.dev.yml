@@ -85,8 +85,13 @@ services:
       GATEWAY_TOKEN: ${VYPQ_TOKEN:?bat buoc dat VYPQ_TOKEN}
       # Bắt buộc, cùng lập trường với VYPQ_TOKEN: dashboard là proxy vào gateway,
       # chạy không mật khẩu nghĩa là mở toàn bộ token máy GPU ra cổng 3001.
-      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?bat buoc dat DASHBOARD_PASSWORD}
-      SESSION_SECRET: ${SESSION_SECRET:?bat buoc dat SESSION_SECRET (openssl rand -hex 32)}
+      # "off" bỏ hẳn cổng mật khẩu. Chỉ dùng khi cổng 3001 không ai ngoài với
+      # tới được: dashboard cầm GATEWAY_TOKEN, mà token đó đọc được endpoint
+      # discovery của gateway — nơi chứa token của mọi máy GPU đang thuê.
+      DASHBOARD_AUTH: ${DASHBOARD_AUTH:-on}
+      # Bỏ trống được khi DASHBOARD_AUTH=off; ngoài ra là bắt buộc.
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:-}
+      SESSION_SECRET: ${SESSION_SECRET:-}
     # Cổng 3000 đã là Grafana.
     ports: ["3001:3001"]
     depends_on: [gateway]

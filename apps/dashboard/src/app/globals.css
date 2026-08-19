@@ -1,9 +1,49 @@
 @import "tailwindcss";
 
+/* Bảng token. Mọi màu trong giao diện đi qua đây chứ không rải hex khắp nơi —
+   đổi tông một lần là đổi cả trang. */
+@theme {
+  --color-brand-50: oklch(0.97 0.02 275);
+  --color-brand-100: oklch(0.94 0.04 275);
+  --color-brand-200: oklch(0.88 0.07 275);
+  --color-brand-500: oklch(0.58 0.19 275);
+  --color-brand-600: oklch(0.51 0.2 275);
+  --color-brand-700: oklch(0.44 0.18 275);
+  --color-brand-950: oklch(0.24 0.08 275);
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+    "Helvetica Neue", sans-serif;
+  --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+}
+
 :root {
   color-scheme: light;
 }
 
 body {
-  @apply bg-slate-50 text-slate-900 antialiased;
+  /* Nền hơi ngả lạnh thay vì trắng phẳng: các thẻ trắng nổi lên mà không cần
+     viền đậm. */
+  @apply bg-slate-100/70 font-sans text-slate-900 antialiased;
+}
+
+/* Số trong bảng phải thẳng cột. Không có dòng này thì "1.50 s" và "842 ms"
+   nhảy chữ số lung tung và mắt không quét dọc được. */
+table {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Chuỗi id/token/URL: dễ đọc từng ký tự, và không kéo giãn bố cục khi dài. */
+.ma {
+  @apply font-mono text-[0.8125rem] tracking-tight;
+}
+
+/* Vòng focus thống nhất — bàn phím phải thấy mình đang ở đâu. */
+:where(a, button, input, select, summary):focus-visible {
+  @apply outline-2 outline-offset-2 outline-brand-500;
+}
+
+/* Thanh cuộn mảnh cho vùng bảng tràn ngang. */
+.cuon-manh {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-slate-300) transparent;
 }

@@ -53,6 +53,16 @@ describe("RunsTable", () => {
     expect(screen.getByRole("link", { name: "t1" })).toHaveAttribute("href", "/runs?trace_id=t1&limit=50");
   });
 
+  it("cắt ngắn trace dài nhưng giữ nguyên bản đầy đủ để copy", () => {
+    // trace_id thật dài 32 ký tự và sẽ nuốt hết bề ngang bảng. Cắt hiển thị,
+    // nhưng title phải là bản đầy đủ — người ta cần chuỗi đó để tra log.
+    const dai = "0893462620b1488b958d234272ee6cd7";
+    render(<RunsTable runs={[run({ id: "r9", trace_id: dai })]} total={1} offset={0} filters={filters} />);
+    const link = screen.getByRole("link", { name: /^0893462620b1/ });
+    expect(link).toHaveAttribute("title", dai);
+    expect(link.textContent).not.toBe(dai);
+  });
+
   it("đặt sẵn giá trị lọc hiện tại vào form", () => {
     render(<RunsTable runs={[]} total={0} offset={0} filters={{ service: "asr", status: "failed", limit: 50 }} />);
     expect(screen.getByLabelText("Service")).toHaveValue("asr");

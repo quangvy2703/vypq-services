@@ -7,9 +7,9 @@ const STATUS_LABEL = { ok: "khoẻ", degraded: "chập chờn", down: "chết" }
 
 export function ServicesTable({ services }: { services: ServiceState[] }) {
   return (
-    <Card title="Service đang đăng ký">
+    <Card title="Service đang đăng ký" flush>
       {services.length === 0 ? (
-        <EmptyState>Gateway chưa khai service nào — kiểm tra `config/services.yaml`.</EmptyState>
+        <div className="p-5"><EmptyState>Gateway chưa khai service nào — kiểm tra `config/services.yaml`.</EmptyState></div>
       ) : (
         <DataTable headers={["Service", "Task", "Capability", "Model mặc định", "Trạng thái", "Thấy lần cuối"]}>
           {services.map((state) => (
@@ -23,7 +23,7 @@ export function ServicesTable({ services }: { services: ServiceState[] }) {
                 <div className="font-medium">
                   {state.info ? `${state.info.name} · v${state.info.version}` : "—"}
                 </div>
-                <div className="text-xs text-slate-500">{state.base_url}</div>
+                <div className="ma mt-0.5 text-slate-500">{state.base_url}</div>
                 {state.info ? <div className="text-xs text-slate-400">{state.info.invoke_path}</div> : null}
               </td>
               {state.info === null ? (
@@ -42,7 +42,7 @@ export function ServicesTable({ services }: { services: ServiceState[] }) {
                 </>
               )}
               <td className="px-3 py-2 align-top">
-                <Badge tone={statusTone(state.status)}>{STATUS_LABEL[state.status]}</Badge>
+                <Badge dot tone={statusTone(state.status)}>{STATUS_LABEL[state.status]}</Badge>
               </td>
               <td className="px-3 py-2 align-top text-xs text-slate-600">{formatTimestamp(state.last_seen_at)}</td>
             </tr>

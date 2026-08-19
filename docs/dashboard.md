@@ -23,15 +23,31 @@ công khai vào một gateway có xác thực.
 | `GATEWAY_TOKEN` | **có** | phải trùng `VYPQ_TOKEN` của gateway |
 | `DASHBOARD_PASSWORD` | **có** | mật khẩu dùng chung để vào dashboard |
 | `SESSION_SECRET` | **có** | khoá ký cookie phiên, sinh bằng `openssl rand -hex 32` |
+| `DASHBOARD_AUTH` | không (mặc định `on`) | đặt `off` để bỏ hẳn cổng mật khẩu |
 
 Thiếu bất kỳ biến bắt buộc nào thì dashboard ném lỗi thay vì chạy tiếp — giống
 `GatewaySettings._token_must_not_be_empty`.
+
+### `DASHBOARD_AUTH=off`
+
+Bỏ hẳn trang đăng nhập: mọi trang và mọi `/api/*` vào thẳng. `DASHBOARD_PASSWORD` và
+`SESSION_SECRET` lúc đó không cần nữa; `GATEWAY_TOKEN` thì vẫn bắt buộc vì không có nó
+dashboard chẳng gọi được gì.
+
+**Chỉ dùng khi cổng 3001 không ai ngoài với tới được.** Dashboard cầm `GATEWAY_TOKEN`, và
+token đó đọc được endpoint discovery của gateway — nơi chứa token của **mọi máy GPU đang
+thuê**. Tắt xác thực là biến cổng 3001 thành đường vào thẳng chỗ đó.
+
+Cờ này so khớp **chính xác** chuỗi `off`. Mọi giá trị khác — `false`, `0`, hay một lỗi gõ —
+đều giữ nguyên xác thực, và vắng mặt cũng vậy: quên cấu hình không bao giờ được biến thành
+mở khoá. `scripts/stack.sh` đặt sẵn `off` trong `infra/compose/.env` cho máy local; đổi
+thành `on` trước khi đưa ra ngoài.
 
 ## Chạy
 
 ```bash
 cd apps/dashboard
-cp .env.example .env.local   # điền ba bí mật
+# scripts/stack.sh dev tự ghi .env.local với token khớp gateway
 pnpm install && pnpm dev     # http://localhost:3001
 ```
 

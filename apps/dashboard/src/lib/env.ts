@@ -26,12 +26,20 @@ function required(name: string): string {
  * bundle nạp, sớm hơn lúc runtime container có đủ biến, và làm test không stub
  * được.
  */
+/** DASHBOARD_AUTH=off: bỏ cổng mật khẩu. Xem AccessInput.authDisabled. */
+export function authDisabled(): boolean {
+  return process.env.DASHBOARD_AUTH?.trim().toLowerCase() === "off";
+}
+
 export function getServerEnv(): ServerEnv {
+  // GATEWAY_TOKEN vẫn bắt buộc kể cả khi tắt xác thực: không có nó thì dashboard
+  // chẳng gọi được gì. Chỉ hai bí mật của riêng cổng đăng nhập là bỏ được.
+  const boQuaDangNhap = authDisabled();
   return {
     gatewayUrl: (process.env.GATEWAY_URL?.trim() || "http://localhost:8080").replace(/\/+$/, ""),
     gatewayToken: required("GATEWAY_TOKEN"),
-    dashboardPassword: required("DASHBOARD_PASSWORD"),
-    sessionSecret: required("SESSION_SECRET"),
+    dashboardPassword: boQuaDangNhap ? "" : required("DASHBOARD_PASSWORD"),
+    sessionSecret: boQuaDangNhap ? "" : required("SESSION_SECRET"),
     maxUploadBytes: MAX_UPLOAD_BYTES,
   };
 }

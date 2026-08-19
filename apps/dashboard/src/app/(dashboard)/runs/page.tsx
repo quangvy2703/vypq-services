@@ -1,3 +1,4 @@
+import { PageHeader } from "@/components/ui";
 import { RunsTable } from "@/components/RunsTable";
 import { gateway } from "@/lib/gateway";
 import type { RunsFilters } from "@/lib/pagination";
@@ -41,5 +42,13 @@ export default async function RunsPage({
   if (filters.status) query.status = filters.status as RunStatus;
 
   const { runs, total } = await gateway.listRuns(query);
-  return <RunsTable runs={runs} total={total} offset={offset} filters={filters} />;
+  return (
+    <>
+      <PageHeader
+        title="Lịch sử chạy"
+        description="Mọi lần gọi model đều được ghi lại. Bấm trace để xem mọi run cùng một yêu cầu."
+      />
+      <RunsTable runs={runs} total={total} offset={offset} filters={filters} />
+    </>
+  );
 }
