@@ -2374,6 +2374,26 @@ async def test_empty_model_version_still_deduplicates(session):
     assert total == 1
 
 
+async def test_concurrent_record_of_the_same_key_does_not_raise(factory):
+    # Kafka giao ít nhất một lần; bản sao là chuyện bình thường, không phải lỗi.
+    # Nếu IntegrityError bay ra, consumer sẽ dead-letter một kết quả ĐÃ CHẠY XONG.
+    import asyncio
+
+    async def once():
+        async with factory() as s:
+            return await RunRepo(s).record(
+                trace_id="dua", service="ocr", model_version="m1",
+                mode=InvokeMode.ASYNC, status=RunStatus.OK, input_uri=None,
+                output={"ok": True}, latency_ms=1, error=None,
+            )
+
+    a, b = await asyncio.gather(once(), once())
+    assert a.id == b.id
+    async with factory() as s:
+        _runs, total = await RunRepo(s).list_runs(trace_id="dua")
+    assert total == 1
+
+
 async def test_filter_by_trace_id_finds_every_model_version(session):
     # Người gọi async chỉ cầm trace_id. Shadow-run cho nhiều model cùng xử lý,
     # nên một trace_id phải tra ra đủ các dòng của nó.
@@ -2439,6 +2459,7 @@ Thêm vào `apps/gateway/src/gateway/db/repo.py`:
 import uuid
 
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 
 from gateway.db.models import Run
 from vypq_contracts.gateway import InvokeMode, RunRecord, RunStatus
@@ -2491,7 +2512,21 @@ class RunRepo:
             error=error, created_at=datetime.now(UTC),
         )
         self._s.add(row)
-        await self._s.commit()
+        try:
+            await self._s.commit()
+        except IntegrityError:
+            # Thua cuộc đua ghi: một tiến trình khác vừa ghi đúng cặp
+            # (trace_id, model_version) này. Đó là bản sao Kafka lành tính, không
+            # phải lỗi — đọc lại bản của bên thắng và trả về. Để exception bay
+            # tiếp thì consumer coi là dữ liệu hỏng và dead-letter một KẾT QUẢ
+            # INFERENCE ĐÃ CHẠY XONG.
+            await self._s.rollback()
+            existing = (
+                await self._s.execute(
+                    select(Run).where(Run.trace_id == trace_id, Run.model_version == key)
+                )
+            ).scalar_one()
+            return _to_run(existing)
         return _to_run(row)
 
     async def get(self, run_id: str) -> RunRecord | None:
