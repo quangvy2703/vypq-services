@@ -84,18 +84,10 @@ export function OcrViewer({ result, imageUrl }: { result: OcrResult; imageUrl: s
         )}
         <details className="rounded border border-slate-200 bg-white p-3">
           <summary className="cursor-pointer text-sm text-slate-600">Toàn văn</summary>
-          {/* Bọc từng từ trong <span> riêng thay vì một text node duy nhất: một
-              dòng OCR có thể trùng y hệt text của một box trong bảng (vd. dòng
-              "Tổng cộng 120000"); nếu để full_text là một khối text liền thì
-              truy vấn theo nội dung không phân biệt được đây là bản sao của box
-              nào. Tách theo từ giữ nguyên hiển thị (khoảng trắng/newline vẫn là
-              token riêng) nhưng mỗi box text vẫn là node duy nhất mang đúng nội
-              dung của nó. */}
-          <p className="mt-2 whitespace-pre-wrap text-sm">
-            {result.full_text.split(/(\s+)/).map((token, index) => (
-              <span key={index}>{token}</span>
-            ))}
-          </p>
+          {/* Một khối text liền, không tách theo từ: đây là thứ người ta bôi đen
+              rồi copy. Truy vấn test phải khoanh vùng vào khối này thay vì bắt
+              sản phẩm tự cắt nhỏ ra cho dễ tìm. */}
+          <pre className="mt-2 whitespace-pre-wrap text-sm">{result.full_text}</pre>
         </details>
       </div>
     </div>

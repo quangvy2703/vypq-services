@@ -71,9 +71,15 @@ describe("OcrViewer", () => {
     expect(selected[0]?.getAttribute("points")).toBe("10,50 200,50 200,80 10,80");
   });
 
-  it("hiện toàn văn để copy", () => {
-    render(<OcrViewer result={ocr} imageUrl={null} />);
-    expect(screen.getByText(/Tổng cộng 120000/)).toBeInTheDocument();
+  it("hiện toàn văn để copy, dưới dạng một khối text liền", () => {
+    // Toàn văn trùng nội dung với một box trong bảng, nên phải khoanh vùng truy
+    // vấn vào đúng khối này. Khẳng định thẳng vào textContent của <pre>: nếu ai
+    // đó cắt nó thành nhiều node cho dễ tìm thì bôi đen copy sẽ ra sai.
+    const { container } = render(<OcrViewer result={ocr} imageUrl={null} />);
+    const block = container.querySelector("pre");
+    expect(block).not.toBeNull();
+    expect(block?.textContent).toBe(ocr.full_text);
+    expect(block?.childNodes).toHaveLength(1);
   });
 
   it("nói rõ khi model không tìm thấy chữ nào", () => {
