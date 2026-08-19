@@ -1,6 +1,8 @@
+import asyncio
 from dataclasses import dataclass, field
 
 import pytest
+from prometheus_client import REGISTRY
 from vypq_contracts.common import Task
 from vypq_core.breaker import CircuitOpenError
 from vypq_core.host_registry import NoHostAvailableError
@@ -267,6 +269,114 @@ async def test_pause_stops_fetching_then_resumes_and_carries_on():
     assert producer.published == []           # suốt quá trình không DLQ cái nào
 
 
+async def test_poison_message_is_dead_lettered_after_pause_limit_then_progress_resumes():
+    # input_uri trỏ tới host đã biến mất vĩnh viễn: handler luôn lỗi retryable cho
+    # đúng message này; mọi message khác (không trùng uri) xử lý bình thường.
+    dead_host = "s3://dead-host/permanently-gone.jpg"
+
+    async def handler(env):
+        if env.payload["input_uri"] == dead_host:
+            raise UpstreamError("host đã biến mất vĩnh viễn")
+
+    clock = Clock()
+    producer = FakeProducer()
+    poison_rounds = [{TOPIC_TP: [_msg(0, uri=dead_host)]} for _ in range(4)]
+    kafka = FakeConsumer(batches=poison_rounds + [{TOPIC_TP: [_msg(1)]}])
+    c = _consumer(
+        kafka,
+        producer,
+        handler,
+        clock=clock,
+        max_attempts=1,
+        pause_seconds=10.0,
+        max_pause_rounds=3,
+    )
+
+    for _ in range(4):
+        await c.run_once()
+        clock.advance(11.0)
+
+    assert len(producer.published) == 1
+    assert producer.published[0][0] == "infer.ocr.dlq"
+    assert kafka.paused_tps == set()          # không còn treo ở message này nữa
+
+    processed = await c.run_once()            # batch kế tiếp trong hàng đợi
+    assert processed == 1                     # được xử lý bình thường, không bị chặn
+    assert len(producer.published) == 1       # không có DLQ nào phát sinh thêm
+
+
+async def test_pause_round_counter_resets_when_head_offset_changes():
+    # offset 0 lỗi 2 lần rồi thành công; offset 1 lỗi 2 lần sau đó. Nếu bộ đếm
+    # không reset theo offset đang đứng đầu, hai lần lỗi của offset 1 sẽ cộng dồn
+    # lên hai lần lỗi trước đó của offset 0 và có thể vượt ngưỡng oan.
+    uri_a, uri_b = "s3://gpu-a/img.jpg", "s3://gpu-b/img.jpg"
+    attempts_a = [0]
+
+    async def handler(env):
+        uri = env.payload["input_uri"]
+        if uri == uri_a:
+            if attempts_a[0] < 2:
+                attempts_a[0] += 1
+                raise UpstreamError("gpu-a chập chờn")
+            return
+        if uri == uri_b:
+            raise UpstreamError("gpu-b chập chờn")
+
+    clock = Clock()
+    producer = FakeProducer()
+    kafka = FakeConsumer(
+        batches=[
+            {TOPIC_TP: [_msg(0, uri=uri_a)]},
+            {TOPIC_TP: [_msg(0, uri=uri_a)]},
+            {TOPIC_TP: [_msg(0, uri=uri_a)]},  # lần thứ 3 mới thành công
+            {TOPIC_TP: [_msg(1, uri=uri_b)]},
+            {TOPIC_TP: [_msg(1, uri=uri_b)]},
+        ]
+    )
+    c = _consumer(
+        kafka,
+        producer,
+        handler,
+        clock=clock,
+        max_attempts=1,
+        pause_seconds=10.0,
+        max_pause_rounds=3,
+    )
+
+    for _ in range(5):
+        await c.run_once()
+        clock.advance(11.0)
+
+    assert producer.published == []           # không message nào bị dead-letter
+
+
+async def test_default_pause_rounds_rides_out_a_handful_of_rounds_without_dlq():
+    # Sự cố hạ tầng bình thường (vài vòng pause) không được phép làm rơi message
+    # vào DLQ — đây chính là hành vi "lossless" mà cơ chế pause tồn tại để giữ.
+    async def handler(_env):
+        raise UpstreamError("outage hạ tầng kéo dài nhưng chưa vượt ngưỡng")
+
+    clock = Clock()
+    producer = FakeProducer()
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]} for _ in range(5)])
+    c = _consumer(
+        kafka,
+        producer,
+        handler,
+        clock=clock,
+        max_attempts=1,
+        pause_seconds=30.0,
+        max_pause_rounds=40,
+    )
+
+    for _ in range(5):
+        await c.run_once()
+        clock.advance(31.0)
+
+    assert producer.published == []            # vẫn lossless, chưa gần tới ngưỡng
+    assert TOPIC_TP in kafka.paused_tps         # vẫn đang chờ hạ tầng, không bỏ cuộc
+
+
 async def test_producer_wraps_broker_failure_as_upstream_error():
     # Broker trục trặc lúc publish kết quả không được coi là dữ liệu hỏng:
     # inference đã chạy xong rồi, dead-letter là vứt mất kết quả đã trả tiền.
@@ -280,3 +390,108 @@ async def test_producer_wraps_broker_failure_as_upstream_error():
     )
     with pytest.raises(UpstreamError):
         await producer.publish("infer.ocr.results", env)
+
+
+def _value(name: str, topic: str) -> float:
+    return REGISTRY.get_sample_value(name, {"topic": topic}) or 0.0
+
+
+async def test_pausing_increments_the_paused_counter():
+    async def handler(_env):
+        raise UpstreamError("gpu chết")
+
+    before = _value("vypq_events_consumer_paused_total", "infer.ocr.requests")
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]}])
+    c = _consumer(kafka, FakeProducer(), handler, max_attempts=1)
+    await c.run_once()
+    assert _value("vypq_events_consumer_paused_total", "infer.ocr.requests") == before + 1
+
+
+async def test_dead_lettering_increments_its_counter():
+    async def handler(_env):
+        raise ValueError("dữ liệu hỏng")
+
+    before = _value("vypq_events_dead_lettered_total", "infer.ocr.dlq")
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]}])
+    c = _consumer(kafka, FakeProducer(), handler, max_attempts=1)
+    await c.run_once()
+    assert _value("vypq_events_dead_lettered_total", "infer.ocr.dlq") == before + 1
+
+
+async def test_failing_dlq_publish_increments_its_own_counter():
+    # Đây là chỉ số quan trọng nhất: nó báo partition đang bị kẹt.
+    class BrokenProducer(FakeProducer):
+        async def publish(self, topic, envelope, key=None):
+            raise RuntimeError("broker chết")
+
+    async def handler(_env):
+        raise ValueError("dữ liệu hỏng")
+
+    before = _value("vypq_events_dlq_publish_failed_total", "infer.ocr.dlq")
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]}])
+    c = _consumer(kafka, BrokenProducer(), handler, max_attempts=1)
+    await c.run_once()
+    assert _value("vypq_events_dlq_publish_failed_total", "infer.ocr.dlq") == before + 1
+
+
+async def test_run_survives_a_broker_io_failure_and_keeps_looping():
+    # Toàn bộ cơ chế pause/rewind chỉ bảo vệ khỏi exception của HANDLER.
+    # getmany()/commit() nằm ngoài mọi try trong run_once() — một lỗi I/O
+    # broker thô (rebalance -> CommitFailedError, mất kết nối, v.v.) trước bản
+    # sửa sẽ bay thẳng ra khỏi run_once() và kết liễu `while True` trong
+    # run() vĩnh viễn. Giả lập bằng getmany() ném lỗi vài lần đầu rồi hết —
+    # giống một broker chớp nhoáng rồi hồi phục — và chứng minh run() vẫn còn
+    # sống, còn gọi getmany() tiếp, sau khi lỗi đó xảy ra.
+    calls = {"n": 0}
+
+    class FlakyConsumer(FakeConsumer):
+        async def getmany(self, timeout_ms: int = 1000, max_records: int | None = None):
+            calls["n"] += 1
+            # sleep(0) THẬT SỰ nhường quyền điều khiển cho event loop mỗi
+            # vòng. FakeConsumer thật (giống mọi fake khác trong file này) và
+            # _noop_sleep đều là coroutine không await gì thật cả — nếu thiếu
+            # điểm nhường quyền này, run()'s `while True` (không có await nào
+            # từng thật sự treo) chiếm trọn event loop và task.cancel() không
+            # bao giờ được giao, treo cả tiến trình pytest.
+            await asyncio.sleep(0)
+            if calls["n"] <= 3:
+                raise RuntimeError("mất kết nối broker")
+            return await super().getmany(timeout_ms, max_records)
+
+    async def handler(_env):  # pragma: no cover - không có message nào tới
+        raise AssertionError("không nên được gọi")
+
+    kafka = FlakyConsumer()
+    c = _consumer(kafka, FakeProducer(), handler, pause_seconds=0.0)
+    task = asyncio.create_task(c.run())
+    try:
+        for _ in range(200):
+            if calls["n"] > 3:
+                break
+            await asyncio.sleep(0.001)
+        assert calls["n"] > 3, "run() phải tiếp tục gọi getmany() sau khi nó ném lỗi"
+        assert not task.done(), "run() không được chết vì lỗi I/O của broker"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_run_propagates_cancellation_instead_of_swallowing_it():
+    # CancelledError là tín hiệu SHUTDOWN, không phải lỗi hạ tầng — phải bay
+    # tiếp, nếu không lifespan của app sẽ treo lúc tắt (giống lý do
+    # HostPoller.poll_once() phân biệt CancelledError với Exception thường).
+    class HangingConsumer(FakeConsumer):
+        async def getmany(self, timeout_ms: int = 1000, max_records: int | None = None):
+            await asyncio.sleep(10)
+            return {}
+
+    async def handler(_env):  # pragma: no cover
+        raise AssertionError("không nên được gọi")
+
+    c = _consumer(HangingConsumer(), FakeProducer(), handler)
+    task = asyncio.create_task(c.run())
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

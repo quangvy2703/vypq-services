@@ -1,3 +1,5 @@
+import json
+import re
 import shutil
 import subprocess
 from pathlib import Path
@@ -32,13 +34,56 @@ def test_script_generates_a_service_that_passes_its_own_tests(generated):
     )
     assert (generated / "src" / "tmptest_service" / "handler.py").is_file()
     assert (generated / "src" / "tmptest_service" / "worker.py").is_file()
-    assert (generated / "service.yaml").is_file()
+    # service.yaml đã bị xoá: /v1/info là nguồn sự thật sống thay nó. Kiểm tĩnh
+    # trên source sinh ra, không khởi động server ở đây — test riêng bên dưới
+    # (test_script_generated_service_advertises_itself_via_v1_info) đã lo phần
+    # gọi HTTP thật; test này chỉ cần chắc invoke_path khai trong ServiceInfo
+    # khớp đúng route POST mà chính main.py vừa sinh đăng ký.
+    main_py = (generated / "src" / "tmptest_service" / "main.py").read_text(encoding="utf-8")
+    assert "ServiceInfo(" in main_py
+    invoke_path_match = re.search(r'invoke_path=["\'](/v1/[^"\']+)["\']', main_py)
+    assert invoke_path_match, f"không tìm thấy invoke_path trong {main_py!r}"
+    route_match = re.search(r'@router\.post\(\s*["\'](/[^"\']+)["\']', main_py)
+    assert route_match, f"không tìm thấy route POST trong {main_py!r}"
+    assert invoke_path_match.group(1) == "/v1" + route_match.group(1)
 
     result = subprocess.run(
         ["uv", "run", "pytest", "services/tmptest", "-q"],
         cwd=REPO, capture_output=True, text=True,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_script_generated_service_advertises_itself_via_v1_info(generated):
+    subprocess.run(
+        [str(SCRIPT), "tmptest", "ocr", "8099"], cwd=REPO, check=True, capture_output=True
+    )
+    # Không import trực tiếp trong tiến trình test: gói vừa sinh chỉ nằm trong
+    # venv sau "uv sync" mà script đã tự chạy — python con của "uv run" mới
+    # chắc chắn thấy nó trên sys.path.
+    probe = (
+        "import json\n"
+        "import httpx\n"
+        "from tmptest_service.main import build_app\n"
+        "app = build_app()\n"
+        "transport = httpx.ASGITransport(app=app)\n"
+        "async def _get():\n"
+        "    async with httpx.AsyncClient(transport=transport, base_url='http://t') as c:\n"
+        "        return await c.get('/v1/info')\n"
+        "import asyncio\n"
+        "resp = asyncio.run(_get())\n"
+        "print(json.dumps(resp.json()))\n"
+    )
+    result = subprocess.run(
+        ["uv", "run", "python", "-c", probe],
+        cwd=REPO, capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    generated_info = json.loads(result.stdout.strip().splitlines()[-1])
+    assert "/v1/" in generated_info["invoke_path"]
+    # Route thật đăng ký trong main.py là "/v1/" + task (ocr ở đây), không phải
+    # slug — sai chỗ này thì gateway gọi invoke_path sẽ 404 dù /v1/info vẫn ok.
+    assert generated_info["invoke_path"] == "/v1/ocr"
 
 
 def test_script_leaves_no_unreplaced_tokens(generated):

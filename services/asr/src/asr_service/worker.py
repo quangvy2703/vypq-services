@@ -4,7 +4,6 @@ from collections.abc import Awaitable, Callable
 import httpx
 from vypq_contracts.common import ErrorCode, Task
 from vypq_core.errors import ServiceError
-from vypq_core.host_registry import StaticHostRegistry
 from vypq_core.http_client import UpstreamError
 from vypq_core.logging import get_logger, setup_logging
 from vypq_events.consumer import EventConsumer
@@ -15,7 +14,7 @@ from vypq_events.topics import dlq_topic, request_topic, result_topic
 
 from asr_service.backend.remote import RemoteAsrBackend
 from asr_service.handler import AsrHandler
-from asr_service.settings import AsrSettings, load_hosts
+from asr_service.settings import AsrSettings, build_host_registry
 
 log = get_logger(__name__)
 
@@ -38,6 +37,14 @@ async def fetch_bytes(uri: str) -> bytes:
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
             response = await client.get(uri)
+    except (httpx.UnsupportedProtocol, httpx.InvalidURL) as exc:
+        # PHẢI bắt TRƯỚC TransportError: UnsupportedProtocol kế thừa từ nó.
+        # URI sai scheme hay sai định dạng thì thử lại bao nhiêu lần cũng hỏng
+        # y hệt — xếp vào hạ tầng sẽ làm consumer pause vô hạn và kẹt cả
+        # partition sau một URI hỏng, trong khi DLQ vẫn rỗng.
+        raise ServiceError(
+            ErrorCode.BAD_INPUT, f"URI không dùng được: {uri} ({exc})", http_status=422
+        ) from exc
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         raise UpstreamError(f"không tải được {uri}: {exc}") from exc
     if response.status_code >= 500:
@@ -93,7 +100,7 @@ class AsrWorkerHandler:
 async def main() -> None:
     settings = AsrSettings()
     setup_logging(settings.log_level)
-    registry = StaticHostRegistry(load_hosts(settings.hosts_path))
+    registry = build_host_registry(settings)
     backend = RemoteAsrBackend(registry, timeout_s=settings.timeout_s)
     handler = AsrHandler(backend, default_model=settings.default_model)
     producer = EventProducer(settings.brokers)
@@ -115,6 +122,9 @@ async def main() -> None:
         await consumer.stop()
         await producer.stop()
         await backend.aclose()
+        # worker.py là tiến trình chạy dài: không đóng thì client httpx bên
+        # trong DiscoveryHostRegistry rò tài nguyên suốt vòng đời tiến trình.
+        await registry.aclose()
 
 
 if __name__ == "__main__":

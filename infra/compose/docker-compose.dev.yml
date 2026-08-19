@@ -8,7 +8,7 @@ services:
       - --memory 1G
       - --kafka-addr PLAINTEXT://0.0.0.0:9092
       - --advertise-kafka-addr PLAINTEXT://localhost:9092
-    ports: ["9092:9092"]
+    ports: ["9092:9092", "9644:9644"]
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
       interval: 5s
@@ -20,3 +20,43 @@ services:
       KAFKA_BROKERS: redpanda:9092
     ports: ["8090:8080"]
     depends_on: [redpanda]
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: vypq
+      POSTGRES_PASSWORD: vypq
+      POSTGRES_DB: vypq
+    ports: ["5432:5432"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U vypq"]
+      interval: 5s
+      retries: 20
+
+  gateway:
+    build: {context: ../.., dockerfile: apps/gateway/Dockerfile}
+    environment:
+      VYPQ_DATABASE_URL: postgresql+asyncpg://vypq:vypq@postgres:5432/vypq
+      VYPQ_BROKERS: redpanda:9092
+      # Bắt buộc, giống model-host: gateway từ chối khởi động nếu thiếu — xem
+      # GatewaySettings._token_must_not_be_empty.
+      VYPQ_TOKEN: ${VYPQ_TOKEN:?bat buoc dat VYPQ_TOKEN}
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redpanda: {condition: service_healthy}
+
+  prometheus:
+    image: prom/prometheus:v2.55.1
+    volumes:
+      - ../prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ../prometheus/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports: ["9090:9090"]
+    depends_on: [redpanda]
+
+  grafana:
+    image: grafana/grafana:11.3.1
+    environment:
+      GF_SECURITY_ADMIN_PASSWORD: vypq
+    ports: ["3000:3000"]
+    depends_on: [prometheus]

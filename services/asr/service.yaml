@@ -1,5 +1,0 @@
-name: asr
-port: 8002
-capability: {input: bytes, output: json}
-consumes: [infer.asr.requests]
-produces: [infer.asr.results]

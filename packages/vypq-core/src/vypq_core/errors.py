@@ -1,4 +1,5 @@
 from fastapi import FastAPI, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from vypq_contracts.common import ErrorCode, ErrorResponse
 
@@ -30,6 +31,20 @@ def install_error_handlers(app: FastAPI) -> None:
     async def _handle_service_error(_request: Request, exc: ServiceError):
         log.warning("service_error", code=exc.code.value, message=exc.message)
         return _envelope(exc.code, exc.message, exc.http_status)
+
+    @app.exception_handler(RequestValidationError)
+    async def _handle_validation(_request: Request, exc: RequestValidationError):
+        # KHÔNG trả exc.errors() nguyên bản: FastAPI nhét cả `input` vào từng mục,
+        # nên một request đăng ký hỏng sẽ dội ngược token về cho chính người gửi.
+        # Chỉ nói TRƯỜNG nào sai, tuyệt đối không nói người ta đã gửi giá trị gì.
+        fields = sorted(
+            ".".join(str(part) for part in error["loc"][1:]) or "body"
+            for error in exc.errors()
+        )
+        log.warning("request_validation_failed", fields=fields)
+        return _envelope(
+            ErrorCode.BAD_INPUT, f"dữ liệu không hợp lệ: {', '.join(fields)}", 422
+        )
 
     @app.exception_handler(Exception)
     async def _handle_unexpected(_request: Request, exc: Exception):

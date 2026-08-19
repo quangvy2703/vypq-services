@@ -59,6 +59,18 @@ async def test_ready_reports_degraded_when_a_host_circuit_is_open():
     assert "gpu-1" in resp.json()["detail"]["model_host"]
 
 
+async def test_service_advertises_its_capability():
+    # Gateway dựa vào đây để biết service nhận gì, trả gì, và model mặc định.
+    async with _client(_app(FakeOcrBackend(RawOcrOutput()))) as c:
+        resp = await c.get("/v1/info")
+    body = resp.json()
+    assert body["name"] == "ocr"
+    assert body["task"] == "ocr"
+    assert body["capability_input"] == "image"
+    assert body["invoke_path"] == "/v1/ocr"
+    assert body["default_model"] == "m1"
+
+
 async def test_trace_id_header_is_echoed_back():
     async with _client(_app(FakeOcrBackend(RawOcrOutput()))) as c:
         resp = await c.post(

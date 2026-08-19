@@ -1,0 +1,38 @@
+groups:
+  - name: vypq
+    rules:
+      - alert: DlqPublishFailing
+        expr: increase(vypq_events_dlq_publish_failed_total[5m]) > 0
+        for: 1m
+        labels: {severity: critical}
+        annotations:
+          summary: "Không ghi được vào DLQ trên {{ $labels.topic }}"
+          description: >
+            Consumer không đẩy được message hỏng vào dead-letter nên nó dừng và
+            tua lại mãi. Cả partition đang kẹt sau một message. Không có cảnh báo
+            này thì tình trạng đó hoàn toàn im lặng.
+
+      # Không có ConsumerLagGrowing: đã xác minh trực tiếp trên broker Redpanda
+      # v24.2.7 đang chạy (cả /public_metrics lẫn /metrics ở cổng 9644) rằng
+      # KHÔNG có metric lag nào được phát ra — không có "redpanda_kafka_..lag..",
+      # cũng không có gauge lag nào khác. Chỉ có hai gauge rời:
+      # redpanda_kafka_consumer_group_committed_offset (theo group/partition/topic)
+      # và redpanda_kafka_max_offset (theo namespace/partition/topic, KHÔNG có
+      # nhãn group). Hai metric này không chung đủ nhãn để join bằng PromQL
+      # (thiếu topic namespace nhất quán và max_offset không có nhãn group), nên
+      # bất kỳ expr nào ghép hai cái lại đều là suy đoán không đáng tin, và một
+      # placeholder chưa xác minh còn tệ hơn không có cảnh báo — nó tạo ảo giác
+      # rằng lag được giám sát trong khi thực ra không. Không thêm alert; xem
+      # task-15-report.md để biết cách đã tra cứu và tuỳ chọn thay thế
+      # (rpk group describe qua một exporter nhỏ) nếu muốn giám sát lag thật.
+
+      - alert: ConsumerPausedTooLong
+        expr: increase(vypq_events_consumer_paused_total[15m]) > 3
+        for: 5m
+        labels: {severity: warning}
+        annotations:
+          summary: "Consumer dừng liên tục trên {{ $labels.topic }}"
+          description: >
+            Dừng vài lần là bình thường khi máy GPU thuê được thay. Dừng liên
+            tục nghĩa là không có host nào sống, hoặc token đã đổi mà chưa
+            đăng ký lại.

@@ -7,6 +7,7 @@ from vypq_core.breaker import CircuitOpenError
 from vypq_core.host_registry import NoHostAvailableError
 from vypq_core.http_client import UpstreamError
 from vypq_core.logging import get_logger, set_trace_id
+from vypq_core.metrics import DLQ_PUBLISH_FAILED, EVENTS_DEAD_LETTERED, EVENTS_PAUSED
 
 from vypq_events.envelope import EventEnvelope, RawEnvelope
 
@@ -29,6 +30,14 @@ def default_is_retryable(exc: Exception) -> bool:
 class _PauseSignal(Exception):
     """Nội bộ: báo run_once dừng consume thay vì đẩy message vào DLQ."""
 
+    def __init__(self, envelope=None) -> None:
+        super().__init__()
+        self.envelope = envelope
+
+
+class PauseLimitExceeded(Exception):
+    """Message này đã khiến consumer pause quá max_pause_rounds vòng liên tiếp."""
+
 
 class EventConsumer:
     def __init__(
@@ -49,6 +58,7 @@ class EventConsumer:
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         clock: Callable[[], float] = time.monotonic,
         is_retryable: Callable[[Exception], bool] = default_is_retryable,
+        max_pause_rounds: int = 40,
     ) -> None:
         self._handler = handler
         self._dlq_topic = dlq_topic
@@ -61,29 +71,68 @@ class EventConsumer:
         self._sleep = sleep
         self._clock = clock
         self._is_retryable = is_retryable
+        self._max_pause_rounds = max_pause_rounds
         self._paused_until: float | None = None
-        self._consumer = consumer or AIOKafkaConsumer(
-            topic,
-            bootstrap_servers=brokers,
-            group_id=group_id,
-            enable_auto_commit=False,
-            auto_offset_reset="earliest",
-        )
+        # Offset đang bị kẹt ở đầu batch và số vòng pause liên tiếp nó đã gây ra.
+        self._pause_offset_key: tuple | None = None
+        self._pause_round_count: int = 0
+        # KHÔNG dựng AIOKafkaConsumer() ở đây, cùng lý do với EventProducer (xem
+        # đó): nó đòi một event loop ĐANG CHẠY ngay lúc __init__ chạy, còn
+        # EventConsumer thường được dựng ở composition root lúc module được
+        # import, trước khi loop tồn tại. Hoãn sang start().
+        self._topic = topic
+        self._brokers = brokers
+        self._group_id = group_id
+        self._consumer = consumer
 
     async def start(self) -> None:
+        if self._consumer is None:
+            self._consumer = AIOKafkaConsumer(
+                self._topic,
+                bootstrap_servers=self._brokers,
+                group_id=self._group_id,
+                enable_auto_commit=False,
+                auto_offset_reset="earliest",
+            )
         await self._consumer.start()
 
     async def stop(self) -> None:
-        await self._consumer.stop()
+        if self._consumer is not None:
+            await self._consumer.stop()
 
     async def run(self) -> None:
         while True:
-            await self.run_once()
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # getmany()/commit() nằm NGOÀI mọi try trong run_once(): toàn bộ
+                # cơ chế pause/rewind ở trên chỉ bảo vệ khỏi exception của
+                # HANDLER, không phải I/O broker của chính consumer. aiokafka
+                # ném CommitFailedError khi generation của consumer group đổi
+                # (rebalance) — một lần rebalance hay broker chớp nhoáng là đủ
+                # để vòng lặp `while True` này chết, và chết là VĨNH VIỄN: không
+                # có gì gọi lại run(). Ở worker đứng một mình, chết còn kéo theo
+                # chết cả tiến trình nên Docker restart — hỏng an toàn. Nhưng
+                # trong gateway, main._guard bọc coroutine này, nuốt exception,
+                # log một dòng, rồi tiến trình SỐNG TIẾP — result ingestion của
+                # topic đó chết hẳn mà /ready vẫn báo 200 vì không ai theo dõi
+                # task đã chết. I/O của broker là hạ tầng — cùng cách nhìn nhận
+                # với default_is_retryable ở trên — nên xử lý giống hệt: log rồi
+                # nghỉ một nhịp rồi thử getmany() lại, không để nó kết liễu vòng
+                # lặp.
+                log.exception(
+                    "consumer_run_once_failed", topic=self._topic, error=str(exc)
+                )
+                await self._sleep(self._pause_seconds)
 
     async def run_once(self) -> int:
         # Vẫn gọi getmany() khi đang pause, không bỏ qua: consumer thật trả rỗng
         # sau timeout_ms nên vòng lặp tự có nhịp, và aiokafka giữ được heartbeat
         # với group. Bỏ poll đi thì run() quay tít không nghỉ.
+        if self._consumer is None:
+            raise UpstreamError("EventConsumer chưa start(), chưa có gì để consume")
         self._maybe_resume()
         batch = await self._consumer.getmany(
             timeout_ms=self._poll_ms, max_records=self._max_records
@@ -95,7 +144,48 @@ class EventConsumer:
             for message in messages:
                 try:
                     await self._process(message)
-                except _PauseSignal:
+                except _PauseSignal as sig:
+                    key = (tp, message.offset)
+                    if key != self._pause_offset_key:
+                        self._pause_offset_key = key
+                        self._pause_round_count = 1
+                    else:
+                        self._pause_round_count += 1
+
+                    # Chỉ message ở ĐẦU batch (head) mới tích luỹ vòng pause — các
+                    # message phía sau nó trong cùng partition chưa bao giờ được
+                    # thử, vì mỗi lần pause consumer đều tua về đúng offset này rồi
+                    # dừng lại. Vì thế bộ đếm này KHÔNG phân biệt được "message hỏng
+                    # vĩnh viễn" với "hạ tầng đang gặp sự cố kéo dài": nó chỉ đo được
+                    # message đứng đầu hàng đợi bao lâu, không đo bản chất lỗi. Đặt
+                    # ngưỡng thấp (kiểu 3 vòng) sẽ khiến consumer bắt đầu dead-letter
+                    # cả hàng đợi, mỗi cửa sổ pause một message, ngay khi hạ tầng chỉ
+                    # mới gián đoạn vài phút — chính là mất dữ liệu mà cơ chế
+                    # pause/rewind này sinh ra để ngăn. Ngưỡng phải đủ rộng để chịu
+                    # được MỌI sự cố hạ tầng thực tế (đổi máy GPU thuê, object store
+                    # phục hồi, v.v.); nó chỉ tồn tại để chặn tình huống kẹt VÔ HẠN,
+                    # không phải để lọc message lỗi.
+                    if self._pause_round_count > self._max_pause_rounds:
+                        log.error(
+                            "pause_limit_exceeded",
+                            topic=tp.topic,
+                            offset=message.offset,
+                            rounds=self._pause_round_count,
+                        )
+                        reason = PauseLimitExceeded(
+                            f"vượt quá {self._max_pause_rounds} vòng pause liên tiếp "
+                            f"tại offset {message.offset}; lỗi gần nhất: {sig.__cause__}"
+                        )
+                        await self._to_dlq(
+                            message, sig.envelope, reason, attempts=self._max_attempts
+                        )
+                        pending[tp] = message.offset + 1
+                        processed += 1
+                        await self._consumer.commit()
+                        self._pause_offset_key = None
+                        self._pause_round_count = 0
+                        continue
+
                     # Tua lại MỌI partition trong batch, không chỉ cái đang lỗi:
                     # commit() không tham số commit vị trí của TẤT CẢ partition
                     # được gán, kể cả những partition mà getmany() đã trả record
@@ -109,6 +199,8 @@ class EventConsumer:
                     return processed
                 pending[tp] = message.offset + 1
                 processed += 1
+                self._pause_offset_key = None
+                self._pause_round_count = 0
         if processed:
             await self._consumer.commit()
         return processed
@@ -118,6 +210,7 @@ class EventConsumer:
         if assignment:
             self._consumer.pause(*assignment)
         self._paused_until = self._clock() + self._pause_seconds
+        EVENTS_PAUSED.labels(topic=self._topic).inc()
         log.warning("consumer_paused", seconds=self._pause_seconds)
 
     def _maybe_resume(self) -> None:
@@ -150,7 +243,7 @@ class EventConsumer:
                     return
                 if attempt == self._max_attempts:
                     log.warning("retry_exhausted_pausing", error=str(exc))
-                    raise _PauseSignal from exc
+                    raise _PauseSignal(envelope) from exc
                 await self._sleep(self._base_delay * (2 ** (attempt - 1)))
 
     async def _to_dlq(self, message, envelope, exc: Exception, attempts: int) -> None:
@@ -175,8 +268,10 @@ class EventConsumer:
             # Broker đang có vấn đề → coi như sự cố hạ tầng và dừng consume, giống
             # hệt lúc upstream chết. Để exception bay tiếp thì nó không phải
             # _PauseSignal, run_once() không bắt, và cả consumer chết đứng.
+            DLQ_PUBLISH_FAILED.labels(topic=self._dlq_topic).inc()
             log.error("dlq_publish_failed", topic=self._dlq_topic, error=str(dlq_exc))
             raise _PauseSignal from dlq_exc
+        EVENTS_DEAD_LETTERED.labels(topic=self._dlq_topic).inc()
         log.error("event_dead_lettered", topic=self._dlq_topic, reason=str(exc))
 
 

@@ -247,19 +247,23 @@ không cần JVM/ZooKeeper.
   vì khác consumer group. Đây là chế độ shadow-run và là cách `evaluator` chạy benchmark —
   không cần code riêng cho việc so model.
 
-### 3.8 Service manifest
+### 3.8 Service tự mô tả qua `/v1/info`
 
-```yaml
-# services/ocr/service.yaml
-name: ocr
-port: 8001
-capability: {input: image, output: text_boxes}
-consumes: [infer.ocr.requests]
-produces: [infer.ocr.results]
+```json
+{"name": "ocr", "task": "ocr", "capability_input": "image",
+ "capability_output": "text_boxes", "version": "0.1.0",
+ "invoke_path": "/v1/ocr", "default_model": "paddleocr-v4-vi"}
 ```
 
 Dashboard đọc capability từ gateway rồi tự chọn uploader và viewer. Service thứ ba
-(NER, TTS...) chỉ cần khai báo manifest, không sửa code dashboard.
+(NER, TTS...) chỉ cần trả đúng `/v1/info`, không sửa code dashboard.
+
+**Ghi chú lịch sử:** Plan A để manifest trong `services/*/service.yaml`. Cách đó
+chỉ đọc được khi đứng cùng máy, mà gateway ở máy khác — nên Plan B1 thay bằng
+endpoint HTTP và **xoá hẳn file YAML**. Giữ lại cả hai sẽ thành hai nguồn sự thật,
+và cái không ai đọc sẽ lặng lẽ trôi khỏi cái đang chạy: lúc phát hiện thì
+`service.yaml` của asr đã ghi `bytes/json` trong khi service thật trả
+`audio/transcript`.
 
 ## 4. Định dạng dataset có nhãn
 
@@ -563,6 +567,46 @@ tranh luận lại — và để Plan B, C không vấp phải.
   (`_parse` khi model-host trả sai kiểu output — lỗi cấu hình, retry mãi chỉ kẹt
   partition). Ai "dọn dẹp" cho `default_is_retryable` đọc `ErrorCode` sẽ lật
   ngược cả hai và làm hỏng bảo đảm không-mất-dữ-liệu. Đừng làm.
+- **Giới hạn số lần pause trên cùng một message.** Consumer dừng khi gặp sự cố hạ
+  tầng và tua lại chính message đó, nên trong lúc sự cố **chỉ một message duy nhất**
+  tích luỹ số lần dừng — những cái sau chưa được đụng tới. Vì vậy đặt ngưỡng nhỏ là
+  sai: một sự cố thật kéo dài sẽ bào mòn hàng đợi, cứ N×`pause_seconds` lại mất một
+  message. Ngưỡng mặc định 40 vòng × 30s ≈ **20 phút**: mọi sự cố ngắn hơn thế được
+  chịu đựng trọn vẹn, dài hơn thì mất chậm và alert đã kêu từ lâu.
+  Cách phân biệt đúng hẳn là bỏ qua message nghi vấn rồi thử cái kế tiếp — cái sau
+  chạy được thì cái trước là độc. Không làm vì phá thứ tự xử lý, và vì message độc
+  thật sự (URI sai scheme, URI hỏng) đã vào DLQ ngay từ khâu phân loại.
+- **Đường async không tạo dòng `PENDING`, nên "đang chờ" và "sai trace_id" nhìn
+  giống nhau.** `POST /v1/invoke` chế độ async trả `trace_id` rồi đẩy vào Kafka,
+  không ghi gì vào `runs` — vì shadow-run cho nhiều model cùng xử lý, chưa biết
+  sẽ có bao nhiêu kết quả và mỗi cái thuộc model nào. Hệ quả:
+  `GET /v1/runs?trace_id=X` trả rỗng có thể là "chưa xong" hoặc "id không tồn tại".
+  `RunStatus.PENDING` hiện không chỗ nào dùng. Cách chữa nếu cần: dispatch ghi một
+  dòng PENDING với `model_version=""`, result consumer NHẬN dòng đó cho kết quả
+  đầu tiên và chèn dòng mới cho các model version sau. Chưa làm vì người gọi vừa
+  nhận trace_id từ chính gateway nên "sai id" không phải tình huống thực tế của
+  họ; nhu cầu thật của Plan C (biết việc nào hỏng hẳn) đi qua `InferenceFailed`
+  đã ghi ở trên.
+- **Redpanda v24.2.7 KHÔNG phát metric consumer lag.** Đã kiểm cả `/public_metrics`
+  lẫn `/metrics` trên broker thật: không series nào khớp `lag`. Nên alert lag bị bỏ
+  hẳn thay vì ship một rule trỏ vào thứ không tồn tại — rule như vậy không bao giờ
+  kêu và tạo cảm giác an toàn giả. Muốn có lag thì tính bằng PromQL từ hai gauge
+  sẵn có: `redpanda_kafka_max_offset - redpanda_kafka_consumer_group_committed_offset`,
+  join theo topic/partition/group. Kiểm bằng query thật trước khi đặt ngưỡng.
+- **Gateway CHƯA CÓ xác thực, và compose mở nó ra mọi interface.** Ai với tới cổng
+  8080 đều `GET /v1/discovery/hosts` để lấy token của mọi máy GPU đang thuê, hoặc
+  `POST /v1/hosts` để trỏ một tên host sang URL của họ. Việc tách hai endpoint là
+  để dashboard không rò token, KHÔNG phải để chống mạng. Plan B2 làm điều này gắt
+  hơn vì gateway phải với được từ nơi trình duyệt chạy. Chưa quyết — xem mục dưới.
+- **`GET /v1/runs?service=...` bỏ sót dòng gán nhãn fallback.** Khi result consumer
+  không khớp được service nào, nó quy run về `task.value`. Plan C join theo
+  trace/run id nên chấm điểm vẫn đúng, nhưng lọc theo service thì thiếu. Nên log
+  cảnh báo khi fallback kích hoạt.
+- **Gateway async API chưa mang được metadata đánh giá.** `InvokeRequest` không có
+  `eval_job_id`/`dataset_item_id` và `Dispatcher` không đặt chúng, dù schema event
+  và worker đã truyền xuyên suốt. Evaluator của Plan C do đó phải publish
+  `InferenceRequested` thẳng vào Kafka thay vì gọi `POST /v1/invoke` — ghi rõ ở đây
+  để Plan C không thiết kế vòng quanh gateway.
 - **Cần metric và alert trên `dlq_publish_failed` + `consumer_paused`** trước khi
   chạy không người trông. DLQ hỏng vĩnh viễn sẽ kẹt cả partition, im lặng.
   Đây là bước 10 trong lộ trình Plan B.
