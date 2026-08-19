@@ -153,6 +153,38 @@ describe("Playground — so sánh nhiều model", () => {
     expect(within(panels[0] as HTMLElement).queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  it("một model bị lỗi MẠNG cũng không kéo đổ kết quả model kia", () => {
+    // Khác hẳn ca 503 ở trên: 503 là response hợp lệ nên runOne tự bắt và trả
+    // RunOutcome, promise không bao giờ reject — nghĩa là ca đó chạy giống hệt
+    // nhau với Promise.all lẫn Promise.allSettled. Chỉ khi fetch NÉM (mất mạng,
+    // gateway rớt giữa chừng) mới phân biệt được hai cái, và đó mới là lý do
+    // Promise.allSettled tồn tại ở đây.
+    fetchMock.mockImplementation(async (url: string, init?: RequestInit) => {
+      if (url === "/api/invoke") {
+        const model = String((init?.body as FormData).get("model_version") ?? "");
+        if (model === "vietocr-ft-invoice") throw new TypeError("Failed to fetch");
+        return new Response(
+          JSON.stringify({ trace_id: "t1", mode: "sync", run_id: "r1", result: ocrOutput("ok") }),
+          { status: 200 },
+        );
+      }
+      return new Response(JSON.stringify({ id: "r1", latency_ms: 320 }), { status: 200 });
+    });
+
+    return (async () => {
+      const user = await setup();
+      await user.selectOptions(screen.getByLabelText(/^Model$/), "paddleocr-v4-vi");
+      await user.click(screen.getByRole("checkbox", { name: /vietocr-ft-invoice/ }));
+      await user.click(screen.getByRole("button", { name: "Chạy thử" }));
+
+      const panels = await screen.findAllByTestId("ket-qua");
+      expect(panels).toHaveLength(2);
+      expect(within(panels[0] as HTMLElement).queryByRole("alert")).not.toBeInTheDocument();
+      expect(within(panels[0] as HTMLElement).getByText("320 ms")).toBeInTheDocument();
+      expect(within(panels[1] as HTMLElement).getByRole("alert")).toHaveTextContent(/Failed to fetch/);
+    })();
+  });
+
   it("vẫn hiện kết quả khi không lấy được độ trễ", async () => {
     fetchMock.mockImplementation(async (url: string) => {
       if (url === "/api/invoke") {
