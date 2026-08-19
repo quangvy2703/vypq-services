@@ -576,6 +576,17 @@ tranh luận lại — và để Plan B, C không vấp phải.
   Cách phân biệt đúng hẳn là bỏ qua message nghi vấn rồi thử cái kế tiếp — cái sau
   chạy được thì cái trước là độc. Không làm vì phá thứ tự xử lý, và vì message độc
   thật sự (URI sai scheme, URI hỏng) đã vào DLQ ngay từ khâu phân loại.
+- **Đường async không tạo dòng `PENDING`, nên "đang chờ" và "sai trace_id" nhìn
+  giống nhau.** `POST /v1/invoke` chế độ async trả `trace_id` rồi đẩy vào Kafka,
+  không ghi gì vào `runs` — vì shadow-run cho nhiều model cùng xử lý, chưa biết
+  sẽ có bao nhiêu kết quả và mỗi cái thuộc model nào. Hệ quả:
+  `GET /v1/runs?trace_id=X` trả rỗng có thể là "chưa xong" hoặc "id không tồn tại".
+  `RunStatus.PENDING` hiện không chỗ nào dùng. Cách chữa nếu cần: dispatch ghi một
+  dòng PENDING với `model_version=""`, result consumer NHẬN dòng đó cho kết quả
+  đầu tiên và chèn dòng mới cho các model version sau. Chưa làm vì người gọi vừa
+  nhận trace_id từ chính gateway nên "sai id" không phải tình huống thực tế của
+  họ; nhu cầu thật của Plan C (biết việc nào hỏng hẳn) đi qua `InferenceFailed`
+  đã ghi ở trên.
 - **Cần metric và alert trên `dlq_publish_failed` + `consumer_paused`** trước khi
   chạy không người trông. DLQ hỏng vĩnh viễn sẽ kẹt cả partition, im lặng.
   Đây là bước 10 trong lộ trình Plan B.
