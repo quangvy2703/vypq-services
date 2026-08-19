@@ -38,6 +38,10 @@ describe("ServicesTable", () => {
     // Suy task từ base_url là chỗ dễ sai nhất: "ner" trong URL không phải task.
     expect(within(row).queryByText("ocr")).not.toBeInTheDocument();
     expect(within(row).queryByText("asr")).not.toBeInTheDocument();
+    // queryByText khớp CHÍNH XÁC cả text node, nên hai dòng trên không bắt được
+    // kiểu đoán nhúng giữa câu ("...chưa đọc được /v1/info (đoán: ocr)"). Soi
+    // thẳng textContent mới chặn được cả hai kiểu.
+    expect(row.textContent).not.toMatch(/\b(ocr|asr)\b/);
   });
 
   it("hiện base_url để lần ra container nào đang hỏng", () => {
