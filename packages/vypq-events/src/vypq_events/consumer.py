@@ -75,19 +75,29 @@ class EventConsumer:
         # Offset đang bị kẹt ở đầu batch và số vòng pause liên tiếp nó đã gây ra.
         self._pause_offset_key: tuple | None = None
         self._pause_round_count: int = 0
-        self._consumer = consumer or AIOKafkaConsumer(
-            topic,
-            bootstrap_servers=brokers,
-            group_id=group_id,
-            enable_auto_commit=False,
-            auto_offset_reset="earliest",
-        )
+        # KHÔNG dựng AIOKafkaConsumer() ở đây, cùng lý do với EventProducer (xem
+        # đó): nó đòi một event loop ĐANG CHẠY ngay lúc __init__ chạy, còn
+        # EventConsumer thường được dựng ở composition root lúc module được
+        # import, trước khi loop tồn tại. Hoãn sang start().
+        self._topic = topic
+        self._brokers = brokers
+        self._group_id = group_id
+        self._consumer = consumer
 
     async def start(self) -> None:
+        if self._consumer is None:
+            self._consumer = AIOKafkaConsumer(
+                self._topic,
+                bootstrap_servers=self._brokers,
+                group_id=self._group_id,
+                enable_auto_commit=False,
+                auto_offset_reset="earliest",
+            )
         await self._consumer.start()
 
     async def stop(self) -> None:
-        await self._consumer.stop()
+        if self._consumer is not None:
+            await self._consumer.stop()
 
     async def run(self) -> None:
         while True:

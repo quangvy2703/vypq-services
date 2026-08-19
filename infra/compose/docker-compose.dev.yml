@@ -32,3 +32,13 @@ services:
       test: ["CMD-SHELL", "pg_isready -U vypq"]
       interval: 5s
       retries: 20
+
+  gateway:
+    build: {context: ../.., dockerfile: apps/gateway/Dockerfile}
+    environment:
+      VYPQ_DATABASE_URL: postgresql+asyncpg://vypq:vypq@postgres:5432/vypq
+      VYPQ_BROKERS: redpanda:9092
+    ports: ["8080:8080"]
+    depends_on:
+      postgres: {condition: service_healthy}
+      redpanda: {condition: service_healthy}
