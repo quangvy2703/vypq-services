@@ -53,6 +53,18 @@ class ServiceInfo(BaseModel):
 
 
 class ServiceState(BaseModel):
+    """Trạng thái một service như gateway đang thấy.
+
+    `name` là KHOÁ ĐỊNH TUYẾN — tên trong `config/services.yaml`, thứ duy nhất
+    gateway tra cứu khi nhận `POST /v1/invoke`. Nó KHÔNG nhất thiết bằng
+    `info.name` (tên service tự khai qua /v1/info): hai chỗ đó do hai người
+    khác nhau đặt, và trước khi có trường này, dashboard gọi bằng `info.name`
+    nên chỉ cần ai đó đổi một trong hai là mọi lần chạy thử trả 404 "không có
+    service", còn trang lịch sử thì hiện JSON thô thay vì viewer đúng — im
+    lặng, vì không chỗ nào đối chiếu hai tên.
+    """
+
+    name: str
     # None nghĩa là gateway CHƯA TỪNG poll thành công service này — không có
     # ServiceInfo thật để đọc, nên tuyệt đối không được đoán task hay
     # invoke_path (đoán = có thể gọi/định tuyến sai service, ví dụ publish

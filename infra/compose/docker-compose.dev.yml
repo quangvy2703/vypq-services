@@ -6,8 +6,13 @@ services:
       - --overprovisioned
       - --smp 1
       - --memory 1G
-      - --kafka-addr PLAINTEXT://0.0.0.0:9092
-      - --advertise-kafka-addr PLAINTEXT://localhost:9092
+      # Hai listener chứ không một. Một listener quảng bá "localhost:9092" chỉ
+      # đúng cho client chạy trên máy chủ; container trong cùng network nhận
+      # metadata đó rồi nối vào CHÍNH NÓ và nhận Connection refused. Giữ
+      # external ở 9092 để dev và test trên máy chủ không phải đổi gì, thêm
+      # internal ở 9093 cho các container gọi nhau bằng tên service.
+      - --kafka-addr internal://0.0.0.0:9093,external://0.0.0.0:9092
+      - --advertise-kafka-addr internal://redpanda:9093,external://localhost:9092
     ports: ["9092:9092", "9644:9644"]
     healthcheck:
       test: ["CMD-SHELL", "rpk cluster health | grep -q 'Healthy:.*true'"]
@@ -17,7 +22,9 @@ services:
   redpanda-console:
     image: redpandadata/console:v2.7.2
     environment:
-      KAFKA_BROKERS: redpanda:9092
+      # 9093 là listener nội bộ. Cổng 9092 quảng bá "localhost", đúng cho client
+      # trên máy chủ nhưng trỏ ngược vào chính container khi gọi từ trong network.
+      KAFKA_BROKERS: redpanda:9093
     ports: ["8090:8080"]
     depends_on: [redpanda]
 
@@ -37,7 +44,7 @@ services:
     build: {context: ../.., dockerfile: apps/gateway/Dockerfile}
     environment:
       VYPQ_DATABASE_URL: postgresql+asyncpg://vypq:vypq@postgres:5432/vypq
-      VYPQ_BROKERS: redpanda:9092
+      VYPQ_BROKERS: redpanda:9093
       # Bắt buộc, giống model-host: gateway từ chối khởi động nếu thiếu — xem
       # GatewaySettings._token_must_not_be_empty.
       VYPQ_TOKEN: ${VYPQ_TOKEN:?bat buoc dat VYPQ_TOKEN}
@@ -45,6 +52,20 @@ services:
     depends_on:
       postgres: {condition: service_healthy}
       redpanda: {condition: service_healthy}
+
+  dashboard:
+    build: {context: ../../apps/dashboard, dockerfile: Dockerfile}
+    environment:
+      GATEWAY_URL: http://gateway:8080
+      # Phải trùng token của gateway — dashboard là client có xác thực của nó.
+      GATEWAY_TOKEN: ${VYPQ_TOKEN:?bat buoc dat VYPQ_TOKEN}
+      # Bắt buộc, cùng lập trường với VYPQ_TOKEN: dashboard là proxy vào gateway,
+      # chạy không mật khẩu nghĩa là mở toàn bộ token máy GPU ra cổng 3001.
+      DASHBOARD_PASSWORD: ${DASHBOARD_PASSWORD:?bat buoc dat DASHBOARD_PASSWORD}
+      SESSION_SECRET: ${SESSION_SECRET:?bat buoc dat SESSION_SECRET (openssl rand -hex 32)}
+    # Cổng 3000 đã là Grafana.
+    ports: ["3001:3001"]
+    depends_on: [gateway]
 
   prometheus:
     image: prom/prometheus:v2.55.1

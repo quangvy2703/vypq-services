@@ -1,5 +1,7 @@
 import httpx
+import pytest
 import respx
+import structlog.testing
 from gateway.registry.services import ServiceEntry, ServiceRegistry
 from vypq_contracts.common import HealthStatus, Task
 
@@ -129,3 +131,50 @@ async def test_parse_failure_in_one_service_does_not_stop_another():
 
 def test_get_unknown_service_returns_none():
     assert _registry().get("khong-co") is None
+
+
+@pytest.mark.anyio
+@respx.mock
+async def test_state_mang_khoa_dinh_tuyen_chu_khong_phai_ten_tu_khai():
+    """`ServiceState.name` phải là khoá trong services.yaml, không phải info.name.
+
+    Gateway định tuyến `POST /v1/invoke` bằng khoá đó. Trước khi có trường này,
+    dashboard chỉ thấy `info.name` và gọi bằng nó — trùng nhau ở cấu hình mặc
+    định, nhưng lệch một chữ là mọi lần chạy thử trả 404 mà không chỗ nào nói
+    vì sao.
+    """
+    respx.get("http://doc:8003/v1/info").mock(
+        return_value=httpx.Response(200, json={**INFO_BODY, "name": "docreader"})
+    )
+    respx.get("http://doc:8003/ready").mock(return_value=httpx.Response(200, json={
+        "status": "ok", "service": "docreader", "version": "0.1.0", "detail": {}}))
+    reg = _registry(ServiceEntry(name="docsvc", base_url="http://doc:8003"))
+    await reg.refresh()
+
+    state = reg.get("docsvc")
+    assert state.name == "docsvc"
+    assert state.info.name == "docreader"
+    # Tra bằng tên tự khai không ra gì — đúng, vì nó không phải khoá định tuyến.
+    assert reg.get("docreader") is None
+    await reg.aclose()
+
+
+@pytest.mark.anyio
+@respx.mock
+async def test_canh_bao_khi_hai_ten_lech_nhau():
+    """Lệch tên trước đây hỏng hoàn toàn im lặng — ít nhất phải nói ra."""
+    respx.get("http://doc:8003/v1/info").mock(
+        return_value=httpx.Response(200, json={**INFO_BODY, "name": "docreader"})
+    )
+    respx.get("http://doc:8003/ready").mock(return_value=httpx.Response(200, json={
+        "status": "ok", "service": "docreader", "version": "0.1.0", "detail": {}}))
+    reg = _registry(ServiceEntry(name="docsvc", base_url="http://doc:8003"))
+
+    with structlog.testing.capture_logs() as logs:
+        await reg.refresh()
+
+    canh_bao = [e for e in logs if e["event"] == "service_name_mismatch"]
+    assert len(canh_bao) == 1
+    assert canh_bao[0]["service"] == "docsvc"
+    assert canh_bao[0]["declared"] == "docreader"
+    await reg.aclose()

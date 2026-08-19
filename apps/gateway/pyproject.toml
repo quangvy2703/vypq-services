@@ -12,6 +12,11 @@ dependencies = [
     "alembic>=1.14",
     "asyncpg>=0.30",
     "httpx>=0.27",
+    # POST /v1/invoke/upload nhận multipart; FastAPI ném RuntimeError ngay lúc
+    # dựng route nếu thiếu gói này. Trước đây nó chỉ có mặt nhờ workspace dev
+    # kéo vào qua model-host/services, nên gateway chạy được ở máy dev nhưng
+    # chết ngay khi đóng gói riêng.
+    "python-multipart>=0.0.12",
     "pyyaml>=6.0",
     "prometheus-client>=0.21",
 ]
