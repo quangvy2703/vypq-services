@@ -6,6 +6,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from vypq_contracts.gateway import HostRegistration, HostState
 from vypq_contracts.hosting import ModelInfo
+from vypq_core.host_registry import HostRef
 
 from gateway.db.models import Host
 
@@ -68,6 +69,44 @@ class HostRepo:
     async def list_all(self) -> list[HostState]:
         rows = (await self._s.execute(select(Host).order_by(Host.name))).scalars().all()
         return [_to_state(r) for r in rows]
+
+    async def list_all_refs(self, *, now: datetime, ttl_s: float) -> list[HostRef]:
+        """Đọc trạng thái và token trong CÙNG MỘT truy vấn, cùng một snapshot.
+
+        `/v1/discovery/hosts` cần cả trạng thái (healthy, models) lẫn token, và
+        trước đây lấy hai thứ đó bằng hai lượt đọc riêng (list_all() rồi
+        token_for() cho từng host). Giữa hai lượt đọc đó một host có thể bị
+        đăng ký lại — thuê máy theo giờ là chuyện bình thường, không phải lỗi
+        — và kết quả sẽ ghép URL CŨ với token MỚI, cùng cờ healthy=True sót lại
+        trong khi upsert() đã tự đặt lại về False vì URL đổi (upsert chủ đích
+        làm vậy để không định tuyến vào một tunnel chưa ai kiểm chứng). Đọc một
+        lần duy nhất, từ một snapshot, loại bỏ khả năng ghép lệch đó — đồng thời
+        gộp N truy vấn (một cho state, N cho token) thành một.
+        """
+        rows = (await self._s.execute(select(Host).order_by(Host.name))).scalars().all()
+        refs: list[HostRef] = []
+        for row in rows:
+            elapsed = (
+                None
+                if row.last_seen_at is None
+                else (now - row.last_seen_at).total_seconds()
+            )
+            # Chặn cả hai đầu. Hiệu ÂM nghĩa là đồng hồ lệch (nhiều replica
+            # gateway, hoặc NTP trôi), và `<= ttl` một mình sẽ cho qua vô điều
+            # kiện — host đó khoẻ vĩnh viễn, đúng ngược lại mục đích của việc
+            # tính lại độ tươi ở đây. Lệch đồng hồ là bất thường, mà bất thường
+            # thì không được nhận việc.
+            fresh = elapsed is not None and 0 <= elapsed <= ttl_s
+            refs.append(
+                HostRef(
+                    name=row.name,
+                    url=row.url,
+                    token=row.token,
+                    models=[ModelInfo.model_validate(m) for m in (row.models_json or [])],
+                    healthy=row.healthy and fresh,
+                )
+            )
+        return refs
 
     async def delete(self, name: str) -> bool:
         result = await self._s.execute(sql_delete(Host).where(Host.name == name))

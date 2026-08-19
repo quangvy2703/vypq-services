@@ -1,4 +1,5 @@
 from datetime import UTC, datetime, timedelta
+from unittest.mock import patch
 
 import httpx
 import pytest
@@ -78,3 +79,41 @@ async def test_never_polled_host_is_unhealthy(ctx):
 async def test_empty_registry_returns_empty_list(ctx):
     client, _ = ctx
     assert (await client.get("/v1/discovery/hosts")).json()["hosts"] == []
+
+
+async def test_future_last_seen_is_served_as_unhealthy(ctx):
+    # Đây là lệch đồng hồ, không phải chuyện độ tươi bình thường: last_seen_at
+    # ở TƯƠNG LAI (nhiều replica gateway, hoặc NTP trôi) khiến hiệu số âm. Chỉ
+    # kiểm tra `<= ttl` sẽ cho qua vô điều kiện, và host coi như khoẻ vĩnh viễn
+    # dù nó có thể đã chết từ lâu. seen_ago_s âm nghĩa là last_seen_at ở tương lai.
+    client, factory = ctx
+    await _healthy_host(factory, seen_ago_s=-30.0)
+    hosts = (await client.get("/v1/discovery/hosts")).json()["hosts"]
+    assert hosts[0]["healthy"] is False
+
+
+async def test_host_seen_exactly_at_ttl_boundary_is_healthy(ctx):
+    # Biên `elapsed == ttl` được chọn là KHOẺ (<=, không phải <): quyết định có
+    # chủ đích, không phải tình cờ, để pin lại hành vi ở đúng ranh giới. `now`
+    # bị đóng băng vì so sánh giây trên đồng hồ tường (wall clock) thật sẽ luôn
+    # trôi thêm vài micro giây giữa lúc ghi last_seen_at và lúc endpoint đọc
+    # `datetime.now()`, khiến elapsed nhỉnh hơn ttl và bài test tự nhiên flaky.
+    client, factory = ctx
+    fixed_now = datetime(2026, 1, 1, tzinfo=UTC)
+    async with factory() as s:
+        await HostRepo(s).upsert(
+            HostRegistration(name="gpu-1", url="http://h:9000", token="bi-mat")
+        )
+        await HostRepo(s).mark_polled("gpu-1", healthy=True, models=[_model()], error=None)
+        row = await s.get(Host, "gpu-1")
+        row.last_seen_at = fixed_now - timedelta(seconds=SETTINGS.host_ttl_s)
+        await s.commit()
+
+    class _FixedDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return fixed_now
+
+    with patch("gateway.api.discovery.datetime", _FixedDateTime):
+        hosts = (await client.get("/v1/discovery/hosts")).json()["hosts"]
+    assert hosts[0]["healthy"] is True

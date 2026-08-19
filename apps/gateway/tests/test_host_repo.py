@@ -162,6 +162,26 @@ async def test_registered_at_comes_back_aware(session):
     assert row.registered_at.tzinfo is not None
 
 
+async def test_list_all_refs_returns_token_together_with_state_in_one_call(session):
+    repo = HostRepo(session)
+    await repo.upsert(HostRegistration(name="gpu-1", url="http://h:9000", token="bi-mat"))
+    await repo.mark_polled("gpu-1", healthy=True, models=[_model("a")], error=None)
+
+    refs = await repo.list_all_refs(now=datetime.now(UTC), ttl_s=45.0)
+
+    assert len(refs) == 1
+    ref = refs[0]
+    assert ref.name == "gpu-1"
+    assert ref.url == "http://h:9000"
+    assert ref.token == "bi-mat"
+    assert ref.healthy is True
+    assert [m.id for m in ref.models] == ["a"]
+
+
+async def test_list_all_refs_on_empty_registry_returns_empty_list(session):
+    assert await HostRepo(session).list_all_refs(now=datetime.now(UTC), ttl_s=45.0) == []
+
+
 async def test_reregistering_same_url_with_new_token_keeps_health_and_models(session):
     # Cùng URL nghĩa là cùng máy — chỉ đổi credential, không phải đổi máy. healthy
     # và danh sách model đã biết phải giữ nguyên, khác với trường hợp đổi URL.
