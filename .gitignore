@@ -9,6 +9,10 @@ node_modules/
 *.tsbuildinfo
 dist/
 build/
+# output của Playwright (Task 12 — e2e dashboard)
+test-results/
+playwright-report/
+blob-report/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/

@@ -1,10 +1,8 @@
 "use client";
 
-import { useRouter } from "next/navigation";
 import { useState } from "react";
 
 export function LoginForm() {
-  const router = useRouter();
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [pending, setPending] = useState(false);
@@ -21,9 +19,11 @@ export function LoginForm() {
       setError("Sai mật khẩu");
       return;
     }
-    // replace chứ không push: nút Back không nên quay về trang đăng nhập.
-    router.replace("/hosts");
-    router.refresh();
+    // Điều hướng cứng chứ không router.replace: đăng nhập là một lần đổi quyền,
+    // và mọi thứ Router Cache phía client ghi lại lúc CHƯA có phiên (mọi trang
+    // đều bị middleware đẩy về /login) đều đã sai kể từ giây này. Tải lại cả
+    // trang là cách duy nhất chắc chắn vứt hết đống đó đi.
+    window.location.assign("/hosts");
   }
 
   return (

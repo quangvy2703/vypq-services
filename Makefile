@@ -1,4 +1,4 @@
-.PHONY: test test-all test-web lint lint-web fmt typecheck
+.PHONY: test test-all test-web test-web-e2e lint lint-web fmt typecheck
 test:
 	uv run pytest
 test-all:
@@ -13,3 +13,5 @@ test-web:
 	cd apps/dashboard && pnpm install --frozen-lockfile && pnpm test
 lint-web:
 	cd apps/dashboard && pnpm install --frozen-lockfile && pnpm lint
+test-web-e2e:
+	cd apps/dashboard && pnpm install --frozen-lockfile && pnpm exec playwright install --with-deps chromium && pnpm test:e2e
