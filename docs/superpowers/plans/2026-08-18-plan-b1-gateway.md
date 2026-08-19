@@ -2807,6 +2807,10 @@ class SyncProxy:
         self, service: str, data: bytes, filename: str,
         model_version: str | None, trace_id: str | None = None,
     ) -> RunRecord:
+        # Ranh giới ghi `runs`: những lần TỪ CHỐI phía gateway (không có service,
+        # chưa từng poll được, đã biết là DOWN) KHÔNG tạo dòng nào — chưa có gì
+        # chạy nên chưa có gì để ghi lịch sử. Từ lúc đã gửi request đi thì mọi
+        # kết cục, kể cả hỏng, đều phải có một dòng.
         state = self._registry.get(service)
         if state is None:
             raise ServiceError(ErrorCode.BAD_INPUT, f"không có service '{service}'", 404)
@@ -2869,7 +2873,7 @@ class SyncProxy:
 ```python
 import uuid
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, Request, UploadFile
 
 from gateway.proxy import SyncProxy
 from vypq_contracts.common import ErrorCode
@@ -2882,12 +2886,18 @@ def build_invoke_router(proxy: SyncProxy, dispatcher=None) -> APIRouter:
 
     @router.post("/invoke/upload", response_model=InvokeResponse)
     async def invoke_upload(
+        request: Request,
         service: str = Form(...),
         model_version: str | None = Form(default=None),
         file: UploadFile = File(...),
     ) -> InvokeResponse:
+        # Nhận trace_id của người gọi nếu có. Middleware đã echo header đó ra
+        # response, nên nếu ở đây tự sinh UUID mới thì header, body, dòng runs và
+        # lời gọi xuống service sẽ mang hai giá trị khác nhau — người vận hành
+        # lần theo header sẽ không bao giờ tìm ra run.
         record = await proxy.invoke(
-            service, await file.read(), file.filename or "input", model_version
+            service, await file.read(), file.filename or "input", model_version,
+            trace_id=request.headers.get("x-trace-id"),
         )
         return InvokeResponse(
             trace_id=record.trace_id, mode=InvokeMode.SYNC,
@@ -2895,7 +2905,8 @@ def build_invoke_router(proxy: SyncProxy, dispatcher=None) -> APIRouter:
         )
 
     @router.post("/invoke", response_model=InvokeResponse)
-    async def invoke(request: InvokeRequest) -> InvokeResponse:
+    async def invoke(request: InvokeRequest, http: Request) -> InvokeResponse:
+        incoming_trace = http.headers.get("x-trace-id")
         if not request.input_uri:
             raise ServiceError(ErrorCode.BAD_INPUT, "thiếu input_uri", 422)
         if request.mode is InvokeMode.ASYNC:
@@ -2903,13 +2914,14 @@ def build_invoke_router(proxy: SyncProxy, dispatcher=None) -> APIRouter:
                 raise ServiceError(
                     ErrorCode.BAD_INPUT, "gateway này chưa bật đường async", 501
                 )
-            trace = uuid.uuid4().hex
+            trace = incoming_trace or uuid.uuid4().hex
             await dispatcher.dispatch(request, trace)
             return InvokeResponse(trace_id=trace, mode=InvokeMode.ASYNC)
 
         data = await proxy.fetch(request.input_uri)
         record = await proxy.invoke(
-            request.service, data, "input", request.model_version
+            request.service, data, "input", request.model_version,
+            trace_id=incoming_trace,
         )
         return InvokeResponse(
             trace_id=record.trace_id, mode=InvokeMode.SYNC,
