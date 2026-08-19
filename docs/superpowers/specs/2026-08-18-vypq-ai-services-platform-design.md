@@ -593,6 +593,20 @@ tranh luận lại — và để Plan B, C không vấp phải.
   kêu và tạo cảm giác an toàn giả. Muốn có lag thì tính bằng PromQL từ hai gauge
   sẵn có: `redpanda_kafka_max_offset - redpanda_kafka_consumer_group_committed_offset`,
   join theo topic/partition/group. Kiểm bằng query thật trước khi đặt ngưỡng.
+- **Gateway CHƯA CÓ xác thực, và compose mở nó ra mọi interface.** Ai với tới cổng
+  8080 đều `GET /v1/discovery/hosts` để lấy token của mọi máy GPU đang thuê, hoặc
+  `POST /v1/hosts` để trỏ một tên host sang URL của họ. Việc tách hai endpoint là
+  để dashboard không rò token, KHÔNG phải để chống mạng. Plan B2 làm điều này gắt
+  hơn vì gateway phải với được từ nơi trình duyệt chạy. Chưa quyết — xem mục dưới.
+- **`GET /v1/runs?service=...` bỏ sót dòng gán nhãn fallback.** Khi result consumer
+  không khớp được service nào, nó quy run về `task.value`. Plan C join theo
+  trace/run id nên chấm điểm vẫn đúng, nhưng lọc theo service thì thiếu. Nên log
+  cảnh báo khi fallback kích hoạt.
+- **Gateway async API chưa mang được metadata đánh giá.** `InvokeRequest` không có
+  `eval_job_id`/`dataset_item_id` và `Dispatcher` không đặt chúng, dù schema event
+  và worker đã truyền xuyên suốt. Evaluator của Plan C do đó phải publish
+  `InferenceRequested` thẳng vào Kafka thay vì gọi `POST /v1/invoke` — ghi rõ ở đây
+  để Plan C không thiết kế vòng quanh gateway.
 - **Cần metric và alert trên `dlq_publish_failed` + `consumer_paused`** trước khi
   chạy không người trông. DLQ hỏng vĩnh viễn sẽ kẹt cả partition, im lặng.
   Đây là bước 10 trong lộ trình Plan B.
