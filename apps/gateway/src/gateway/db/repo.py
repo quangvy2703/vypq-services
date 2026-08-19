@@ -1,16 +1,17 @@
+import uuid
 from datetime import UTC, datetime
 from typing import cast
 
 from sqlalchemy import delete as sql_delete
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
-from vypq_contracts.gateway import HostRegistration, HostState
+from vypq_contracts.gateway import HostRegistration, HostState, InvokeMode, RunRecord, RunStatus
 from vypq_contracts.hosting import ModelInfo
 from vypq_core.host_registry import HostRef
 
-from gateway.db.models import Host
+from gateway.db.models import Host, Run
 
 
 def _to_state(row: Host) -> HostState:
@@ -139,3 +140,90 @@ class HostRepo:
     async def token_for(self, name: str) -> str | None:
         row = await self._s.get(Host, name)
         return None if row is None else row.token
+
+
+def _to_run(row: Run) -> RunRecord:
+    return RunRecord(
+        id=row.id, trace_id=row.trace_id, service=row.service,
+        model_version=row.model_version or None, mode=InvokeMode(row.mode),
+        status=RunStatus(row.status), input_uri=row.input_uri,
+        output=row.output_json, latency_ms=row.latency_ms, error=row.error,
+        created_at=row.created_at,
+    )
+
+
+class RunRepo:
+    """Nơi duy nhất chạm bảng `runs`."""
+
+    def __init__(self, session: AsyncSession) -> None:
+        self._s = session
+
+    async def record(
+        self,
+        *,
+        trace_id: str,
+        service: str,
+        model_version: str | None,
+        mode: InvokeMode,
+        status: RunStatus,
+        input_uri: str | None,
+        output: dict | None,
+        latency_ms: int | None,
+        error: str | None,
+    ) -> RunRecord:
+        key = model_version or ""
+        existing = (
+            await self._s.execute(
+                select(Run).where(Run.trace_id == trace_id, Run.model_version == key)
+            )
+        ).scalar_one_or_none()
+        if existing is not None:
+            # Đã ghi rồi: Kafka giao ít nhất một lần nên bản sao là bình thường,
+            # không phải lỗi. Giữ bản đầu, không đè.
+            return _to_run(existing)
+
+        row = Run(
+            id=uuid.uuid4().hex, trace_id=trace_id, service=service,
+            model_version=key, mode=mode.value, status=status.value,
+            input_uri=input_uri, output_json=output, latency_ms=latency_ms,
+            error=error, created_at=datetime.now(UTC),
+        )
+        self._s.add(row)
+        await self._s.commit()
+        return _to_run(row)
+
+    async def get(self, run_id: str) -> RunRecord | None:
+        row = await self._s.get(Run, run_id)
+        return None if row is None else _to_run(row)
+
+    async def list_runs(
+        self,
+        *,
+        trace_id: str | None = None,
+        service: str | None = None,
+        status: RunStatus | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> tuple[list[RunRecord], int]:
+        filters = []
+        if trace_id is not None:
+            # Đường async chỉ trả về trace_id, không trả run_id (kết quả có thể
+            # về từ nhiều model version). Thiếu bộ lọc này thì người gọi async
+            # không có cách nào tìm lại kết quả của chính mình.
+            filters.append(Run.trace_id == trace_id)
+        if service is not None:
+            filters.append(Run.service == service)
+        if status is not None:
+            filters.append(Run.status == status.value)
+
+        total = (
+            await self._s.execute(select(func.count()).select_from(Run).where(*filters))
+        ).scalar_one()
+        rows = (
+            await self._s.execute(
+                select(Run).where(*filters)
+                .order_by(Run.created_at.desc(), Run.id.desc())
+                .limit(limit).offset(offset)
+            )
+        ).scalars().all()
+        return [_to_run(r) for r in rows], total
