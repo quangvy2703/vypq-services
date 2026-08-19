@@ -1,3 +1,5 @@
+import asyncio
+
 import httpx
 import pytest
 import respx
@@ -112,3 +114,50 @@ async def test_malformed_models_body_marks_unhealthy(factory):
 
 async def test_poll_with_no_hosts_is_a_noop(factory):
     assert await _poller(factory).poll_once() == 0
+
+
+@respx.mock
+async def test_db_failure_on_one_host_does_not_stop_the_others(factory, monkeypatch):
+    # gpu-1 sẽ hỏng lúc ghi DB (không phải lúc gọi HTTP); gpu-2 vẫn phải được
+    # poll và ghi nhận bình thường, và poll_once() vẫn phải trả đủ số host.
+    await _register(factory, name="gpu-1", url="http://a:9000")
+    await _register(factory, name="gpu-2", url="http://b:9000")
+    respx.get("http://a:9000/v1/models").mock(return_value=httpx.Response(200, json=MODELS_BODY))
+    respx.get("http://b:9000/v1/models").mock(return_value=httpx.Response(200, json=MODELS_BODY))
+
+    original_mark_polled = HostRepo.mark_polled
+
+    async def _flaky_mark_polled(self, name, *args, **kwargs):
+        if name == "gpu-1":
+            raise RuntimeError("ghi DB hỏng")
+        return await original_mark_polled(self, name, *args, **kwargs)
+
+    monkeypatch.setattr(HostRepo, "mark_polled", _flaky_mark_polled)
+
+    assert await _poller(factory).poll_once() == 2
+    async with factory() as s:
+        repo = HostRepo(s)
+        assert (await repo.get("gpu-2")).healthy is True
+
+
+@respx.mock
+async def test_cancelled_error_in_one_host_propagates_out_of_poll_once(factory):
+    # CancelledError là tín hiệu shutdown, không phải lỗi của host: nó phải
+    # bay ra khỏi poll_once() thay vì bị nuốt, nếu không lifespan sẽ treo.
+    await _register(factory, name="gpu-1", url="http://a:9000")
+    await _register(factory, name="gpu-2", url="http://b:9000")
+    respx.get("http://a:9000/v1/models").mock(return_value=httpx.Response(200, json=MODELS_BODY))
+    respx.get("http://b:9000/v1/models").mock(return_value=httpx.Response(200, json=MODELS_BODY))
+
+    poller = _poller(factory)
+    original_poll_host = poller._poll_host
+
+    async def _cancelling_poll_host(client, name, url):
+        if name == "gpu-1":
+            raise asyncio.CancelledError()
+        return await original_poll_host(client, name, url)
+
+    poller._poll_host = _cancelling_poll_host
+
+    with pytest.raises(asyncio.CancelledError):
+        await poller.poll_once()
