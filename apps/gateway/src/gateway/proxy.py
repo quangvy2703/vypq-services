@@ -87,12 +87,40 @@ class SyncProxy:
             error = str(exc)
 
         latency_ms = int((time.monotonic() - started) * 1000)
-        async with self._factory() as session:
-            record = await RunRepo(session).record(
-                trace_id=trace, service=service, model_version=resolved,
-                mode=InvokeMode.SYNC, status=status, input_uri=None,
-                output=output, latency_ms=latency_ms, error=error,
-            )
+        try:
+            async with self._factory() as session:
+                record = await RunRepo(session).record(
+                    trace_id=trace, service=service, model_version=resolved,
+                    mode=InvokeMode.SYNC, status=status, input_uri=None,
+                    output=output, latency_ms=latency_ms, error=error,
+                    # Đường sync tôn trọng x-trace-id do CALLER chọn. Dedup
+                    # theo (trace_id, model_version) là đúng khi trace_id do
+                    # Kafka phát ra (đường async/result_consumer), nhưng với
+                    # trace_id do client chọn thì trùng nghĩa là hai request
+                    # KHÁC NHAU tình cờ/chủ đích trùng header — trả lại row cũ
+                    # là ÂM THẦM TRẢ NHẦM KẾT QUẢ cho caller thứ hai (INVOICE B
+                    # chạy xong, GPU tốn thời gian, nhưng caller nhận INVOICE
+                    # A). Ép record() từ chối thay vì dedup ở đúng nhánh gọi
+                    # này.
+                    reject_duplicate_trace=True,
+                )
+        except ServiceError:
+            # ServiceError là lỗi ĐÃ ĐƯỢC PHÂN LOẠI ĐÚNG bởi chính record() ở
+            # trên (trace_id trùng là lỗi của CLIENT, không phải hạ tầng) —
+            # để nó bay thẳng ra, không phải chạy tiếp vào nhánh except Exception
+            # bên dưới rồi bị gán nhầm thành 503 hạ tầng.
+            raise
+        except Exception as exc:
+            # Cùng lỗ hổng như result_consumer.py: DB không kết nối được (ổ cắm
+            # chết, container restart) ném OSError trần, không phải
+            # SQLAlchemyError — allowlist theo kiểu exception đã lọt bug này
+            # bốn lần trước rồi trên nhánh kia. Ở đây mọi lỗi của khối ghi DB
+            # (trừ ServiceError đã bắt ở trên) đều là hạ tầng: một kết quả
+            # inference ĐÃ CHẠY XONG không được phép biến thành 500 mù mờ —
+            # phải là 503 nói rõ lý do.
+            raise ServiceError(
+                ErrorCode.UPSTREAM_ERROR, f"không ghi được run vào DB: {exc}", 503
+            ) from exc
         if status is RunStatus.FAILED:
             # Ghi xong rồi mới ném: lỗi là lúc lịch sử có giá trị nhất.
             raise ServiceError(ErrorCode.UPSTREAM_ERROR, error or "service lỗi", 502)

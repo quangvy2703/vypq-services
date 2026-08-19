@@ -1,3 +1,4 @@
+import asyncio
 from dataclasses import dataclass, field
 
 import pytest
@@ -431,3 +432,66 @@ async def test_failing_dlq_publish_increments_its_own_counter():
     c = _consumer(kafka, BrokenProducer(), handler, max_attempts=1)
     await c.run_once()
     assert _value("vypq_events_dlq_publish_failed_total", "infer.ocr.dlq") == before + 1
+
+
+async def test_run_survives_a_broker_io_failure_and_keeps_looping():
+    # Toàn bộ cơ chế pause/rewind chỉ bảo vệ khỏi exception của HANDLER.
+    # getmany()/commit() nằm ngoài mọi try trong run_once() — một lỗi I/O
+    # broker thô (rebalance -> CommitFailedError, mất kết nối, v.v.) trước bản
+    # sửa sẽ bay thẳng ra khỏi run_once() và kết liễu `while True` trong
+    # run() vĩnh viễn. Giả lập bằng getmany() ném lỗi vài lần đầu rồi hết —
+    # giống một broker chớp nhoáng rồi hồi phục — và chứng minh run() vẫn còn
+    # sống, còn gọi getmany() tiếp, sau khi lỗi đó xảy ra.
+    calls = {"n": 0}
+
+    class FlakyConsumer(FakeConsumer):
+        async def getmany(self, timeout_ms: int = 1000, max_records: int | None = None):
+            calls["n"] += 1
+            # sleep(0) THẬT SỰ nhường quyền điều khiển cho event loop mỗi
+            # vòng. FakeConsumer thật (giống mọi fake khác trong file này) và
+            # _noop_sleep đều là coroutine không await gì thật cả — nếu thiếu
+            # điểm nhường quyền này, run()'s `while True` (không có await nào
+            # từng thật sự treo) chiếm trọn event loop và task.cancel() không
+            # bao giờ được giao, treo cả tiến trình pytest.
+            await asyncio.sleep(0)
+            if calls["n"] <= 3:
+                raise RuntimeError("mất kết nối broker")
+            return await super().getmany(timeout_ms, max_records)
+
+    async def handler(_env):  # pragma: no cover - không có message nào tới
+        raise AssertionError("không nên được gọi")
+
+    kafka = FlakyConsumer()
+    c = _consumer(kafka, FakeProducer(), handler, pause_seconds=0.0)
+    task = asyncio.create_task(c.run())
+    try:
+        for _ in range(200):
+            if calls["n"] > 3:
+                break
+            await asyncio.sleep(0.001)
+        assert calls["n"] > 3, "run() phải tiếp tục gọi getmany() sau khi nó ném lỗi"
+        assert not task.done(), "run() không được chết vì lỗi I/O của broker"
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+
+async def test_run_propagates_cancellation_instead_of_swallowing_it():
+    # CancelledError là tín hiệu SHUTDOWN, không phải lỗi hạ tầng — phải bay
+    # tiếp, nếu không lifespan của app sẽ treo lúc tắt (giống lý do
+    # HostPoller.poll_once() phân biệt CancelledError với Exception thường).
+    class HangingConsumer(FakeConsumer):
+        async def getmany(self, timeout_ms: int = 1000, max_records: int | None = None):
+            await asyncio.sleep(10)
+            return {}
+
+    async def handler(_env):  # pragma: no cover
+        raise AssertionError("không nên được gọi")
+
+    c = _consumer(HangingConsumer(), FakeProducer(), handler)
+    task = asyncio.create_task(c.run())
+    await asyncio.sleep(0.01)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task

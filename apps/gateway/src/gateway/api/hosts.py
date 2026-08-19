@@ -1,3 +1,5 @@
+from datetime import UTC, datetime
+
 from fastapi import APIRouter, Response
 from vypq_contracts.common import ErrorCode
 from vypq_contracts.gateway import HostRegistration, HostsResponse, HostState
@@ -17,8 +19,14 @@ def build_hosts_router(session_factory, settings: GatewaySettings) -> APIRouter:
 
     @router.get("/hosts", response_model=HostsResponse)
     async def list_hosts() -> HostsResponse:
+        # Tính lại độ tươi giống hệt /v1/discovery/hosts (xem
+        # HostRepo.list_all_states docstring): dashboard không được nói dối
+        # rằng một host quá hạn (poller treo) vẫn khoẻ trong khi mọi service
+        # định tuyến qua đường kia đã coi nó là chết.
+        now = datetime.now(UTC)
         async with session_factory() as session:
-            return HostsResponse(hosts=await HostRepo(session).list_all())
+            hosts = await HostRepo(session).list_all_states(now=now, ttl_s=settings.host_ttl_s)
+        return HostsResponse(hosts=hosts)
 
     @router.delete("/hosts/{name}", status_code=204)
     async def delete_host(name: str) -> Response:

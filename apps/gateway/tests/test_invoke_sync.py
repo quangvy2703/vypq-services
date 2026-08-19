@@ -212,6 +212,53 @@ async def test_model_version_is_forwarded_to_the_service(ctx):
 
 
 @respx.mock
+async def test_duplicate_caller_trace_id_is_rejected_not_substituted(ctx):
+    # Bug gốc do reviewer tái hiện: gateway tôn trọng x-trace-id của caller, và
+    # RunRepo.record() dedup theo (trace_id, model_version) trả về BẢN CŨ. Hai
+    # lần gọi sync với cùng header đó khiến caller thứ hai nhận kết quả của
+    # caller thứ nhất — INVOICE B chạy xong trên GPU (tốn thời gian thật) rồi
+    # bị vứt, caller nhận nhầm INVOICE A. Đường sync giờ phải từ chối bằng lỗi
+    # rõ ràng (409) thay vì âm thầm trả nhầm dữ liệu.
+    client, factory, _reg = ctx
+    calls = {"n": 0}
+
+    def _respond(request: httpx.Request) -> httpx.Response:
+        calls["n"] += 1
+        doc = "INVOICE A" if calls["n"] == 1 else "INVOICE B"
+        return httpx.Response(
+            200,
+            json={
+                "trace_id": "t1", "model_version": "m1", "latency_ms": 12,
+                "result": {"full_text": doc, "boxes": []},
+            },
+        )
+
+    respx.post("http://ocr:8001/v1/ocr").mock(side_effect=_respond)
+
+    first = await client.post(
+        "/v1/invoke/upload", data={"service": "ocr"},
+        files={"file": ("a.png", b"x", "image/png")},
+        headers={"x-trace-id": "cung-mot-trace"},
+    )
+    assert first.status_code == 200
+    assert first.json()["result"]["full_text"] == "INVOICE A"
+
+    second = await client.post(
+        "/v1/invoke/upload", data={"service": "ocr"},
+        files={"file": ("b.png", b"y", "image/png")},
+        headers={"x-trace-id": "cung-mot-trace"},
+    )
+    # KHÔNG được là 200 với kết quả của INVOICE A: phải là lỗi khách hàng rõ
+    # ràng, không phải sự thay thế kết quả im lặng.
+    assert second.status_code == 409
+
+    async with factory() as s:
+        runs, total = await RunRepo(s).list_runs(trace_id="cung-mot-trace")
+    assert total == 1
+    assert runs[0].output["full_text"] == "INVOICE A"
+
+
+@respx.mock
 async def test_input_uri_is_fetched_then_forwarded_as_multipart(ctx):
     # Service chỉ có một đường vào là multipart; tự tải URI là việc của worker.
     client, _factory, _reg = ctx

@@ -1,6 +1,5 @@
 from collections.abc import Callable
 
-from sqlalchemy.exc import SQLAlchemyError
 from vypq_contracts.common import Task
 from vypq_contracts.gateway import InvokeMode, RunStatus
 from vypq_core.http_client import UpstreamError
@@ -31,11 +30,21 @@ def make_result_handler(session_factory, service_name_for: Callable[[Task], str]
                     latency_ms=completed.latency_ms,
                     error=None,
                 )
-        except SQLAlchemyError as exc:
-            # DB chập chờn là sự cố HẠ TẦNG, không phải dữ liệu hỏng. Không bọc
-            # thì consumer dead-letter một KẾT QUẢ INFERENCE ĐÃ CHẠY XONG —
-            # inference thành công rồi, chỉ mỗi lần ghi trượt. Bọc thành
-            # UpstreamError để consumer dừng chờ DB quay lại.
+        except Exception as exc:
+            # Từng bọc mỗi SQLAlchemyError — vẫn lọt OSError khi Postgres chết
+            # hẳn (container restart, network partition, DNS lỗi): asyncpg thất
+            # bại ngay ở connect(), TRƯỚC KHI có kết nối DBAPI để SQLAlchemy bọc
+            # lại thành SQLAlchemyError. Đây là lần thứ năm một kiểu exception
+            # hạ tầng lọt qua allowlist kiểu exception trên nhánh này — liệt kê
+            # từng loại là trò chơi không bao giờ thắng được. Đảo lại quy tắc:
+            # trong handler này, đúng MỘT lỗi là dữ liệu hỏng — model_validate ở
+            # trên thất bại — nên nó nằm NGOÀI khối try này và được ném thẳng ra
+            # để dead-letter. Mọi lỗi của khối ghi DB, bất kể hình dạng gì
+            # (OperationalError, OSError, hay bất cứ thứ gì asyncpg/SQLAlchemy
+            # tương lai còn ném ra), đều là hạ tầng: DB chập chờn khi ghi một
+            # KẾT QUẢ INFERENCE ĐÃ CHẠY XONG (GPU đã tốn thời gian, kết quả đã
+            # có) không bao giờ là lỗi dữ liệu. Bọc thành UpstreamError để
+            # consumer dừng chờ DB quay lại thay vì mất kết quả.
             raise UpstreamError(f"không ghi được run vào DB: {exc}") from exc
 
     return handle

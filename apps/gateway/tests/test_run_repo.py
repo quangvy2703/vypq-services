@@ -5,6 +5,7 @@ from gateway.db.models import Base
 from gateway.db.repo import RunRepo
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from vypq_contracts.gateway import InvokeMode, RunStatus
+from vypq_core.errors import ServiceError
 
 
 @pytest.fixture
@@ -148,3 +149,58 @@ async def test_concurrent_record_of_the_same_key_does_not_raise(factory):
     async with factory() as s:
         _runs, total = await RunRepo(s).list_runs(trace_id="dua")
     assert total == 1
+
+
+async def test_default_mode_still_dedups_for_the_async_result_path(session):
+    # Đường async/result_consumer: trace_id do CHÍNH GATEWAY sinh ra rồi Kafka
+    # giao lại — Kafka giao ít nhất một lần nên trùng LÀ cùng một kết quả tới
+    # hai lần. reject_duplicate_trace mặc định False, hành vi cũ giữ nguyên.
+    repo = RunRepo(session)
+    first = await _record(repo, trace_id="t-async")
+    second = await _record(repo, trace_id="t-async")
+    assert first.id == second.id
+
+
+async def test_reject_duplicate_trace_raises_service_error_409(session):
+    # Đường sync: trace_id do CLIENT chọn (x-trace-id). Trùng nghĩa là hai
+    # request khác nhau tình cờ/chủ đích trùng header, không phải bản sao
+    # Kafka lành tính. Trả về bản cũ ở đây sẽ ÂM THẦM đưa kết quả của request
+    # thứ nhất cho caller thứ hai — phải từ chối bằng lỗi rõ ràng thay vì đó.
+    repo = RunRepo(session)
+    await _record(repo, trace_id="t-sync")
+    with pytest.raises(ServiceError) as excinfo:
+        await repo.record(
+            trace_id="t-sync", service="ocr", model_version="m1",
+            mode=InvokeMode.SYNC, status=RunStatus.OK, input_uri="s3://b/b.jpg",
+            output={"full_text": "khac"}, latency_ms=1, error=None,
+            reject_duplicate_trace=True,
+        )
+    assert excinfo.value.http_status == 409
+    # Bản gốc phải còn nguyên — không bị ghi đè, không có bản thứ hai xuất hiện.
+    runs, total = await repo.list_runs(trace_id="t-sync")
+    assert total == 1
+    assert runs[0].output["full_text"] == "xin chào"
+
+
+async def test_reject_duplicate_trace_also_applies_to_the_concurrent_race(factory):
+    # Nhánh IntegrityError (thua cuộc đua ghi) phải cùng quy tắc với nhánh
+    # SELECT trước đó: một trong hai request đồng thời phải bị từ chối, không
+    # được lặng lẽ trả về kết quả của bên thắng.
+    async def once(output):
+        async with factory() as s:
+            return await RunRepo(s).record(
+                trace_id="t-race", service="ocr", model_version="m1",
+                mode=InvokeMode.SYNC, status=RunStatus.OK, input_uri=None,
+                output=output, latency_ms=1, error=None,
+                reject_duplicate_trace=True,
+            )
+
+    results = await asyncio.gather(
+        once({"doc": "A"}), once({"doc": "B"}), return_exceptions=True
+    )
+    oks = [r for r in results if not isinstance(r, Exception)]
+    errs = [r for r in results if isinstance(r, Exception)]
+    assert len(oks) == 1
+    assert len(errs) == 1
+    assert isinstance(errs[0], ServiceError)
+    assert errs[0].http_status == 409

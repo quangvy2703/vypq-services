@@ -7,11 +7,26 @@ from sqlalchemy import func, select
 from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from vypq_contracts.common import ErrorCode
 from vypq_contracts.gateway import HostRegistration, HostState, InvokeMode, RunRecord, RunStatus
 from vypq_contracts.hosting import ModelInfo
+from vypq_core.errors import ServiceError
 from vypq_core.host_registry import HostRef
 
 from gateway.db.models import Host, Run
+
+
+def _is_fresh(last_seen_at: datetime | None, *, now: datetime, ttl_s: float) -> bool:
+    # Dùng chung giữa list_all_states() và list_all_refs() để hai endpoint
+    # KHÔNG THỂ lệch nhau về định nghĩa "tươi" — trùng lặp công thức này ở hai
+    # chỗ là đúng loại lỗi khiến dashboard và routing bất đồng với nhau.
+    if last_seen_at is None:
+        return False
+    elapsed = (now - last_seen_at).total_seconds()
+    # Chặn cả hai đầu. Hiệu ÂM nghĩa là đồng hồ lệch (nhiều replica gateway,
+    # hoặc NTP trôi), và `<= ttl` một mình sẽ cho qua vô điều kiện — host đó
+    # khoẻ vĩnh viễn, đúng ngược lại mục đích của việc tính lại độ tươi ở đây.
+    return 0 <= elapsed <= ttl_s
 
 
 def _to_state(row: Host) -> HostState:
@@ -73,6 +88,31 @@ class HostRepo:
         rows = (await self._s.execute(select(Host).order_by(Host.name))).scalars().all()
         return [_to_state(r) for r in rows]
 
+    async def list_all_states(self, *, now: datetime, ttl_s: float) -> list[HostState]:
+        """Như list_all(), nhưng tính lại độ tươi giống list_all_refs() (xem
+        docstring ở đó — cùng công thức, cùng chặn lệch đồng hồ).
+
+        `GET /v1/hosts` (dashboard) trước đây gọi list_all() và trả thẳng cờ
+        `healthy` đã lưu trong DB — cờ đó đóng băng ở lần poll cuối. Nếu poller
+        treo, dashboard báo `healthy=True` cho một host mà MỌI service qua
+        `/v1/discovery/hosts` đã coi là chết (route vẫn an toàn vì nó luôn đi
+        qua list_all_refs()), nhưng dashboard nói dối. Kế hoạch tiếp theo dựng
+        trên đúng con số này, nên hai endpoint phải đồng ý với nhau — không
+        đọc token, khác list_all_refs() ở đúng chỗ đó.
+        """
+        rows = (await self._s.execute(select(Host).order_by(Host.name))).scalars().all()
+        return [
+            HostState(
+                name=row.name,
+                url=row.url,
+                healthy=row.healthy and _is_fresh(row.last_seen_at, now=now, ttl_s=ttl_s),
+                models=[ModelInfo.model_validate(m) for m in (row.models_json or [])],
+                last_seen_at=row.last_seen_at,
+                last_error=row.last_error,
+            )
+            for row in rows
+        ]
+
     async def list_all_refs(self, *, now: datetime, ttl_s: float) -> list[HostRef]:
         """Đọc trạng thái và token trong CÙNG MỘT truy vấn, cùng một snapshot.
 
@@ -87,29 +127,16 @@ class HostRepo:
         gộp N truy vấn (một cho state, N cho token) thành một.
         """
         rows = (await self._s.execute(select(Host).order_by(Host.name))).scalars().all()
-        refs: list[HostRef] = []
-        for row in rows:
-            elapsed = (
-                None
-                if row.last_seen_at is None
-                else (now - row.last_seen_at).total_seconds()
+        return [
+            HostRef(
+                name=row.name,
+                url=row.url,
+                token=row.token,
+                models=[ModelInfo.model_validate(m) for m in (row.models_json or [])],
+                healthy=row.healthy and _is_fresh(row.last_seen_at, now=now, ttl_s=ttl_s),
             )
-            # Chặn cả hai đầu. Hiệu ÂM nghĩa là đồng hồ lệch (nhiều replica
-            # gateway, hoặc NTP trôi), và `<= ttl` một mình sẽ cho qua vô điều
-            # kiện — host đó khoẻ vĩnh viễn, đúng ngược lại mục đích của việc
-            # tính lại độ tươi ở đây. Lệch đồng hồ là bất thường, mà bất thường
-            # thì không được nhận việc.
-            fresh = elapsed is not None and 0 <= elapsed <= ttl_s
-            refs.append(
-                HostRef(
-                    name=row.name,
-                    url=row.url,
-                    token=row.token,
-                    models=[ModelInfo.model_validate(m) for m in (row.models_json or [])],
-                    healthy=row.healthy and fresh,
-                )
-            )
-        return refs
+            for row in rows
+        ]
 
     async def delete(self, name: str) -> bool:
         # session.execute() is typed to return the generic Result, but for a
@@ -170,7 +197,25 @@ class RunRepo:
         output: dict | None,
         latency_ms: int | None,
         error: str | None,
+        reject_duplicate_trace: bool = False,
     ) -> RunRecord:
+        """Ghi một dòng `runs`, dedup theo (trace_id, model_version).
+
+        `reject_duplicate_trace` phân biệt HAI nguồn gốc khác nhau của
+        trace_id, thứ dedup-trả-về-bản-cũ chỉ đúng với MỘT trong hai:
+
+        - False (mặc định, đường async/result_consumer): trace_id do CHÍNH
+          GATEWAY sinh ra lúc dispatch rồi Kafka giao lại. Kafka giao ít nhất
+          một lần nên bản trùng ở đây LÀ CÙNG MỘT kết quả tới hai lần — trả về
+          bản cũ là đúng.
+        - True (đường sync qua SyncProxy): gateway giờ tôn trọng x-trace-id do
+          CALLER gửi lên. Hai request khác nhau tình cờ/chủ đích trùng header
+          không phải là "cùng một kết quả tới hai lần" — nếu vẫn dedup-trả-về-
+          bản-cũ thì caller thứ hai ÂM THẦM NHẬN KẾT QUẢ CỦA CALLER THỨ NHẤT
+          (GPU đã chạy xong request của họ, kết quả bị vứt). Với client-chọn
+          trace_id, trùng là lỗi CỦA CLIENT, không phải bản sao lành tính —
+          phải từ chối bằng ServiceError 409, không được trả nhầm dữ liệu.
+        """
         key = model_version or ""
         existing = (
             await self._s.execute(
@@ -178,6 +223,12 @@ class RunRepo:
             )
         ).scalar_one_or_none()
         if existing is not None:
+            if reject_duplicate_trace:
+                raise ServiceError(
+                    ErrorCode.BAD_INPUT,
+                    f"trace_id '{trace_id}' đã được dùng cho model_version '{key}'",
+                    409,
+                )
             # Đã ghi rồi: Kafka giao ít nhất một lần nên bản sao là bình thường,
             # không phải lỗi. Giữ bản đầu, không đè.
             return _to_run(existing)
@@ -191,18 +242,24 @@ class RunRepo:
         self._s.add(row)
         try:
             await self._s.commit()
-        except IntegrityError:
+        except IntegrityError as exc:
             # Thua cuộc đua ghi: một tiến trình khác vừa ghi đúng cặp
-            # (trace_id, model_version) này. Đó là bản sao Kafka lành tính, không
-            # phải lỗi — đọc lại bản của bên thắng và trả về. Để exception bay
-            # tiếp thì consumer coi là dữ liệu hỏng và dead-letter một KẾT QUẢ
-            # INFERENCE ĐÃ CHẠY XONG.
+            # (trace_id, model_version) này.
             await self._s.rollback()
             existing = (
                 await self._s.execute(
                     select(Run).where(Run.trace_id == trace_id, Run.model_version == key)
                 )
             ).scalar_one()
+            if reject_duplicate_trace:
+                raise ServiceError(
+                    ErrorCode.BAD_INPUT,
+                    f"trace_id '{trace_id}' đã được dùng cho model_version '{key}'",
+                    409,
+                ) from exc
+            # Bản sao Kafka lành tính, không phải lỗi — đọc lại bản của bên
+            # thắng và trả về. Để exception bay tiếp thì consumer coi là dữ
+            # liệu hỏng và dead-letter một KẾT QUẢ INFERENCE ĐÃ CHẠY XONG.
             return _to_run(existing)
         return _to_run(row)
 

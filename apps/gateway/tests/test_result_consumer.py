@@ -81,10 +81,29 @@ async def test_unparseable_payload_raises_so_the_consumer_dead_letters_it(factor
         await handler(bad)
 
 
+class _UnreachableSession:
+    """Giả lập Postgres KHÔNG THỂ KẾT NỐI được chút nào: container restart,
+    network partition, DNS lỗi. asyncpg thất bại ngay ở connect() — TRƯỚC KHI
+    có kết nối DBAPI để SQLAlchemy bọc lại thành SQLAlchemyError — và ném một
+    OSError trần, đây chính là hình dạng reviewer tái hiện được khi trỏ
+    handler vào một cổng chết. Bọc theo allowlist SQLAlchemyError bỏ sót đúng
+    hình dạng này."""
+
+    async def __aenter__(self):
+        raise ConnectionRefusedError("[Errno 61] Connection refused")
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def execute(self, *args, **kwargs):  # pragma: no cover - không tới được
+        raise AssertionError("không nên tới được execute(): __aenter__ đã ném")
+
+
 class _OutageSession:
-    """Giả lập một DB không thể kết nối được: mọi execute() đều ném
-    OperationalError, giống hệt cách reviewer tái hiện sự cố (session.execute
-    ném exception)."""
+    """Giả lập một DB đã CÓ kết nối DBAPI nhưng chập chờn khi thực thi: mọi
+    execute() đều ném OperationalError. Đây là hình dạng ĐÃ ĐƯỢC bọc đúng từ
+    trước — giữ lại ca này để pin rằng bản sửa (bare except Exception) không
+    làm hình dạng cũ hết được xử lý."""
 
     async def __aenter__(self):
         return self
@@ -98,13 +117,24 @@ class _OutageSession:
         raise OperationalError("SELECT 1", {}, Exception("connection refused"))
 
 
+async def test_db_unreachable_during_record_is_classified_as_retryable():
+    # Đây là hình dạng phổ biến nhất của "DB chết": không kết nối được chút
+    # nào, không phải một kết nối đã có rồi chập chờn giữa chừng. Ghi một kết
+    # quả inference ĐÃ CHẠY XONG (GPU đã tốn thời gian, kết quả đã có) là sự cố
+    # hạ tầng, không phải dữ liệu hỏng. Nếu handler chỉ bọc SQLAlchemyError,
+    # OSError này bay thẳng ra ngoài và default_is_retryable coi nó là bad
+    # data -> dead-letter ngay, mất luôn kết quả. Assert trên phán quyết của
+    # classifier, không chỉ trên kiểu exception, vì phán quyết mới là thứ
+    # EventConsumer thực sự dùng.
+    handler = make_result_handler(lambda: _UnreachableSession(), lambda task: "ocr")
+    with pytest.raises(Exception) as excinfo:  # noqa: B017 - phải bắt bất kỳ gì thoát ra
+        await handler(_completed())
+    assert default_is_retryable(excinfo.value) is True
+
+
 async def test_db_outage_during_record_is_classified_as_retryable():
-    # DB chập chờn khi ghi một kết quả inference ĐÃ CHẠY XONG (GPU đã tốn thời
-    # gian, kết quả đã có) là sự cố hạ tầng, không phải dữ liệu hỏng. Nếu
-    # handler không bọc lại thành UpstreamError, OperationalError bay thẳng ra
-    # ngoài và default_is_retryable coi nó là bad data -> dead-letter ngay,
-    # mất luôn kết quả. Assert trên phán quyết của classifier, không chỉ trên
-    # kiểu exception, vì phán quyết mới là thứ EventConsumer thực sự dùng.
+    # Hình dạng thứ hai, đã có kết nối DBAPI: execute() ném OperationalError.
+    # Pin song song với ca OSError ở trên để cả hai hình dạng cùng được giữ.
     handler = make_result_handler(lambda: _OutageSession(), lambda task: "ocr")
     with pytest.raises(Exception) as excinfo:  # noqa: B017 - phải bắt bất kỳ gì thoát ra
         await handler(_completed())

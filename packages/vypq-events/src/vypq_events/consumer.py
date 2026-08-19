@@ -102,7 +102,30 @@ class EventConsumer:
 
     async def run(self) -> None:
         while True:
-            await self.run_once()
+            try:
+                await self.run_once()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                # getmany()/commit() nằm NGOÀI mọi try trong run_once(): toàn bộ
+                # cơ chế pause/rewind ở trên chỉ bảo vệ khỏi exception của
+                # HANDLER, không phải I/O broker của chính consumer. aiokafka
+                # ném CommitFailedError khi generation của consumer group đổi
+                # (rebalance) — một lần rebalance hay broker chớp nhoáng là đủ
+                # để vòng lặp `while True` này chết, và chết là VĨNH VIỄN: không
+                # có gì gọi lại run(). Ở worker đứng một mình, chết còn kéo theo
+                # chết cả tiến trình nên Docker restart — hỏng an toàn. Nhưng
+                # trong gateway, main._guard bọc coroutine này, nuốt exception,
+                # log một dòng, rồi tiến trình SỐNG TIẾP — result ingestion của
+                # topic đó chết hẳn mà /ready vẫn báo 200 vì không ai theo dõi
+                # task đã chết. I/O của broker là hạ tầng — cùng cách nhìn nhận
+                # với default_is_retryable ở trên — nên xử lý giống hệt: log rồi
+                # nghỉ một nhịp rồi thử getmany() lại, không để nó kết liễu vòng
+                # lặp.
+                log.exception(
+                    "consumer_run_once_failed", topic=self._topic, error=str(exc)
+                )
+                await self._sleep(self._pause_seconds)
 
     async def run_once(self) -> int:
         # Vẫn gọi getmany() khi đang pause, không bỏ qua: consumer thật trả rỗng

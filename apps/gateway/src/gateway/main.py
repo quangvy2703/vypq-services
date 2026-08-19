@@ -1,8 +1,9 @@
 import asyncio
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager
 
 from fastapi import APIRouter, FastAPI
+from vypq_contracts.common import HealthStatus
 from vypq_core.app import create_app
 from vypq_core.logging import get_logger
 from vypq_core.metrics import build_metrics_router
@@ -11,20 +12,26 @@ from gateway.settings import GatewaySettings
 
 log = get_logger(__name__)
 
+HealthCheck = Callable[[], Awaitable[tuple[HealthStatus, str]]]
+
 
 def build_app(
     session_factory,
     settings: GatewaySettings,
     routers: Sequence[APIRouter] = (),
     lifespan=None,
+    readiness: Mapping[str, HealthCheck] | None = None,
 ) -> FastAPI:
-    return create_app(settings, routers=list(routers), lifespan=lifespan)
+    return create_app(
+        settings, routers=list(routers), lifespan=lifespan, readiness=readiness
+    )
 
 
 def background_lifespan(
     tasks: Sequence[Callable[[], Awaitable[None]]],
     on_shutdown: Sequence[Callable[[], Awaitable[None]]],
     on_startup: Sequence[Callable[[], Awaitable[None]]] = (),
+    task_handles: list[asyncio.Task] | None = None,
 ):
     """Chạy các vòng nền suốt vòng đời app, huỷ sạch khi tắt.
 
@@ -32,6 +39,11 @@ def background_lifespan(
     `gather` bên trong là sai: gather KHÔNG huỷ các nhánh còn lại khi một nhánh
     ném lỗi, nên nhánh sống sót thành task mồ côi — không nằm trong danh sách
     theo dõi, không bị huỷ lúc tắt, và vẫn chạy sau khi app đã đóng.
+
+    `task_handles`, nếu có, được điền (in-place, cùng thứ tự với `tasks`) bằng
+    các asyncio.Task vừa tạo lúc startup. Đây là cách duy nhất để code BÊN
+    NGOÀI closure này (ví dụ một readiness check) biết một vòng nền cụ thể có
+    còn sống hay không — `running` ở dưới là biến cục bộ của lifespan.
     """
 
     @asynccontextmanager
@@ -39,6 +51,8 @@ def background_lifespan(
         for hook in on_startup:
             await hook()
         running = [asyncio.create_task(_guard(t)) for t in tasks]
+        if task_handles is not None:
+            task_handles[:] = running
         try:
             yield
         finally:
@@ -60,6 +74,32 @@ async def _guard(task: Callable[[], Awaitable[None]]) -> None:
         raise
     except Exception as exc:  # noqa: BLE001
         log.exception("background_task_died", error=str(exc))
+
+
+def consumer_readiness(consumers: Sequence, task_handles: list, offset: int) -> HealthCheck:
+    """Readiness check cho các result consumer, phát hiện task NỀN đã chết.
+
+    _guard() bên trên nuốt mọi exception của vòng nền rồi im lặng sống tiếp —
+    đúng cho poller/refresh_services (hỏng an toàn: host quá hạn rồi biến
+    mất). Nhưng với result consumer, task chết nghĩa là ingestion của topic đó
+    dừng HẲN mà /ready vẫn báo 200 vì trước đây create_gateway() không truyền
+    readiness= gì cả — im lặng, vĩnh viễn, không ai biết. `task_handles` được
+    background_lifespan() điền lúc startup (xem docstring ở đó); `offset` là
+    số task KHÔNG PHẢI consumer đứng trước trong cùng danh sách `tasks` (ví
+    dụ poller.run, refresh_services), để lấy đúng lát cắt ứng với `consumers`.
+    """
+
+    async def check() -> tuple[HealthStatus, str]:
+        handles = task_handles[offset:]
+        if len(handles) < len(consumers):
+            # Lifespan chưa chạy xong startup — chưa có gì để kiểm.
+            return HealthStatus.OK, "chưa khởi động"
+        dead = [c._dlq_topic for c, t in zip(consumers, handles, strict=True) if t.done()]
+        if dead:
+            return HealthStatus.DOWN, f"consumer(s) đã chết: {', '.join(dead)}"
+        return HealthStatus.OK, "đang chạy"
+
+    return check
 
 
 def create_gateway() -> FastAPI:
@@ -108,6 +148,9 @@ def create_gateway() -> FastAPI:
         await proxy.aclose()
         await engine.dispose()
 
+    core_tasks = [poller.run, refresh_services]
+    task_handles: list[asyncio.Task] = []
+
     return build_app(
         factory,
         settings,
@@ -119,10 +162,16 @@ def create_gateway() -> FastAPI:
             build_runs_router(factory),
             build_metrics_router(),
         ],
+        readiness={
+            "result_consumers": consumer_readiness(
+                consumers, task_handles, len(core_tasks)
+            )
+        },
         lifespan=background_lifespan(
-            [poller.run, refresh_services, *(c.run for c in consumers)],
+            [*core_tasks, *(c.run for c in consumers)],
             on_shutdown=[shutdown],
             on_startup=[start_messaging],
+            task_handles=task_handles,
         ),
     )
 
