@@ -1,6 +1,7 @@
 from dataclasses import dataclass, field
 
 import pytest
+from prometheus_client import REGISTRY
 from vypq_contracts.common import Task
 from vypq_core.breaker import CircuitOpenError
 from vypq_core.host_registry import NoHostAvailableError
@@ -388,3 +389,45 @@ async def test_producer_wraps_broker_failure_as_upstream_error():
     )
     with pytest.raises(UpstreamError):
         await producer.publish("infer.ocr.results", env)
+
+
+def _value(name: str, topic: str) -> float:
+    return REGISTRY.get_sample_value(name, {"topic": topic}) or 0.0
+
+
+async def test_pausing_increments_the_paused_counter():
+    async def handler(_env):
+        raise UpstreamError("gpu chết")
+
+    before = _value("vypq_events_consumer_paused_total", "infer.ocr.requests")
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]}])
+    c = _consumer(kafka, FakeProducer(), handler, max_attempts=1)
+    await c.run_once()
+    assert _value("vypq_events_consumer_paused_total", "infer.ocr.requests") == before + 1
+
+
+async def test_dead_lettering_increments_its_counter():
+    async def handler(_env):
+        raise ValueError("dữ liệu hỏng")
+
+    before = _value("vypq_events_dead_lettered_total", "infer.ocr.dlq")
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]}])
+    c = _consumer(kafka, FakeProducer(), handler, max_attempts=1)
+    await c.run_once()
+    assert _value("vypq_events_dead_lettered_total", "infer.ocr.dlq") == before + 1
+
+
+async def test_failing_dlq_publish_increments_its_own_counter():
+    # Đây là chỉ số quan trọng nhất: nó báo partition đang bị kẹt.
+    class BrokenProducer(FakeProducer):
+        async def publish(self, topic, envelope, key=None):
+            raise RuntimeError("broker chết")
+
+    async def handler(_env):
+        raise ValueError("dữ liệu hỏng")
+
+    before = _value("vypq_events_dlq_publish_failed_total", "infer.ocr.dlq")
+    kafka = FakeConsumer(batches=[{TOPIC_TP: [_msg(0)]}])
+    c = _consumer(kafka, BrokenProducer(), handler, max_attempts=1)
+    await c.run_once()
+    assert _value("vypq_events_dlq_publish_failed_total", "infer.ocr.dlq") == before + 1

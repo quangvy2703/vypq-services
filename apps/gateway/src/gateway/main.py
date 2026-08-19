@@ -5,6 +5,7 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, FastAPI
 from vypq_core.app import create_app
 from vypq_core.logging import get_logger
+from vypq_core.metrics import build_metrics_router
 
 from gateway.settings import GatewaySettings
 
@@ -116,6 +117,7 @@ def create_gateway() -> FastAPI:
             build_services_router(service_registry),
             build_invoke_router(proxy, dispatcher),
             build_runs_router(factory),
+            build_metrics_router(),
         ],
         lifespan=background_lifespan(
             [poller.run, refresh_services, *(c.run for c in consumers)],

@@ -6,6 +6,7 @@ from vypq_contracts.common import HealthStatus, Task
 from vypq_contracts.gateway import ServiceInfo
 from vypq_core.app import create_app
 from vypq_core.logging import get_trace_id
+from vypq_core.metrics import build_metrics_router
 from vypq_core.service_info import build_info_router
 
 from asr_service.backend.remote import RemoteAsrBackend
@@ -45,7 +46,7 @@ def build_app_with(handler: AsrHandler, settings: AsrSettings, backend=None, lif
 
     return create_app(
         settings,
-        routers=[router, build_info_router(info)],
+        routers=[router, build_info_router(info), build_metrics_router()],
         readiness={"model_host": _upstream_ready},
         lifespan=lifespan,
     )

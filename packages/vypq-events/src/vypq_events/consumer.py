@@ -7,6 +7,7 @@ from vypq_core.breaker import CircuitOpenError
 from vypq_core.host_registry import NoHostAvailableError
 from vypq_core.http_client import UpstreamError
 from vypq_core.logging import get_logger, set_trace_id
+from vypq_core.metrics import DLQ_PUBLISH_FAILED, EVENTS_DEAD_LETTERED, EVENTS_PAUSED
 
 from vypq_events.envelope import EventEnvelope, RawEnvelope
 
@@ -186,6 +187,7 @@ class EventConsumer:
         if assignment:
             self._consumer.pause(*assignment)
         self._paused_until = self._clock() + self._pause_seconds
+        EVENTS_PAUSED.labels(topic=self._topic).inc()
         log.warning("consumer_paused", seconds=self._pause_seconds)
 
     def _maybe_resume(self) -> None:
@@ -243,8 +245,10 @@ class EventConsumer:
             # Broker đang có vấn đề → coi như sự cố hạ tầng và dừng consume, giống
             # hệt lúc upstream chết. Để exception bay tiếp thì nó không phải
             # _PauseSignal, run_once() không bắt, và cả consumer chết đứng.
+            DLQ_PUBLISH_FAILED.labels(topic=self._dlq_topic).inc()
             log.error("dlq_publish_failed", topic=self._dlq_topic, error=str(dlq_exc))
             raise _PauseSignal from dlq_exc
+        EVENTS_DEAD_LETTERED.labels(topic=self._dlq_topic).inc()
         log.error("event_dead_lettered", topic=self._dlq_topic, reason=str(exc))
 
 

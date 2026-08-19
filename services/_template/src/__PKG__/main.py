@@ -6,6 +6,7 @@ from vypq_contracts.gateway import ServiceInfo
 from vypq_contracts.__TASK__ import __RESP__
 from vypq_core.app import create_app
 from vypq_core.logging import get_trace_id
+from vypq_core.metrics import build_metrics_router
 from vypq_core.service_info import build_info_router
 
 from __PKG__.backend.remote import Remote__BACKEND__
@@ -45,7 +46,7 @@ def build_app_with(handler: __HANDLER__, settings: __SETTINGS__, backend=None, l
 
     return create_app(
         settings,
-        routers=[router, build_info_router(info)],
+        routers=[router, build_info_router(info), build_metrics_router()],
         readiness={"model_host": _upstream_ready},
         lifespan=lifespan,
     )
