@@ -82,6 +82,13 @@ describe("OcrViewer", () => {
     expect(block?.childNodes).toHaveLength(1);
   });
 
+  it("vẫn dựng được viewBox hợp lệ khi không có box nào", () => {
+    // svg có chiều bằng 0 thì không vẽ ra gì cả, và trang chi tiết run (không
+    // có ảnh gốc) rơi vào đúng nhánh này mỗi khi model trả rỗng.
+    const { container } = render(<OcrViewer result={{ full_text: "", boxes: [] }} imageUrl={null} />);
+    expect(container.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 1 1");
+  });
+
   it("nói rõ khi model không tìm thấy chữ nào", () => {
     render(<OcrViewer result={{ full_text: "", boxes: [] }} imageUrl={null} />);
     expect(screen.getByText(/không tìm thấy chữ nào/i)).toBeInTheDocument();

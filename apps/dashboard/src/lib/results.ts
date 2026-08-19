@@ -63,22 +63,12 @@ export function asAsrResult(output: unknown): AsrResult | null {
   return { text: typeof output.text === "string" ? output.text : "", segments };
 }
 
-/**
- * `polygon` chỉ cần đọc x,y theo vị trí — không cần đúng hẳn kiểu tuple
- * `Polygon` của `TextBox`. Nới kiểu tham số theo cấu trúc (thay vì đòi
- * `TextBox[]` cứng) để chấp nhận cả literal `number[][]` mà TS suy ra khi một
- * biến polygon được khai báo rồi mới spread — như trong test — mà không phải
- * ép kiểu `as Polygon` ở phía gọi.
- */
-interface BoxLike {
-  polygon: readonly (readonly number[])[];
-}
 
 /**
  * Khung toạ độ dùng khi KHÔNG có ảnh gốc (mọi run sync đều ghi input_uri=null).
  * Tối thiểu 1×1: svg viewBox có chiều bằng 0 thì không vẽ ra gì cả.
  */
-export function boundingExtent(boxes: readonly BoxLike[]): { width: number; height: number } {
+export function boundingExtent(boxes: readonly TextBox[]): { width: number; height: number } {
   let width = 1;
   let height = 1;
   for (const box of boxes) {

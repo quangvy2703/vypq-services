@@ -1,8 +1,15 @@
 import { describe, expect, it } from "vitest";
 
 import { asAsrResult, asOcrResult, boundingExtent } from "@/lib/results";
+import type { TextBox } from "@/lib/types";
 
-const box = { id: 1, polygon: [[0, 0], [10, 0], [10, 5], [0, 5]], text: "HOÁ ĐƠN", confidence: 0.98, ignore: false };
+// Chú kiểu tường minh: TypeScript suy `polygon` của một object literal thành
+// number[][] chứ không phải tuple [number, number][], và không suy ngược lại từ
+// chỗ gọi. Nới kiểu tham số của boundingExtent cho vừa chỗ này là nới hợp đồng
+// của code sản phẩm để chiều một file test — chú kiểu ở đây mới đúng chỗ.
+const box: TextBox = {
+  id: 1, polygon: [[0, 0], [10, 0], [10, 5], [0, 5]], text: "HOÁ ĐƠN", confidence: 0.98, ignore: false,
+};
 
 describe("asOcrResult", () => {
   it("nhận kết quả OCR hợp lệ", () => {
