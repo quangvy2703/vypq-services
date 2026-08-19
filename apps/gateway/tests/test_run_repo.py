@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from gateway.db.models import Base
 from gateway.db.repo import RunRepo
@@ -13,6 +15,23 @@ async def session():
     factory = async_sessionmaker(engine, expire_on_commit=False)
     async with factory() as s:
         yield s
+    await engine.dispose()
+
+
+@pytest.fixture
+async def factory(tmp_path):
+    # In-memory SQLite gives each connection its own private database, so two
+    # sessions from an in-memory engine would never actually collide — the
+    # race would be fake and the test would pass without proving anything.
+    # A file-backed database is shared across connections, which is what it
+    # takes to make two concurrent sessions genuinely contend on the same
+    # (trace_id, model_version) UNIQUE constraint, like two real HTTP/Kafka
+    # consumer workers would.
+    db_path = tmp_path / "runs.sqlite"
+    engine = create_async_engine(f"sqlite+aiosqlite:///{db_path}")
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    yield async_sessionmaker(engine, expire_on_commit=False)
     await engine.dispose()
 
 
@@ -111,3 +130,21 @@ async def test_failed_run_keeps_the_error_and_has_no_output(session):
     )
     assert run.error == "gpu chết"
     assert run.output is None
+
+
+async def test_concurrent_record_of_the_same_key_does_not_raise(factory):
+    # Kafka giao ít nhất một lần; bản sao là chuyện bình thường, không phải lỗi.
+    # Nếu IntegrityError bay ra, consumer sẽ dead-letter một kết quả ĐÃ CHẠY XONG.
+    async def once():
+        async with factory() as s:
+            return await RunRepo(s).record(
+                trace_id="dua", service="ocr", model_version="m1",
+                mode=InvokeMode.ASYNC, status=RunStatus.OK, input_uri=None,
+                output={"ok": True}, latency_ms=1, error=None,
+            )
+
+    a, b = await asyncio.gather(once(), once())
+    assert a.id == b.id
+    async with factory() as s:
+        _runs, total = await RunRepo(s).list_runs(trace_id="dua")
+    assert total == 1

@@ -189,7 +189,21 @@ class RunRepo:
             error=error, created_at=datetime.now(UTC),
         )
         self._s.add(row)
-        await self._s.commit()
+        try:
+            await self._s.commit()
+        except IntegrityError:
+            # Thua cuộc đua ghi: một tiến trình khác vừa ghi đúng cặp
+            # (trace_id, model_version) này. Đó là bản sao Kafka lành tính, không
+            # phải lỗi — đọc lại bản của bên thắng và trả về. Để exception bay
+            # tiếp thì consumer coi là dữ liệu hỏng và dead-letter một KẾT QUẢ
+            # INFERENCE ĐÃ CHẠY XONG.
+            await self._s.rollback()
+            existing = (
+                await self._s.execute(
+                    select(Run).where(Run.trace_id == trace_id, Run.model_version == key)
+                )
+            ).scalar_one()
+            return _to_run(existing)
         return _to_run(row)
 
     async def get(self, run_id: str) -> RunRecord | None:
