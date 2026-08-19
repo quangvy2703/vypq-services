@@ -9,8 +9,16 @@ export function formatMs(ms: number | null): string {
 export function formatClock(seconds: number): string {
   const safe = Math.max(0, seconds);
   const minutes = Math.floor(safe / 60);
-  const rest = safe - minutes * 60;
-  return `${String(minutes).padStart(2, "0")}:${rest.toFixed(1).padStart(4, "0")}`;
+  const restRaw = safe - minutes * 60;
+  // `toFixed` làm tròn theo biểu diễn nhị phân (3.25 → "3.3" thay vì "3.2"),
+  // khiến mốc thời gian hiện lên SAU thời điểm thật của segment. Cắt bớt
+  // (truncate) thay vì làm tròn để mốc hiển thị luôn <= giá trị gốc — quan
+  // trọng khi người dùng bấm "nghe từ" ngay tại mốc hiển thị.
+  const restTenths = Math.floor(restRaw * 10 + 1e-9);
+  const wholeSeconds = Math.floor(restTenths / 10);
+  const tenth = restTenths % 10;
+  const rest = `${String(wholeSeconds).padStart(2, "0")}.${tenth}`;
+  return `${String(minutes).padStart(2, "0")}:${rest}`;
 }
 
 export function formatTimestamp(iso: string | null): string {
