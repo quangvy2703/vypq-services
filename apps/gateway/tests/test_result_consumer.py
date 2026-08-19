@@ -7,6 +7,7 @@ from gateway.settings import GatewaySettings
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from vypq_contracts.common import Task
 from vypq_contracts.gateway import RunStatus, ServiceInfo, ServiceState
+from vypq_events.consumer import default_is_retryable
 from vypq_events.envelope import EventEnvelope, RawEnvelope
 from vypq_events.schemas.inference import InferenceCompleted
 
@@ -78,6 +79,63 @@ async def test_unparseable_payload_raises_so_the_consumer_dead_letters_it(factor
     )
     with pytest.raises(Exception):  # noqa: B017 - cố ý: bất kỳ exception nào cũng phải thoát ra
         await handler(bad)
+
+
+class _OutageSession:
+    """Giả lập một DB không thể kết nối được: mọi execute() đều ném
+    OperationalError, giống hệt cách reviewer tái hiện sự cố (session.execute
+    ném exception)."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def execute(self, *args, **kwargs):
+        from sqlalchemy.exc import OperationalError
+
+        raise OperationalError("SELECT 1", {}, Exception("connection refused"))
+
+
+async def test_db_outage_during_record_is_classified_as_retryable():
+    # DB chập chờn khi ghi một kết quả inference ĐÃ CHẠY XONG (GPU đã tốn thời
+    # gian, kết quả đã có) là sự cố hạ tầng, không phải dữ liệu hỏng. Nếu
+    # handler không bọc lại thành UpstreamError, OperationalError bay thẳng ra
+    # ngoài và default_is_retryable coi nó là bad data -> dead-letter ngay,
+    # mất luôn kết quả. Assert trên phán quyết của classifier, không chỉ trên
+    # kiểu exception, vì phán quyết mới là thứ EventConsumer thực sự dùng.
+    handler = make_result_handler(lambda: _OutageSession(), lambda task: "ocr")
+    with pytest.raises(Exception) as excinfo:  # noqa: B017 - phải bắt bất kỳ gì thoát ra
+        await handler(_completed())
+    assert default_is_retryable(excinfo.value) is True
+
+
+async def test_malformed_payload_is_classified_as_not_retryable(factory):
+    # Ranh giới ngược lại: payload hỏng là dữ liệu hỏng thật sự, phải tiếp tục
+    # bị dead-letter (không retry, không pause consumer chờ DB).
+    handler = make_result_handler(factory, lambda task: "ocr")
+    bad = RawEnvelope(
+        event_id="e", event_type="inference.completed", trace_id="t",
+        occurred_at="2026-08-18T00:00:00Z", payload={"khong": "dung shape"},
+    )
+    with pytest.raises(Exception) as excinfo:  # noqa: B017
+        await handler(bad)
+    assert default_is_retryable(excinfo.value) is False
+
+
+async def test_duplicate_delivery_does_not_raise_upstream_error(factory):
+    # RunRepo.record() đã tự bắt IntegrityError của trường hợp trùng lặp và
+    # trả về row cũ, nên nó không được commit lần thứ hai ném ra tới handler
+    # -> không được rơi vào except SQLAlchemyError mới thêm. Nếu nó lọt vào
+    # đó, một bản trùng lặp lành tính sẽ khiến consumer pause chờ DB mãi mãi —
+    # một lỗi còn tệ hơn lỗi đang được sửa ở đây.
+    handler = make_result_handler(factory, lambda task: "ocr")
+    await handler(_completed())
+    await handler(_completed())  # không được ném gì cả
+    async with factory() as s:
+        _runs, total = await RunRepo(s).list_runs()
+    assert total == 1
 
 
 async def test_build_result_consumers_targets_ocr_and_asr_topics(factory):

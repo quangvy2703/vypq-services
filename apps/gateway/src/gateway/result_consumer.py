@@ -1,7 +1,9 @@
 from collections.abc import Callable
 
+from sqlalchemy.exc import SQLAlchemyError
 from vypq_contracts.common import Task
 from vypq_contracts.gateway import InvokeMode, RunStatus
+from vypq_core.http_client import UpstreamError
 from vypq_events.consumer import EventConsumer
 from vypq_events.envelope import RawEnvelope
 from vypq_events.schemas.inference import InferenceCompleted
@@ -16,18 +18,25 @@ def make_result_handler(session_factory, service_name_for: Callable[[Task], str]
         # Không bọc try: envelope hỏng là dữ liệu hỏng, phải ném để
         # EventConsumer đẩy vào DLQ. Nuốt ở đây là mất kết quả mà không ai biết.
         completed = InferenceCompleted.model_validate(envelope.payload)
-        async with session_factory() as session:
-            await RunRepo(session).record(
-                trace_id=envelope.trace_id,
-                service=service_name_for(completed.task),
-                model_version=completed.model_version,
-                mode=InvokeMode.ASYNC,
-                status=RunStatus.OK,
-                input_uri=completed.input_uri,
-                output=completed.output,
-                latency_ms=completed.latency_ms,
-                error=None,
-            )
+        try:
+            async with session_factory() as session:
+                await RunRepo(session).record(
+                    trace_id=envelope.trace_id,
+                    service=service_name_for(completed.task),
+                    model_version=completed.model_version,
+                    mode=InvokeMode.ASYNC,
+                    status=RunStatus.OK,
+                    input_uri=completed.input_uri,
+                    output=completed.output,
+                    latency_ms=completed.latency_ms,
+                    error=None,
+                )
+        except SQLAlchemyError as exc:
+            # DB chập chờn là sự cố HẠ TẦNG, không phải dữ liệu hỏng. Không bọc
+            # thì consumer dead-letter một KẾT QUẢ INFERENCE ĐÃ CHẠY XONG —
+            # inference thành công rồi, chỉ mỗi lần ghi trượt. Bọc thành
+            # UpstreamError để consumer dừng chờ DB quay lại.
+            raise UpstreamError(f"không ghi được run vào DB: {exc}") from exc
 
     return handle
 
