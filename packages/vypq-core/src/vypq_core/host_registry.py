@@ -88,3 +88,14 @@ class StaticHostRegistry:
             yield host
         finally:
             host.inflight -= 1
+
+
+class DiscoveryResponse(BaseModel):
+    """Thân trả lời của gateway cho service hỏi danh sách host.
+
+    Dùng `HostRef` nguyên vẹn — CÓ token — vì service cần token để gọi
+    model-host. Endpoint này chỉ được phơi trong mạng nội bộ, khác với
+    `GET /v1/hosts` dành cho dashboard và không mang token.
+    """
+
+    hosts: list[HostRef] = Field(default_factory=list)
