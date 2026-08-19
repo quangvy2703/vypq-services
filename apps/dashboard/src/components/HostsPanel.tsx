@@ -3,8 +3,8 @@
 import { useRouter } from "next/navigation";
 import { useState } from "react";
 
+import { RelativeTime } from "@/components/RelativeTime";
 import { Badge, Button, Card, DataTable, EmptyState, TextField } from "@/components/ui";
-import { relativeTime } from "@/lib/format";
 import type { HostState, ModelInfo } from "@/lib/types";
 
 async function messageOf(response: Response): Promise<string> {
@@ -35,8 +35,6 @@ function ModelChip({ model }: { model: ModelInfo }) {
 
 export function HostsPanel({ hosts }: { hosts: HostState[] }) {
   const router = useRouter();
-  // now cố định lúc render để relativeTime không phụ thuộc đồng hồ giữa các dòng.
-  const now = Date.now();
   const [name, setName] = useState("");
   const [url, setUrl] = useState("");
   const [token, setToken] = useState("");
@@ -117,7 +115,7 @@ export function HostsPanel({ hosts }: { hosts: HostState[] }) {
                     </div>
                   )}
                 </td>
-                <td className="px-3 py-2 align-top text-xs text-slate-600">{relativeTime(host.last_seen_at, now)}</td>
+                <td className="px-3 py-2 align-top text-xs text-slate-600"><RelativeTime iso={host.last_seen_at} /></td>
                 <td className="px-3 py-2 align-top">
                   <Button tone="danger" type="button" aria-label={`Gỡ ${host.name}`} onClick={() => void remove(host.name)}>
                     Gỡ
