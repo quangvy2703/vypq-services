@@ -44,5 +44,8 @@ export function statusTone(status: HealthStatus): Tone {
  * chưa từng poll được nên info=null) thì trả "json" — xem thô còn hơn đoán.
  */
 export function capabilityOutputFor(services: ServiceState[], serviceName: string): string {
-  return services.find((state) => state.info?.name === serviceName)?.info?.capability_output ?? "json";
+  // Khớp theo KHOÁ ĐỊNH TUYẾN: `runs.service` do gateway ghi bằng đúng khoá đó,
+  // không phải tên service tự khai. Khớp nhầm sang `info.name` làm trang chi
+  // tiết run hiện JSON thô thay vì viewer đúng, ngay khi hai tên lệch nhau.
+  return services.find((state) => state.name === serviceName)?.info?.capability_output ?? "json";
 }

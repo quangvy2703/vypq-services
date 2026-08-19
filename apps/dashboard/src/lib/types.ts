@@ -53,6 +53,13 @@ export interface ServiceInfo {
 }
 
 export interface ServiceState {
+  /**
+   * Khoá định tuyến — tên trong `config/services.yaml`, thứ gateway tra cứu khi
+   * nhận `POST /v1/invoke`. KHÔNG nhất thiết bằng `info.name` (tên service tự
+   * khai): gọi bằng `info.name` khi hai cái lệch nhau sẽ trả 404 "không có
+   * service" mà không chỗ nào giải thích vì sao.
+   */
+  name: string;
   /** null = gateway chưa từng poll thành công. Không được đoán task. */
   info: ServiceInfo | null;
   base_url: string;

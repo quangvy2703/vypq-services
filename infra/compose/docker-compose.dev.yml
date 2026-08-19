@@ -22,7 +22,9 @@ services:
   redpanda-console:
     image: redpandadata/console:v2.7.2
     environment:
-      KAFKA_BROKERS: redpanda:9092
+      # 9093 là listener nội bộ. Cổng 9092 quảng bá "localhost", đúng cho client
+      # trên máy chủ nhưng trỏ ngược vào chính container khi gọi từ trong network.
+      KAFKA_BROKERS: redpanda:9093
     ports: ["8090:8080"]
     depends_on: [redpanda]
 

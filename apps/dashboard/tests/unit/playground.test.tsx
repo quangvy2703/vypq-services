@@ -7,6 +7,7 @@ import { Playground } from "@/components/Playground";
 import type { HostState, ServiceState } from "@/lib/types";
 
 const ocrService: ServiceState = {
+  name: "ocr",
   info: {
     name: "ocr", task: "ocr", capability_input: "image", capability_output: "text_boxes",
     version: "0.1.0", invoke_path: "/v1/ocr", default_model: "paddleocr-v4-vi",
@@ -15,6 +16,7 @@ const ocrService: ServiceState = {
 };
 
 const asrService: ServiceState = {
+  name: "asr",
   info: {
     name: "asr", task: "asr", capability_input: "audio", capability_output: "transcript",
     version: "0.1.0", invoke_path: "/v1/asr", default_model: "whisper-large-v3",
@@ -22,7 +24,7 @@ const asrService: ServiceState = {
   base_url: "http://asr:8000", status: "ok", last_seen_at: null,
 };
 
-const unreachable: ServiceState = { info: null, base_url: "http://ner:8000", status: "down", last_seen_at: null };
+const unreachable: ServiceState = { name: "ner", info: null, base_url: "http://ner:8000", status: "down", last_seen_at: null };
 
 const hosts: HostState[] = [
   {
@@ -126,6 +128,22 @@ describe("Playground", () => {
     expect(body.get("service")).toBe("ocr");
     expect(body.get("model_version")).toBe("vietocr-ft-invoice");
     expect((body.get("file") as File).name).toBe("hoadon.png");
+  });
+
+  it("gọi bằng KHOÁ ĐỊNH TUYẾN chứ không phải tên service tự khai", async () => {
+    // Gateway tra cứu bằng khoá trong services.yaml. Gửi info.name khi hai tên
+    // lệch nhau thì mọi lần chạy thử trả 404 "không có service" và không chỗ
+    // nào nói vì sao.
+    const lechTen = { ...ocrService, name: "docsvc", info: { ...ocrService.info!, name: "docreader" } };
+    const user = userEvent.setup();
+    render(<Playground services={[lechTen]} hosts={hosts} />);
+    await pickFile(user);
+    await user.click(screen.getByRole("button", { name: "Chạy thử" }));
+
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const invokeCall = fetchMock.mock.calls.find((call) => call[0] === "/api/invoke");
+    const body = (invokeCall as [string, RequestInit])[1].body as FormData;
+    expect(body.get("service")).toBe("docsvc");
   });
 
   it("vẽ overlay bbox trên đúng ảnh vừa upload", async () => {

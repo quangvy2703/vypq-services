@@ -61,12 +61,19 @@ async function runOne(service: string, file: File, modelVersion: string): Promis
 }
 
 export function Playground({ services, hosts }: { services: ServiceState[]; hosts: HostState[] }) {
+  // Giữ CẢ HAI tên: `key` là khoá định tuyến trong services.yaml (thứ gateway
+  // tra cứu khi nhận /v1/invoke), `info.name` là tên service tự khai. Trước đây
+  // chỗ này chỉ giữ info.name rồi gọi bằng nó — trùng nhau hôm nay, nhưng lệch
+  // một chữ là mọi lần chạy thử trả 404 mà không ai hiểu vì sao.
   const usable = useMemo(
-    () => services.filter(isUsable).map((state) => state.info as ServiceInfo),
+    () =>
+      services
+        .filter(isUsable)
+        .map((state) => ({ key: state.name, info: state.info as ServiceInfo })),
     [services],
   );
-  const [serviceName, setServiceName] = useState(usable[0]?.name ?? "");
-  const service = usable.find((info) => info.name === serviceName) ?? usable[0];
+  const [serviceName, setServiceName] = useState(usable[0]?.key ?? "");
+  const service = usable.find((entry) => entry.key === serviceName) ?? usable[0];
 
   const [file, setFile] = useState<File | null>(null);
   const [objectUrl, setObjectUrl] = useState<string | null>(null);
@@ -77,7 +84,7 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   const models = useMemo(
-    () => (service ? modelsForTask(hosts, service.task) : []),
+    () => (service ? modelsForTask(hosts, service.info.task) : []),
     [hosts, service],
   );
 
@@ -104,7 +111,7 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
   }
   // Gán lại vào biến đã có kiểu chắc chắn: TS không giữ narrowing của `service`
   // xuyên qua closure `run` bên dưới dù nó không bao giờ đổi giá trị.
-  const activeService: ServiceInfo = service;
+  const activeService: { key: string; info: ServiceInfo } = service;
 
   /** Bỏ mọi lượt chạy đang bay: kết quả của chúng không còn thuộc về màn hình này. */
   function discardInFlight(): void {
@@ -135,7 +142,7 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
     // Set khử trùng lặp: tick đúng model đang chọn ở ô chính thì vẫn chỉ chạy một lần.
     const targets = [...new Set([model, ...extras])];
     const settled = await Promise.allSettled(
-      targets.map((target) => runOne(activeService.name, file, target)),
+      targets.map((target) => runOne(activeService.key, file, target)),
     );
     // Vẫn phải kiểm token như lượt chạy đơn: đổi service giữa chừng rồi kết quả
     // cũ về trễ sẽ hiện output của service này qua viewer của service kia.
@@ -155,8 +162,8 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
     setPending(false);
   }
 
-  const isImage = service.capability_input === "image";
-  const isAudio = service.capability_input === "audio";
+  const isImage = service.info.capability_input === "image";
+  const isAudio = service.info.capability_input === "audio";
 
   return (
     <div className="space-y-6">
@@ -165,12 +172,14 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
           <label className="block space-y-1">
             <span className="text-sm text-slate-600">Service</span>
             <select
-              value={service.name}
+              value={service.key}
               onChange={(event) => selectService(event.target.value)}
               className="w-full rounded border border-slate-300 px-3 py-1.5 text-sm"
             >
-              {usable.map((info) => (
-                <option key={info.name} value={info.name}>{info.name}</option>
+              {usable.map((entry) => (
+                <option key={entry.key} value={entry.key}>
+                  {entry.info.name === entry.key ? entry.key : `${entry.key} (khai là ${entry.info.name})`}
+                </option>
               ))}
             </select>
           </label>
@@ -182,7 +191,7 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
               onChange={(event) => setModel(event.target.value)}
               className="w-full rounded border border-slate-300 px-3 py-1.5 text-sm"
             >
-              <option value="">mặc định ({service.default_model ?? "service tự chọn"})</option>
+              <option value="">mặc định ({service.info.default_model ?? "service tự chọn"})</option>
               {models.map((option) => (
                 <option key={option.id} value={option.id} disabled={!option.available}>
                   {option.id}{option.kind === "finetuned" ? " · fine-tune" : ""}{option.available ? "" : " · không dùng được"}
@@ -195,7 +204,7 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
             <span className="text-sm text-slate-600">Tệp đầu vào</span>
             <input
               type="file"
-              accept={acceptForInput(service.capability_input)}
+              accept={acceptForInput(service.info.capability_input)}
               onChange={(event) => selectFile(event.target.files?.[0] ?? null)}
               className="w-full text-sm"
             />
@@ -256,7 +265,7 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
                 ) : (
                   <div className="space-y-3">
                     <dl className="flex flex-wrap gap-x-6 gap-y-1 text-xs">
-                      {summarize(service.capability_output, entry.invoke?.result ?? null).map((stat) => (
+                      {summarize(service.info.capability_output, entry.invoke?.result ?? null).map((stat) => (
                         <div key={stat.label} className="flex gap-1.5">
                           <dt className="text-slate-500">{stat.label}</dt>
                           <dd className="font-medium">{stat.value}</dd>
@@ -264,7 +273,7 @@ export function Playground({ services, hosts }: { services: ServiceState[]; host
                       ))}
                     </dl>
                     <ResultViewer
-                      capabilityOutput={service.capability_output}
+                      capabilityOutput={service.info.capability_output}
                       output={entry.invoke?.result ?? null}
                       imageUrl={isImage ? objectUrl : null}
                       audioUrl={isAudio ? objectUrl : null}

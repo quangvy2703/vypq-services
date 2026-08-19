@@ -37,6 +37,7 @@ describe("viewerFor", () => {
 });
 
 const usable: ServiceState = {
+  name: "ocr",
   info: {
     name: "ocr", task: "ocr", capability_input: "image", capability_output: "text_boxes",
     version: "0.1.0", invoke_path: "/v1/ocr", default_model: "paddleocr-v4-vi",
@@ -78,6 +79,7 @@ describe("statusTone", () => {
 
 describe("capabilityOutputFor", () => {
   const asr: ServiceState = {
+    name: "asr",
     info: {
       name: "asr", task: "asr", capability_input: "audio", capability_output: "transcript",
       version: "0.1.0", invoke_path: "/v1/asr", default_model: "whisper-large-v3",
@@ -102,12 +104,25 @@ describe("capabilityOutputFor", () => {
     expect(capabilityOutputFor([doiTen], "ocr")).toBe("transcript");
   });
 
+  it("khớp theo KHOÁ ĐỊNH TUYẾN, không phải tên service tự khai", () => {
+    // runs.service do gateway ghi bằng khoá trong services.yaml. Khớp nhầm sang
+    // info.name làm trang chi tiết run hiện JSON thô thay vì viewer đúng, ngay
+    // khi hai tên lệch nhau — mà không chỗ nào báo.
+    const lechTen: ServiceState = {
+      ...usable,
+      name: "docsvc",
+      info: { ...usable.info!, name: "docreader" },
+    };
+    expect(capabilityOutputFor([lechTen], "docsvc")).toBe("text_boxes");
+    expect(capabilityOutputFor([lechTen], "docreader")).toBe("json");
+  });
+
   it("rơi về json khi không khớp service nào", () => {
     expect(capabilityOutputFor([usable], "khong-ton-tai")).toBe("json");
   });
 
   it("rơi về json khi service chưa từng được poll (info=null)", () => {
-    const chuaBiet: ServiceState = { info: null, base_url: "http://ner:8000", status: "down", last_seen_at: null };
+    const chuaBiet: ServiceState = { name: "ner", info: null, base_url: "http://ner:8000", status: "down", last_seen_at: null };
     expect(capabilityOutputFor([chuaBiet], "ner")).toBe("json");
   });
 

@@ -22,7 +22,7 @@ TOKEN = "sekret"
 
 def _state(status=HealthStatus.OK) -> ServiceState:
     return ServiceState(
-        info=ServiceInfo(
+        name="ocr", info=ServiceInfo(
             name="ocr", task=Task.OCR, capability_input="image",
             capability_output="text_boxes", version="0.1.0",
             invoke_path="/v1/ocr", default_model="m1",
@@ -139,7 +139,7 @@ async def test_service_with_no_info_is_refused_without_recording(ctx):
     # ghi dòng nào — nửa còn lại của ranh giới ghi runs, trước đây chưa có test.
     client, factory, registry = ctx
     registry._states["ocr"] = ServiceState(
-        info=None, base_url="http://ocr:8001", status=HealthStatus.OK
+        name="ocr", info=None, base_url="http://ocr:8001", status=HealthStatus.OK
     )
     resp = await client.post(
         "/v1/invoke/upload", data={"service": "ocr"},

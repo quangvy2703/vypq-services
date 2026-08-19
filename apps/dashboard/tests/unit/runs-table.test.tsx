@@ -70,7 +70,7 @@ describe("RunsTable", () => {
   });
 
   it("khoá nút Sau ở trang cuối", () => {
-    // offset 100 + 37 dòng = 137 = total: không còn gì phía sau.
+    // offset 100 + 1 dòng = 101 = total: không còn gì phía sau.
     render(<RunsTable runs={[run({ id: "r1" })]} total={101} offset={100} filters={filters} />);
     expect(screen.getByText("Sau")).not.toHaveAttribute("href");
   });

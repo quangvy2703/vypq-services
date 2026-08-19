@@ -63,6 +63,31 @@ Cổng 3001 vì 3000 đã là Grafana.
   `InferenceRequested` vào Kafka.
 - **Một mật khẩu dùng chung**, không có khái niệm người dùng hay phân quyền. Payload cookie
   chỉ chứa hạn dùng (12 giờ).
+- **Trang không tự làm mới.** Mọi trang đều `force-dynamic`, nhưng không có polling nào ở
+  phía trình duyệt: chữ "3 phút trước" tự nhịp lại, còn *trạng thái* host thì không. Cắm
+  host xong phải **tải lại trang** mới thấy nó chuyển xanh — gateway poll mỗi 15 giây,
+  nhưng dashboard chỉ đọc lại khi có ai đó bảo nó đọc.
+- **Tệp chạy thử tối đa 25 MB**, khớp `max_inline_mb` của service. Chặn hai lớp: theo
+  `Content-Length` trước khi đọc body, rồi theo kích thước file thật.
+- **So sánh nhiều model sinh nhiều `trace_id` khác nhau.** Mỗi model là một lần gọi
+  `/v1/invoke/upload` riêng, nên không gom được chúng lại bằng cách bấm `trace_id` như với
+  shadow-run. Muốn gom thì phải đi đường async qua Kafka.
+- **Độ trễ khi so sánh không so được với nhau.** Các model chạy **song song**
+  (`Promise.allSettled`) nên chúng tranh nhau cùng một GPU; `latency_ms` đọc từ bản ghi run
+  là số thật của lần chạy đó, nhưng là số đo *dưới tải cạnh tranh*, không phải độ trễ của
+  model khi chạy một mình. Dùng nó để thấy "chậm hơn hẳn" thì được, để xếp hạng thì không.
+- **Tên service phải khớp giữa hai nơi.** `config/services.yaml` đặt **khoá định tuyến**,
+  còn service tự khai `name` qua `/v1/info`. Gateway định tuyến bằng khoá, dashboard cũng
+  gọi bằng khoá, nên lệch nhau không còn làm hỏng gì — nhưng gateway sẽ ghi cảnh báo
+  `service_name_mismatch`, và hai cái tên khác nhau trong giao diện thì khó đọc.
+- **Cố ý ngoài phạm vi, không phải thiếu sót:** trang `models` riêng (danh sách model đã
+  hiện đủ trong bảng Host và ô chọn của Playground), trình xem DLQ, và nhúng biểu đồ
+  Prometheus/Grafana. Ba thứ đó thuộc bước 10 của lộ trình Plan B và Plan C.
+- **Chỉ có `task: ocr` và `asr`.** `Task` trong `packages/vypq-contracts` là enum đóng, nên
+  một service khai `task: "ner"` bị gateway từ chối ngay ở bước đọc `/v1/info` và không bao
+  giờ xuất hiện trên dashboard. Phần *capability* của dashboard thì đã sẵn sàng cho service
+  lạ (`capability_input`/`capability_output` chưa biết đều có đường lui), nhưng `task` thì
+  chưa — mở nó ra là thay đổi ở tầng hợp đồng nền tảng, không phải ở đây.
 - **`pnpm test:e2e` không chạy cùng entrypoint với production.** Bộ e2e (Playwright) khởi
   động dashboard bằng `next start`, trong khi image Docker chạy `node server.js` từ cây
   `.next/standalone` (do `output: "standalone"` trong `next.config.ts`). Hai đường khởi

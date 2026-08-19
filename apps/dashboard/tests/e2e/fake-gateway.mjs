@@ -18,13 +18,16 @@ const OCR_RESULT = {
 
 const SERVICES = [
   {
+    // `name` là khoá định tuyến trong services.yaml — dashboard gọi và tra
+    // capability bằng nó, không phải bằng info.name.
+    name: "ocr",
     info: {
       name: "ocr", task: "ocr", capability_input: "image", capability_output: "text_boxes",
       version: "0.1.0", invoke_path: "/v1/ocr", default_model: "paddleocr-v4-vi",
     },
     base_url: "http://ocr:8000", status: "ok", last_seen_at: new Date().toISOString(),
   },
-  { info: null, base_url: "http://ner:8000", status: "down", last_seen_at: null },
+  { name: "ner", info: null, base_url: "http://ner:8000", status: "down", last_seen_at: null },
 ];
 
 function send(res, status, body) {

@@ -34,7 +34,9 @@ def _placeholder(entry: ServiceEntry) -> ServiceState:
     # không có gì để đoán task hay invoke_path. Đoán từng là bug: hardcode
     # Task.OCR khiến một service khác OCR chưa poll được có thể bị định
     # tuyến/publish nhầm sang topic của OCR.
-    return ServiceState(info=None, base_url=entry.base_url, status=HealthStatus.DOWN)
+    return ServiceState(
+        name=entry.name, info=None, base_url=entry.base_url, status=HealthStatus.DOWN
+    )
 
 
 class ServiceRegistry:
@@ -98,8 +100,16 @@ class ServiceRegistry:
         except Exception as exc:
             log.warning("service_ready_failed", service=entry.name, error=str(exc))
 
+        if info.name != entry.name:
+            # Không tự sửa: gateway vẫn định tuyến bằng khoá yaml, và đổi sang
+            # tên service tự khai sẽ làm hỏng mọi đường đang chạy. Chỉ nói ra,
+            # vì lệch hai tên này trước đây hỏng hoàn toàn im lặng.
+            log.warning(
+                "service_name_mismatch", service=entry.name, declared=info.name,
+                detail="tên trong services.yaml khác tên service tự khai qua /v1/info",
+            )
         self._states[entry.name] = ServiceState(
-            info=info, base_url=entry.base_url, status=status,
+            name=entry.name, info=info, base_url=entry.base_url, status=status,
             last_seen_at=datetime.now(UTC),
         )
 

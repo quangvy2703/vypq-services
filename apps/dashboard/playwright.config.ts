@@ -6,8 +6,10 @@ const TOKEN = "token-e2e";
 
 export default defineConfig({
   testDir: "./tests/e2e",
-  // Chỉ chạy tuần tự: gateway giả giữ trạng thái trong RAM, chạy song song thì
-  // các test giẫm lên danh sách host của nhau.
+  // Chạy tuần tự vì gateway giả giữ trạng thái trong RAM và dùng chung cho mọi
+  // test. Bộ test hiện tại vẫn xanh khi chạy song song (mỗi test đặt tên host
+  // riêng), nên đây là phòng thủ cho test viết sau chứ không phải cách chữa một
+  // va chạm đang có.
   workers: 1,
   use: { baseURL: `http://127.0.0.1:${APP_PORT}` },
   webServer: [
@@ -16,8 +18,8 @@ export default defineConfig({
       url: `http://127.0.0.1:${GATEWAY_PORT}/v1/services`,
       reuseExistingServer: false,
       env: { FAKE_GATEWAY_TOKEN: TOKEN, FAKE_GATEWAY_PORT: String(GATEWAY_PORT) },
-      // Gateway giả trả 401 khi không có token — coi đó là "đã sống".
-      ignoreHTTPSErrors: true,
+      // Playwright coi mọi status < 404 là "server đã sống", nên 401 mà gateway
+      // giả trả khi thiếu token vẫn tính là sẵn sàng — đúng ý ta muốn.
     },
     {
       command: `pnpm build && pnpm exec next start -p ${APP_PORT}`,

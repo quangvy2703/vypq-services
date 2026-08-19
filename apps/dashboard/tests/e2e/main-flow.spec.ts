@@ -108,9 +108,18 @@ test("gỡ host đi qua được route có params bất đồng bộ của Next 
   await expect(page.getByRole("row", { name: /a100-sap-tra-may/ })).toHaveCount(0);
 });
 
-test("đăng xuất thì phiên hết hiệu lực", async ({ page }) => {
+test("đăng xuất đưa về trang đăng nhập, không phải một trang JSON", async ({ page }) => {
   await login(page);
   await page.getByRole("button", { name: "Đăng xuất" }).click();
+
+  // Nav dùng <form method="post"> nên đây là điều hướng thật của trình duyệt.
+  // Trả JSON thì người dùng đứng lại ở màn hình {"ok":true} — phiên xoá rồi
+  // nhưng không có đường quay lại. Test cũ chỉ goto("/hosts") ngay sau đó nên
+  // không bao giờ thấy chỗ nó thật sự dừng chân.
+  await expect(page).toHaveURL(/\/login$/);
+  await expect(page.getByLabel("Mật khẩu")).toBeVisible();
+
+  // Và phiên phải thật sự hết hiệu lực, không chỉ là chuyển trang.
   await page.goto("/hosts");
   await expect(page).toHaveURL(/\/login$/);
 });

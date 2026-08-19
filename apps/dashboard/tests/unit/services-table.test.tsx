@@ -5,6 +5,7 @@ import { ServicesTable } from "@/components/ServicesTable";
 import type { ServiceState } from "@/lib/types";
 
 const ocr: ServiceState = {
+  name: "ocr",
   info: {
     name: "ocr", task: "ocr", capability_input: "image", capability_output: "text_boxes",
     version: "0.1.0", invoke_path: "/v1/ocr", default_model: "paddleocr-v4-vi",
@@ -15,6 +16,7 @@ const ocr: ServiceState = {
 };
 
 const unknown: ServiceState = {
+  name: "ner",
   info: null,
   base_url: "http://ner:8000",
   status: "down",

@@ -61,7 +61,11 @@ def build_result_consumers(
             # — nên EventConsumer sẽ dead-letter một kết quả inference hoàn
             # toàn lành. Bỏ qua những state chưa biết info thay vì đoán.
             if state.info is not None and state.info.task is task:
-                return state.info.name
+                # Trả KHOÁ ĐỊNH TUYẾN chứ không phải tên service tự khai: đường
+                # sync ghi runs.service bằng khoá đó (SyncProxy.invoke), nên trả
+                # info.name ở đây sẽ làm hai đường ghi hai giá trị khác nhau cho
+                # cùng một service, và lọc theo service ở /v1/runs mất một nửa.
+                return state.name
         return task.value
 
     handler = make_result_handler(session_factory, service_name_for)

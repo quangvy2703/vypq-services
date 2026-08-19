@@ -10,10 +10,13 @@ export function formatClock(seconds: number): string {
   const safe = Math.max(0, seconds);
   const minutes = Math.floor(safe / 60);
   const restRaw = safe - minutes * 60;
-  // `toFixed` làm tròn theo biểu diễn nhị phân (3.25 → "3.3" thay vì "3.2"),
-  // khiến mốc thời gian hiện lên SAU thời điểm thật của segment. Cắt bớt
-  // (truncate) thay vì làm tròn để mốc hiển thị luôn <= giá trị gốc — quan
-  // trọng khi người dùng bấm "nghe từ" ngay tại mốc hiển thị.
+  // `toFixed` LÀM TRÒN (3.25 → "3.3"), khiến mốc thời gian hiện lên SAU thời
+  // điểm thật của segment — người dùng bấm "nghe từ" đúng mốc đang thấy sẽ tua
+  // quá chỗ cần nghe. Cắt bớt để mốc hiển thị luôn <= giá trị gốc.
+  //
+  // 1e-9 bên dưới là chuyện khác: nó chống sai số nhị phân thật (0.3 * 10 ra
+  // 2.9999999999999996, floor xuống 2). 3.25 thì nhị phân biểu diễn chính xác,
+  // sai lệch ở đó thuần tuý do quy tắc làm tròn.
   const restTenths = Math.floor(restRaw * 10 + 1e-9);
   const wholeSeconds = Math.floor(restTenths / 10);
   const tenth = restTenths % 10;

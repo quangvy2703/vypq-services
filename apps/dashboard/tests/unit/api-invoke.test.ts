@@ -88,6 +88,27 @@ describe("POST /api/invoke", () => {
     expect(body.message).toMatch(/25 MB/);
   });
 
+  it("chặn theo Content-Length trước khi parse form", async () => {
+    // request.formData() của Next ném lỗi trên body quá lớn, và lỗi đó rơi vào
+    // nhánh 502 chung "không gọi được gateway" — nói sai hoàn toàn chỗ hỏng.
+    // Đọc Content-Length trước thì người dùng nhận đúng 413.
+    const request = new Request("http://localhost:3001/api/invoke", {
+      method: "POST",
+      headers: { "content-length": String(200 * 1024 * 1024) },
+      body: new FormData(),
+    });
+    const response = await POST(request);
+    expect(response.status).toBe(413);
+    await expect(response.json()).resolves.toMatchObject({ message: expect.stringMatching(/25 MB/) });
+    expect(mocked.invokeUpload).not.toHaveBeenCalled();
+  });
+
+  it("không chặn nhầm khi Content-Length thiếu hoặc không phải số", async () => {
+    mocked.invokeUpload.mockResolvedValue({ trace_id: "t1", mode: "sync", run_id: "r1", result: {} });
+    const response = await POST(upload({ service: "ocr" }, smallFile()));
+    expect(response.status).toBe(200);
+  });
+
   it("nhận file đúng bằng 25 MB", async () => {
     mocked.invokeUpload.mockResolvedValue({ trace_id: "t1", mode: "sync", run_id: "r1", result: {} });
     const exact = new File([new Uint8Array(25 * 1024 * 1024)], "vua-du.wav", { type: "audio/wav" });

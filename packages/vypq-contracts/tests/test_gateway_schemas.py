@@ -85,7 +85,7 @@ def test_service_info_requires_invoke_path():
 
 def test_service_state_carries_health():
     state = ServiceState(
-        info=ServiceInfo(
+        name="ocr", info=ServiceInfo(
             name="ocr", task=Task.OCR, capability_input="image",
             capability_output="text_boxes", version="0.1.0", invoke_path="/v1/ocr",
         ),
@@ -100,7 +100,7 @@ def test_service_state_info_defaults_to_none():
     # Chưa từng poll thành công thì không có ServiceInfo thật để gắn vào —
     # info phải construct được mà không truyền, và mặc định là None chứ
     # không phải một giá trị đoán (vd hardcode Task.OCR).
-    state = ServiceState(base_url="http://ocr:8001")
+    state = ServiceState(name="ocr", base_url="http://ocr:8001")
     assert state.info is None
 
 

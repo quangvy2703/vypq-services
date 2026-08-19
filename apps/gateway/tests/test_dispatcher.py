@@ -17,7 +17,7 @@ class FakeProducer:
 def _registry(status=HealthStatus.OK) -> ServiceRegistry:
     reg = ServiceRegistry([ServiceEntry(name="ocr", base_url="http://ocr:8001")])
     reg._states["ocr"] = ServiceState(
-        info=ServiceInfo(
+        name="ocr", info=ServiceInfo(
             name="ocr", task=Task.OCR, capability_input="image",
             capability_output="text_boxes", version="0.1.0", invoke_path="/v1/ocr",
         ),
