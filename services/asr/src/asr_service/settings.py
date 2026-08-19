@@ -3,7 +3,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 from vypq_core.config import BaseServiceSettings
-from vypq_core.host_registry import HostRef
+from vypq_core.host_registry import DiscoveryHostRegistry, HostRef, HostRegistry, StaticHostRegistry
 
 
 class AsrSettings(BaseServiceSettings):
@@ -39,3 +39,26 @@ def load_hosts(path: Path) -> list[HostRef]:
         return []
     parsed = HostsFile.model_validate(yaml.safe_load(path.read_text(encoding="utf-8")))
     return parsed.host_discovery.fallback_static
+
+
+def build_host_registry(settings: AsrSettings) -> HostRegistry:
+    """Dựng registry theo `host_discovery.source`.
+
+    Đây là toàn bộ chi phí của việc chuyển từ danh sách tĩnh sang discovery
+    động: một dòng trong config, không dòng nào trong logic service.
+    """
+    if not settings.hosts_path.is_file():
+        return StaticHostRegistry([])
+    parsed = HostsFile.model_validate(
+        yaml.safe_load(settings.hosts_path.read_text(encoding="utf-8"))
+    )
+    discovery = parsed.host_discovery
+    if discovery.source == "gateway" and discovery.url:
+        return DiscoveryHostRegistry(
+            discovery.url,
+            refresh_s=discovery.refresh_s,
+            fallback=discovery.fallback_static,
+        )
+    # source=gateway mà thiếu url là cấu hình sai; rơi về static còn hơn ném
+    # lúc khởi động và làm service không lên được.
+    return StaticHostRegistry(discovery.fallback_static)

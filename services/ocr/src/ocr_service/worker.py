@@ -4,7 +4,6 @@ from collections.abc import Awaitable, Callable
 import httpx
 from vypq_contracts.common import ErrorCode, Task
 from vypq_core.errors import ServiceError
-from vypq_core.host_registry import StaticHostRegistry
 from vypq_core.http_client import UpstreamError
 from vypq_core.logging import get_logger, setup_logging
 from vypq_events.consumer import EventConsumer
@@ -15,7 +14,7 @@ from vypq_events.topics import dlq_topic, request_topic, result_topic
 
 from ocr_service.backend.remote import RemoteOcrBackend
 from ocr_service.handler import OcrHandler
-from ocr_service.settings import OcrSettings, load_hosts
+from ocr_service.settings import OcrSettings, build_host_registry
 
 log = get_logger(__name__)
 
@@ -101,7 +100,7 @@ class OcrWorkerHandler:
 async def main() -> None:
     settings = OcrSettings()
     setup_logging(settings.log_level)
-    registry = StaticHostRegistry(load_hosts(settings.hosts_path))
+    registry = build_host_registry(settings)
     backend = RemoteOcrBackend(registry, timeout_s=settings.timeout_s)
     handler = OcrHandler(
         backend, default_model=settings.default_model, max_side=settings.max_side

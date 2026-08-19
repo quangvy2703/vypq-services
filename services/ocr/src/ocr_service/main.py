@@ -5,13 +5,12 @@ from vypq_contracts.common import HealthStatus, Task
 from vypq_contracts.gateway import ServiceInfo
 from vypq_contracts.ocr import OcrResponse
 from vypq_core.app import create_app
-from vypq_core.host_registry import StaticHostRegistry
 from vypq_core.logging import get_trace_id
 from vypq_core.service_info import build_info_router
 
 from ocr_service.backend.remote import RemoteOcrBackend
 from ocr_service.handler import OcrHandler
-from ocr_service.settings import OcrSettings, load_hosts
+from ocr_service.settings import OcrSettings, build_host_registry
 
 
 def build_app_with(handler: OcrHandler, settings: OcrSettings, backend=None, lifespan=None):
@@ -54,7 +53,7 @@ def build_app_with(handler: OcrHandler, settings: OcrSettings, backend=None, lif
 
 def build_app():
     settings = OcrSettings()
-    registry = StaticHostRegistry(load_hosts(settings.hosts_path))
+    registry = build_host_registry(settings)
     backend = RemoteOcrBackend(registry, timeout_s=settings.timeout_s)
     handler = OcrHandler(
         backend, default_model=settings.default_model, max_side=settings.max_side

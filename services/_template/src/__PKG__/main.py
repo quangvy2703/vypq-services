@@ -5,13 +5,12 @@ from vypq_contracts.common import HealthStatus, Task
 from vypq_contracts.gateway import ServiceInfo
 from vypq_contracts.__TASK__ import __RESP__
 from vypq_core.app import create_app
-from vypq_core.host_registry import StaticHostRegistry
 from vypq_core.logging import get_trace_id
 from vypq_core.service_info import build_info_router
 
 from __PKG__.backend.remote import Remote__BACKEND__
 from __PKG__.handler import __HANDLER__
-from __PKG__.settings import __SETTINGS__, load_hosts
+from __PKG__.settings import __SETTINGS__, build_host_registry
 
 
 def build_app_with(handler: __HANDLER__, settings: __SETTINGS__, backend=None, lifespan=None):
@@ -54,7 +53,7 @@ def build_app_with(handler: __HANDLER__, settings: __SETTINGS__, backend=None, l
 
 def build_app():
     settings = __SETTINGS__()
-    registry = StaticHostRegistry(load_hosts(settings.hosts_path))
+    registry = build_host_registry(settings)
     backend = Remote__BACKEND__(registry, timeout_s=settings.timeout_s)
     handler = __HANDLER__(backend, default_model=settings.default_model)
 

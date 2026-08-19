@@ -4,7 +4,6 @@ from collections.abc import Awaitable, Callable
 import httpx
 from vypq_contracts.common import ErrorCode, Task
 from vypq_core.errors import ServiceError
-from vypq_core.host_registry import StaticHostRegistry
 from vypq_core.http_client import UpstreamError
 from vypq_core.logging import get_logger, setup_logging
 from vypq_events.consumer import EventConsumer
@@ -15,7 +14,7 @@ from vypq_events.topics import dlq_topic, request_topic, result_topic
 
 from __PKG__.backend.remote import Remote__BACKEND__
 from __PKG__.handler import __HANDLER__
-from __PKG__.settings import __SETTINGS__, load_hosts
+from __PKG__.settings import __SETTINGS__, build_host_registry
 
 log = get_logger(__name__)
 
@@ -101,7 +100,7 @@ class __WORKERHANDLER__:
 async def main() -> None:
     settings = __SETTINGS__()
     setup_logging(settings.log_level)
-    registry = StaticHostRegistry(load_hosts(settings.hosts_path))
+    registry = build_host_registry(settings)
     backend = Remote__BACKEND__(registry, timeout_s=settings.timeout_s)
     handler = __HANDLER__(backend, default_model=settings.default_model)
     producer = EventProducer(settings.brokers)
