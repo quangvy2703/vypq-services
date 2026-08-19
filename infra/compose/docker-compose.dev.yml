@@ -34,6 +34,10 @@ services:
       POSTGRES_USER: vypq
       POSTGRES_PASSWORD: vypq
       POSTGRES_DB: vypq
+    # Không có volume thì dữ liệu nằm trong lớp ghi của container và "compose
+    # down" xoá sạch lịch sử chạy — mất im lặng, vì container mới vẫn lên bình
+    # thường và chỉ trống rỗng.
+    volumes: ["pgdata:/var/lib/postgresql/data"]
     ports: ["5432:5432"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U vypq"]
@@ -81,3 +85,6 @@ services:
       GF_SECURITY_ADMIN_PASSWORD: vypq
     ports: ["3000:3000"]
     depends_on: [prometheus]
+
+volumes:
+  pgdata:

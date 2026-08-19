@@ -20,4 +20,9 @@ HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
 # xong vẫn chết ngay khi start với "references a workspace ... but is not a
 # workspace member". Container không phải chỗ để giải phụ thuộc lần nữa: đã
 # sync ở bước build rồi.
-CMD [".venv/bin/uvicorn", "gateway.main:app", "--host", "0.0.0.0", "--port", "8080"]
+# Chạy migration rồi mới phục vụ. Không có bước này thì một lần triển khai
+# sạch đơn giản là không chạy: mọi truy vấn chết với 'relation "hosts" does not
+# exist'. Trước đây nó có vẻ chạy được chỉ vì bảng còn sót lại từ lần chạy
+# alembic thủ công trên máy chủ — một cái bẫy chỉ lộ ra khi ai đó dựng mới.
+# alembic upgrade là idempotent nên chạy lại mỗi lần start không sao.
+CMD ["sh", "-c", ".venv/bin/alembic -c apps/gateway/alembic.ini upgrade head && exec .venv/bin/uvicorn gateway.main:app --host 0.0.0.0 --port 8080"]
