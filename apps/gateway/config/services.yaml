@@ -1,0 +1,3 @@
+services:
+  - {name: ocr, base_url: http://localhost:8001}
+  - {name: asr, base_url: http://localhost:8002}
