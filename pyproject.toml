@@ -18,6 +18,7 @@ dev = [
     "respx>=0.21",
     "ruff>=0.7",
     "mypy>=1.13",
+    "types-PyYAML>=6.0",
     "vypq-contracts",
     "asgi-lifespan>=2.1",
     "vypq-core",
@@ -60,4 +61,11 @@ python_version = "3.12"
 # chữ ký của host_registry.py.
 [[tool.mypy.overrides]]
 module = "vypq_contracts.*"
+ignore_missing_imports = true
+
+# aiokafka chưa publish type stubs (và không có py.typed marker). Chỉ tắt
+# cảnh báo thiếu stub cho riêng module này, không tắt kiểm tra chữ ký của
+# code gọi nó trong vypq_events.
+[[tool.mypy.overrides]]
+module = "aiokafka.*"
 ignore_missing_imports = true

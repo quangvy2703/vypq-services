@@ -1,7 +1,9 @@
 from datetime import UTC, datetime
+from typing import cast
 
 from sqlalchemy import delete as sql_delete
 from sqlalchemy import select
+from sqlalchemy.engine import CursorResult
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from vypq_contracts.gateway import HostRegistration, HostState
@@ -109,7 +111,15 @@ class HostRepo:
         return refs
 
     async def delete(self, name: str) -> bool:
-        result = await self._s.execute(sql_delete(Host).where(Host.name == name))
+        # session.execute() is typed to return the generic Result, but for a
+        # Core DML construct like delete() it always returns a CursorResult
+        # at runtime (CursorResult subclasses Result) — that's what carries
+        # rowcount. Narrowing here reflects that documented SQLAlchemy
+        # behaviour rather than papering over an actual type mismatch.
+        result = cast(
+            CursorResult,
+            await self._s.execute(sql_delete(Host).where(Host.name == name)),
+        )
         await self._s.commit()
         return result.rowcount > 0
 

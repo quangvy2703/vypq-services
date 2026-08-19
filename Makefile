@@ -8,4 +8,4 @@ lint:
 fmt:
 	uv run ruff format .
 typecheck:
-	uv run mypy packages/vypq-core/src/vypq_core/host_registry.py
+	uv run mypy packages/vypq-contracts/src packages/vypq-core/src packages/vypq-events/src apps/gateway/src
