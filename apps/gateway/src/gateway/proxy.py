@@ -42,6 +42,10 @@ class SyncProxy:
         self, service: str, data: bytes, filename: str,
         model_version: str | None, trace_id: str | None = None,
     ) -> RunRecord:
+        # Ranh giới ghi `runs`: những lần TỪ CHỐI phía gateway (không có service,
+        # chưa từng poll được, đã biết là DOWN) KHÔNG tạo dòng nào — chưa có gì
+        # chạy nên chưa có gì để ghi lịch sử. Từ lúc đã gửi request đi thì mọi
+        # kết cục, kể cả hỏng, đều phải có một dòng.
         state = self._registry.get(service)
         if state is None:
             raise ServiceError(ErrorCode.BAD_INPUT, f"không có service '{service}'", 404)

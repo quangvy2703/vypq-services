@@ -110,15 +110,87 @@ async def test_unknown_service_is_404(ctx):
     assert resp.status_code == 404
 
 
+@respx.mock
 async def test_down_service_is_refused_before_sending_anything(ctx):
-    # Không gửi request vào một service đã biết là chết: 503 ngay, rõ lý do.
-    client, _factory, registry = ctx
+    # Không gửi request vào một service đã biết là chết: 503 ngay, rõ lý do,
+    # và không được đụng tới downstream lẫn lịch sử runs.
+    client, factory, registry = ctx
+    route = respx.post("http://ocr:8001/v1/ocr").mock(
+        return_value=httpx.Response(200, json=OCR_RESULT)
+    )
     registry._states["ocr"] = _state(HealthStatus.DOWN)
     resp = await client.post(
         "/v1/invoke/upload", data={"service": "ocr"},
         files={"file": ("a.png", b"x", "image/png")},
     )
     assert resp.status_code == 503
+    assert not route.called
+    async with factory() as s:
+        _runs, total = await RunRepo(s).list_runs()
+    assert total == 0
+
+
+async def test_service_with_no_info_is_refused_without_recording(ctx):
+    # Chưa poll được lần nào nên chưa biết invoke_path: từ chối ngay, không
+    # ghi dòng nào — nửa còn lại của ranh giới ghi runs, trước đây chưa có test.
+    client, factory, registry = ctx
+    registry._states["ocr"] = ServiceState(
+        info=None, base_url="http://ocr:8001", status=HealthStatus.OK
+    )
+    resp = await client.post(
+        "/v1/invoke/upload", data={"service": "ocr"},
+        files={"file": ("a.png", b"x", "image/png")},
+    )
+    assert resp.status_code == 503
+    async with factory() as s:
+        _runs, total = await RunRepo(s).list_runs()
+    assert total == 0
+
+
+@respx.mock
+async def test_caller_trace_id_agrees_everywhere(ctx):
+    # Bug gốc: header response, body, dòng runs và header gửi xuống service có
+    # thể mang bốn giá trị khác nhau. Giờ tất cả phải khớp với trace_id caller
+    # gửi lên, chứ không phải một UUID mới sinh ra ở đâu đó giữa đường.
+    client, factory, _reg = ctx
+    downstream_headers = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        downstream_headers["x-trace-id"] = request.headers.get("x-trace-id")
+        return httpx.Response(200, json=OCR_RESULT)
+
+    respx.post("http://ocr:8001/v1/ocr").mock(side_effect=_capture)
+    resp = await client.post(
+        "/v1/invoke/upload",
+        data={"service": "ocr"},
+        files={"file": ("a.png", b"x", "image/png")},
+        headers={"x-trace-id": "caller-supplied-trace-abc"},
+    )
+    assert resp.status_code == 200
+    assert resp.headers["x-trace-id"] == "caller-supplied-trace-abc"
+    assert resp.json()["trace_id"] == "caller-supplied-trace-abc"
+    assert downstream_headers["x-trace-id"] == "caller-supplied-trace-abc"
+    async with factory() as s:
+        runs, _total = await RunRepo(s).list_runs()
+    assert runs[0].trace_id == "caller-supplied-trace-abc"
+
+
+@respx.mock
+async def test_no_inbound_trace_id_still_generates_a_consistent_one(ctx):
+    # Không có header thì vẫn phải sinh trace_id mới như cũ — nhưng body và
+    # dòng runs phải khớp nhau (đều lấy từ cùng một giá trị được sinh ra).
+    client, factory, _reg = ctx
+    respx.post("http://ocr:8001/v1/ocr").mock(return_value=httpx.Response(200, json=OCR_RESULT))
+    resp = await client.post(
+        "/v1/invoke/upload", data={"service": "ocr"},
+        files={"file": ("a.png", b"x", "image/png")},
+    )
+    assert resp.status_code == 200
+    body_trace_id = resp.json()["trace_id"]
+    assert body_trace_id
+    async with factory() as s:
+        runs, _total = await RunRepo(s).list_runs()
+    assert runs[0].trace_id == body_trace_id
 
 
 @respx.mock
