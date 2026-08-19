@@ -23,11 +23,20 @@ def build_app(
 def background_lifespan(
     tasks: Sequence[Callable[[], Awaitable[None]]],
     on_shutdown: Sequence[Callable[[], Awaitable[None]]],
+    on_startup: Sequence[Callable[[], Awaitable[None]]] = (),
 ):
-    """Chạy các vòng nền suốt vòng đời app, huỷ sạch khi tắt."""
+    """Chạy các vòng nền suốt vòng đời app, huỷ sạch khi tắt.
+
+    MỖI vòng là một task riêng được theo dõi. Gộp nhiều vòng vào một task rồi
+    `gather` bên trong là sai: gather KHÔNG huỷ các nhánh còn lại khi một nhánh
+    ném lỗi, nên nhánh sống sót thành task mồ côi — không nằm trong danh sách
+    theo dõi, không bị huỷ lúc tắt, và vẫn chạy sau khi app đã đóng.
+    """
 
     @asynccontextmanager
     async def lifespan(_app):
+        for hook in on_startup:
+            await hook()
         running = [asyncio.create_task(_guard(t)) for t in tasks]
         try:
             yield
@@ -83,11 +92,12 @@ def create_gateway() -> FastAPI:
             await service_registry.refresh()
             await asyncio.sleep(settings.poll_interval_s)
 
-    async def run_consumers() -> None:
+    async def start_messaging() -> None:
+        # Khởi động trước khi các vòng chạy, để mỗi consumer.run có thể là một
+        # task riêng được theo dõi thay vì gộp chung một task.
         await producer.start()
         for consumer in consumers:
             await consumer.start()
-        await asyncio.gather(*(c.run() for c in consumers))
 
     async def shutdown() -> None:
         for consumer in consumers:
@@ -108,7 +118,9 @@ def create_gateway() -> FastAPI:
             build_runs_router(factory),
         ],
         lifespan=background_lifespan(
-            [poller.run, refresh_services, run_consumers], on_shutdown=[shutdown]
+            [poller.run, refresh_services, *(c.run for c in consumers)],
+            on_shutdown=[shutdown],
+            on_startup=[start_messaging],
         ),
     )
 

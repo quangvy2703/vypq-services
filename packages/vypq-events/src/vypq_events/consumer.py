@@ -107,6 +107,8 @@ class EventConsumer:
         # Vẫn gọi getmany() khi đang pause, không bỏ qua: consumer thật trả rỗng
         # sau timeout_ms nên vòng lặp tự có nhịp, và aiokafka giữ được heartbeat
         # với group. Bỏ poll đi thì run() quay tít không nghỉ.
+        if self._consumer is None:
+            raise UpstreamError("EventConsumer chưa start(), chưa có gì để consume")
         self._maybe_resume()
         batch = await self._consumer.getmany(
             timeout_ms=self._poll_ms, max_records=self._max_records
