@@ -5,9 +5,11 @@ scrape_configs:
     static_configs: [{targets: ["gateway:8080"]}]
   - job_name: services
     static_configs: [{targets: ["ocr:8001", "asr:8002"]}]
-  # Redpanda tự phát metric của nó, trong đó có độ trễ (lag) của từng consumer
-  # group. Đây là chỉ số cho biết worker có theo kịp hàng đợi không — thứ mà
-  # counter của chính ứng dụng không thấy được.
+  # Redpanda v24.2.7 KHÔNG phát metric lag của consumer group — đã kiểm cả
+  # /public_metrics lẫn /metrics trên broker thật, không series nào khớp "lag".
+  # Muốn có lag thì tính bằng PromQL từ hai gauge sẵn có:
+  #   redpanda_kafka_max_offset - redpanda_kafka_consumer_group_committed_offset
+  # join theo topic/partition/group. Kiểm bằng query thật trước khi đặt ngưỡng.
   - job_name: redpanda
     metrics_path: /public_metrics
     static_configs: [{targets: ["redpanda:9644"]}]

@@ -1,3 +1,7 @@
 services:
-  - {name: ocr, base_url: http://localhost:8001}
-  - {name: asr, base_url: http://localhost:8002}
+  # Tên container trong mạng compose, KHÔNG phải localhost: gateway chạy trong
+  # container nên "localhost:8001" trỏ về chính nó và service vĩnh viễn "chết".
+  # Chạy gateway ngoài máy chủ thì đặt lại bằng VYPQ_SERVICES_PATH trỏ sang file
+  # khác, đừng sửa file này.
+  - {name: ocr, base_url: http://ocr:8001}
+  - {name: asr, base_url: http://asr:8002}

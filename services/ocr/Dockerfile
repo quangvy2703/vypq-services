@@ -13,13 +13,16 @@ WORKDIR /app
 COPY pyproject.toml uv.lock .python-version ./
 COPY packages ./packages
 COPY services/ocr ./services/ocr
-# Kèm cả nhóm dev để chạy được test ngay trên image. Bản build thuần production
-# thì thêm --no-dev cho ảnh gọn hơn.
-RUN uv sync --frozen --package ocr-service --group dev
+# Không kèm nhóm dev: `dev` là nhóm của project gốc, không tồn tại khi đã
+# --package ocr-service, nên `--group dev` làm build chết ngay. Nó cũng kéo
+# theo model-host và các service khác — những thứ image này cố tình không chứa.
+RUN uv sync --frozen --package ocr-service
 
 ENV VYPQ_HOSTS_PATH=/app/services/ocr/config.yaml \
     VYPQ_PORT=8001
 EXPOSE 8001
 HEALTHCHECK --interval=15s --timeout=5s --retries=3 \
   CMD curl -fsS http://localhost:8001/health || exit 1
-CMD ["uv", "run", "uvicorn", "ocr_service.main:app", "--host", "0.0.0.0", "--port", "8001"]
+# Gọi thẳng uvicorn trong .venv chứ không qua "uv run": uv run giải lại phụ
+# thuộc lúc khởi động và kéo cả nhóm dev của workspace, thứ không có trong image.
+CMD [".venv/bin/uvicorn", "ocr_service.main:app", "--host", "0.0.0.0", "--port", "8001"]

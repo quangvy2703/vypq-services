@@ -12,7 +12,7 @@ DC=(docker compose -f "$COMPOSE_DIR/docker-compose.dev.yml")
 
 # Hạ tầng + hai thứ tự viết. Không bật prometheus/grafana/redpanda-console mặc
 # định: chúng không cần cho việc dùng dashboard, chỉ tốn RAM.
-CORE=(postgres redpanda gateway dashboard)
+CORE=(postgres redpanda gateway ocr asr dashboard)
 
 die() { echo "LỖI: $*" >&2; exit 1; }
 
@@ -76,6 +76,8 @@ cmd_up() {
   cho_khoe postgres
   cho_khoe redpanda
   cho_khoe gateway
+  cho_khoe ocr
+  cho_khoe asr
   # dashboard không khai healthcheck nên hỏi thẳng nó.
   local giay=0
   printf 'chờ dashboard'
@@ -92,18 +94,21 @@ cmd_up() {
   Dashboard   http://localhost:3001     mật khẩu: $DASHBOARD_PASSWORD
   Gateway     http://localhost:8080     token:    $VYPQ_TOKEN
 
-  Playground còn trống cho tới khi có service chạy — khai chúng vào
-  apps/gateway/config/services.yaml. Trang không tự làm mới: cắm host xong
-  phải tải lại trang mới thấy nó chuyển xanh.
+  OCR         http://localhost:8001
+  ASR         http://localhost:8002
+
+  Hai service đã lên nhưng CHƯA có máy GPU nào: chạy thử sẽ báo không có host.
+  Cắm máy ở trang Model Hosts trước. Trang không tự làm mới — cắm xong phải
+  tải lại trang mới thấy nó chuyển xanh.
 EOF
 }
 
 cmd_dev() {
   sinh_env
   dong_bo_env_local
-  # Chỉ hạ tầng + gateway; dashboard chạy bằng pnpm dev để có hot reload.
-  "${DC[@]}" up -d --build postgres redpanda gateway
-  cho_khoe postgres; cho_khoe redpanda; cho_khoe gateway
+  # Mọi thứ trừ dashboard — nó chạy bằng pnpm dev để có hot reload.
+  "${DC[@]}" up -d --build postgres redpanda gateway ocr asr
+  cho_khoe postgres; cho_khoe redpanda; cho_khoe gateway; cho_khoe ocr; cho_khoe asr
   echo
   echo "Hạ tầng sẵn sàng. Chạy dashboard có hot reload:"
   echo "  cd apps/dashboard && pnpm install && pnpm dev"
@@ -127,7 +132,7 @@ case "${1:-up}" in
 Cách dùng: scripts/stack.sh <lệnh>
 
   up      dựng cả stack trong docker, in ra URL và mật khẩu   (mặc định)
-  dev     chỉ dựng hạ tầng + gateway, để chạy pnpm dev ngoài
+  dev     dựng mọi thứ trừ dashboard, để chạy pnpm dev ngoài
   down    tắt (thêm -v để xoá luôn dữ liệu postgres)
   ps      trạng thái container
   logs    theo dõi log, mặc định gateway. vd: logs dashboard

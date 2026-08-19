@@ -57,6 +57,26 @@ services:
       postgres: {condition: service_healthy}
       redpanda: {condition: service_healthy}
 
+  ocr:
+    build: {context: ../.., dockerfile: services/ocr/Dockerfile}
+    environment:
+      # Service hỏi gateway danh sách máy GPU đang thuê qua
+      # /v1/discovery/hosts — đường đó mang token nên phải xác thực.
+      VYPQ_GATEWAY_TOKEN: ${VYPQ_TOKEN:?bat buoc dat VYPQ_TOKEN}
+      VYPQ_BROKERS: redpanda:9093
+    ports: ["8001:8001"]
+    depends_on:
+      redpanda: {condition: service_healthy}
+
+  asr:
+    build: {context: ../.., dockerfile: services/asr/Dockerfile}
+    environment:
+      VYPQ_GATEWAY_TOKEN: ${VYPQ_TOKEN:?bat buoc dat VYPQ_TOKEN}
+      VYPQ_BROKERS: redpanda:9093
+    ports: ["8002:8002"]
+    depends_on:
+      redpanda: {condition: service_healthy}
+
   dashboard:
     build: {context: ../../apps/dashboard, dockerfile: Dockerfile}
     environment:
