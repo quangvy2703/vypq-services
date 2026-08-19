@@ -8,7 +8,10 @@ dependencies = []
 members = ["packages/*", "apps/*", "services/*"]
 # _template không phải service thật (token chưa thay thế) — loại khỏi workspace
 # để "uv sync" không cố build nó như một package thật.
-exclude = ["services/_template"]
+# apps/dashboard là ứng dụng Node/pnpm, không có pyproject.toml; glob "apps/*"
+# khớp phải nó và làm uv từ chối resolve cả workspace, tức là pytest không chạy
+# được một test nào.
+exclude = ["services/_template", "apps/dashboard"]
 
 [dependency-groups]
 dev = [

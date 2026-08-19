@@ -60,6 +60,13 @@ Spec §3.8 yêu cầu: **service thứ ba (NER, TTS...) chỉ cần trả đúng
 - **Không thêm thư viện UI** (shadcn, Radix, MUI, chart lib). Dependency mới ngoài danh sách ở Task 1 phải hỏi trước.
 - **Mọi giá trị capability đọc từ gateway**, không hardcode `"ocr"`/`"asr"` trong page/component; đi qua `src/lib/capability.ts`.
 - **`vitest run` phải xanh và không cần mạng, không cần Docker.**
+- **`make test` (pytest) phải còn nguyên vẹn: 364 passed, 7 deselected.** `apps/dashboard`
+  đã được thêm vào `exclude` của `[tool.uv.workspace]` trong `pyproject.toml` gốc, vì glob
+  `apps/*` khớp phải một thư mục Node không có `pyproject.toml` và làm uv từ chối resolve cả
+  workspace — pytest không chạy nổi một test nào. Đừng gỡ dòng exclude đó ra.
+- **pnpm 11 chặn postinstall script theo mặc định.** `apps/dashboard/pnpm-workspace.yaml`
+  bật `allowBuilds` cho `esbuild` (qua vite/vitest) và `sharp` (optional dependency chính
+  thức của `next`). Thiếu nó thì `pnpm install --frozen-lockfile` thất bại hẳn.
 
 ---
 
@@ -379,7 +386,7 @@ export function relativeTime(iso: string | null, nowMs: number): string {
 - [ ] **Step 6: Chạy test, xác nhận xanh**
 
 Run: `cd apps/dashboard && pnpm test`
-Expected: PASS — 14 test.
+Expected: PASS — 13 test.
 
 - [ ] **Step 7: Viết layout tối thiểu để `next build` chạy được**
 
@@ -447,7 +454,7 @@ lint-web:
 ```
 
 Run: `make test-web`
-Expected: PASS — 14 test.
+Expected: PASS — 13 test.
 
 - [ ] **Step 10: Commit**
 
@@ -1825,7 +1832,7 @@ export function GET(): Promise<NextResponse> {
 - [ ] **Step 5: Chạy test, xác nhận xanh**
 
 Run: `cd apps/dashboard && pnpm test tests/unit/api-hosts.test.ts && pnpm lint`
-Expected: PASS — 14 test.
+Expected: PASS — 13 test.
 
 - [ ] **Step 6: Commit**
 
