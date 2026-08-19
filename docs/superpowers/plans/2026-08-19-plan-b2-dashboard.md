@@ -4360,19 +4360,30 @@ Trong component, đổi `const [outcome, setOutcome] = useState<RunOutcome | nul
   const [outcomes, setOutcomes] = useState<RunOutcome[]>([]);
 ```
 
-`selectService` và `selectFile` đặt lại `setOutcomes([])`, và `selectService` thêm `setExtras([])`.
+**Giữ nguyên hai cơ chế đã có, chỉ đổi kiểu dữ liệu chúng dọn** — chúng vá hai lỗi
+thật đã tái hiện được, đừng viết lại `run()` từ đầu:
+
+- `discardInFlight()` đổi `setOutcome(null)` thành `setOutcomes([])`; phần tăng
+  `runToken.current` và `setPending(false)` giữ nguyên.
+- `selectService` thêm `setExtras([])` (model của service cũ không thuộc service mới).
+- `useEffect` tạo/thu hồi object URL **không đụng tới**.
 
 `run()` thành:
 
 ```tsx
   async function run(): Promise<void> {
     if (!file) return;
+    const token = runToken.current + 1;
+    runToken.current = token;
     setPending(true);
     // Set khử trùng lặp: tick đúng model đang chọn ở ô chính thì vẫn chỉ chạy một lần.
     const targets = [...new Set([model, ...extras])];
     const settled = await Promise.allSettled(
-      targets.map((target) => runOne(service.name, file, target)),
+      targets.map((target) => runOne(activeService.name, file, target)),
     );
+    // Vẫn phải kiểm token như lượt chạy đơn: đổi service giữa chừng rồi kết quả
+    // cũ về trễ sẽ hiện output của service này qua viewer của service kia.
+    if (token !== runToken.current) return;
     setOutcomes(
       settled.map((entry, index) =>
         entry.status === "fulfilled"
