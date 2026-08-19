@@ -1,4 +1,4 @@
-.PHONY: test test-all lint fmt typecheck
+.PHONY: test test-all test-web lint lint-web fmt typecheck
 test:
 	uv run pytest
 test-all:
@@ -9,3 +9,7 @@ fmt:
 	uv run ruff format .
 typecheck:
 	uv run mypy packages/vypq-contracts/src packages/vypq-core/src packages/vypq-events/src apps/gateway/src
+test-web:
+	cd apps/dashboard && pnpm install --frozen-lockfile && pnpm test
+lint-web:
+	cd apps/dashboard && pnpm install --frozen-lockfile && pnpm lint

@@ -6,6 +6,7 @@ venv/
 .env.local
 node_modules/
 .next/
+*.tsbuildinfo
 dist/
 build/
 *.egg-info/
