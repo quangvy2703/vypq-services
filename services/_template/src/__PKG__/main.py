@@ -63,6 +63,9 @@ def build_app():
         # Không đóng thì các connection httpx của mỗi host treo tới khi tiến trình
         # chết — với worker chạy dài (Task 12) đó là rò tài nguyên thật.
         await backend.aclose()
+        # DiscoveryHostRegistry giữ client httpx riêng để poll gateway; không
+        # đóng thì client đó rò y hệt các client của backend ở trên.
+        await registry.aclose()
 
     return build_app_with(handler, settings, backend=backend, lifespan=_lifespan)
 

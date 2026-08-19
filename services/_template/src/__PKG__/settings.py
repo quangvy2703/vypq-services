@@ -4,6 +4,9 @@ import yaml
 from pydantic import BaseModel, Field
 from vypq_core.config import BaseServiceSettings
 from vypq_core.host_registry import DiscoveryHostRegistry, HostRef, HostRegistry, StaticHostRegistry
+from vypq_core.logging import get_logger
+
+log = get_logger(__name__)
 
 
 class __SETTINGS__(BaseServiceSettings):
@@ -60,5 +63,13 @@ def build_host_registry(settings: __SETTINGS__) -> HostRegistry:
             fallback=discovery.fallback_static,
         )
     # source=gateway mà thiếu url là cấu hình sai; rơi về static còn hơn ném
-    # lúc khởi động và làm service không lên được.
+    # lúc khởi động và làm service không lên được. Nhưng im lặng thì operator
+    # tưởng đang theo gateway trong khi thực ra chạy danh sách tĩnh cũ — phải
+    # log để còn biết mà sửa config.
+    if discovery.source == "gateway":
+        log.warning(
+            "host_discovery_gateway_missing_url",
+            fallback="static",
+            fallback_hosts=len(discovery.fallback_static),
+        )
     return StaticHostRegistry(discovery.fallback_static)

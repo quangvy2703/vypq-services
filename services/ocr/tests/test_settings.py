@@ -1,5 +1,6 @@
 from pathlib import Path
 
+import structlog.testing
 from ocr_service.settings import OcrSettings, build_host_registry
 from vypq_core.host_registry import DiscoveryHostRegistry, StaticHostRegistry
 
@@ -52,6 +53,17 @@ def test_gateway_source_without_url_falls_back_to_static(tmp_path):
     body = GATEWAY.replace("  url: http://gateway:8080/v1/discovery/hosts\n", "")
     registry = build_host_registry(_settings(tmp_path, body))
     assert isinstance(registry, StaticHostRegistry)
+
+
+def test_gateway_source_without_url_logs_a_warning(tmp_path):
+    # Rơi về static lặng lẽ là chính cái nguy hiểm: operator tưởng service
+    # đang theo gateway trong khi thực ra chạy danh sách tĩnh cũ, không có
+    # cách nào biết trừ khi log nói rõ.
+    body = GATEWAY.replace("  url: http://gateway:8080/v1/discovery/hosts\n", "")
+    with structlog.testing.capture_logs() as captured:
+        build_host_registry(_settings(tmp_path, body))
+    events = [entry["event"] for entry in captured]
+    assert "host_discovery_gateway_missing_url" in events
 
 
 def test_missing_config_file_gives_an_empty_static_registry(tmp_path):

@@ -75,6 +75,14 @@ def test_static_registry_satisfies_the_protocol():
     assert isinstance(StaticHostRegistry([]), HostRegistry)
 
 
+async def test_static_registry_aclose_is_awaitable_and_harmless():
+    # StaticHostRegistry không giữ client nào để đóng, nhưng caller đóng bất
+    # kỳ registry nào mà không cần biết đang cầm bản static hay discovery —
+    # aclose() phải tồn tại và không được ném lỗi.
+    reg = StaticHostRegistry([_host("a", [_model("m1")])])
+    await reg.aclose()
+
+
 def test_models_for_task_marks_unavailable_when_only_unhealthy_hosts_have_it():
     reg = StaticHostRegistry([_host("a", [_model("m1")], healthy=False)])
     models = reg.models_for_task(Task.OCR)

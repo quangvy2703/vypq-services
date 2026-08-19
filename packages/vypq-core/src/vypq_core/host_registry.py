@@ -45,6 +45,7 @@ class HostRegistry(Protocol):
     # Lưu ý @runtime_checkable chỉ kiểm method CÓ MẶT, không kiểm chữ ký: một bản
     # cài lease() thành hàm sync vẫn qua được isinstance.
     def lease(self, host: HostRef) -> AbstractAsyncContextManager[HostRef]: ...
+    async def aclose(self) -> None: ...
 
 
 def _pick_from(hosts: list[HostRef], model_id: str) -> HostRef:
@@ -109,6 +110,11 @@ class StaticHostRegistry:
     def lease(self, host: HostRef):
         return _lease(host)
 
+    # Không có client nào để đóng, nhưng vẫn cần tồn tại: caller đóng registry
+    # mà không cần biết đang cầm bản static hay discovery.
+    async def aclose(self) -> None:
+        return None
+
 
 class DiscoveryResponse(BaseModel):
     """Thân trả lời của gateway cho service hỏi danh sách host.
@@ -152,6 +158,19 @@ class DiscoveryHostRegistry:
             response = await self._client.get(self._url)
             response.raise_for_status()
             fresh = DiscoveryResponse.model_validate(response.json()).hosts
+            # `GET /v1/hosts` (dashboard, không token) parse THÀNH CÔNG vào cùng
+            # kiểu này vì `token` mặc định None — nhầm URL đó thay vì
+            # `/v1/discovery/hosts` không lộ ra lỗi nào ở đây, chỉ lộ ra sau
+            # hàng giờ khi mọi lệnh gọi model-host đều 401. Không ném lỗi vì một
+            # deployment có thể cố ý chạy model-host không cần token — chỉ cảnh
+            # báo để operator để ý ngay, thay vì tự suy luận từ log 401.
+            if fresh and all(h.token is None for h in fresh):
+                log.warning(
+                    "host_discovery_tokens_missing",
+                    url=self._url,
+                    hint="url có thể đang trỏ vào danh sách không token (dashboard)"
+                    " thay vì /v1/discovery/hosts",
+                )
         except Exception as exc:
             # Gateway sập không được kéo theo mọi service: danh sách cũ vẫn tốt
             # hơn danh sách rỗng, vì host trong đó có thể vẫn đang chạy.

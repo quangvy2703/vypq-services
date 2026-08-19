@@ -1,6 +1,7 @@
 import httpx
 import pytest
 import respx
+import structlog.testing
 from vypq_contracts.common import ModelKind, Task
 from vypq_contracts.hosting import ModelInfo
 from vypq_core.host_registry import (
@@ -196,6 +197,36 @@ async def test_host_removed_from_gateway_response_is_dropped():
         await reg.pick("m1")
     assert route.call_count == 2
     await reg.aclose()
+
+
+@respx.mock
+async def test_warns_when_every_fetched_host_lacks_a_token():
+    # `GET /v1/hosts` (dashboard, không token) parse THÀNH CÔNG vào cùng kiểu
+    # DiscoveryResponse vì `token` mặc định None. Nhầm URL đó thay vì
+    # `/v1/discovery/hosts` không lộ lỗi gì ở đây — chỉ lộ ra sau hàng giờ khi
+    # mọi lệnh gọi model-host đều 401. Registry phải cảnh báo ngay lúc fetch.
+    no_token = {**_host("a"), "token": None}
+    respx.get(URL).mock(return_value=httpx.Response(200, json=_body(no_token)))
+    reg = DiscoveryHostRegistry(URL)
+    with structlog.testing.capture_logs() as captured:
+        await reg.hosts()
+    await reg.aclose()
+    events = [entry["event"] for entry in captured]
+    assert "host_discovery_tokens_missing" in events
+
+
+@respx.mock
+async def test_no_warning_when_at_least_one_host_has_a_token():
+    # Một deployment CÓ THỂ cố ý chạy model-host không cần token — cảnh báo chỉ
+    # nên bật khi TOÀN BỘ host đều thiếu token, không phải khi có ít nhất một
+    # host bình thường.
+    respx.get(URL).mock(return_value=httpx.Response(200, json=_body(_host("a"))))
+    reg = DiscoveryHostRegistry(URL)
+    with structlog.testing.capture_logs() as captured:
+        await reg.hosts()
+    await reg.aclose()
+    events = [entry["event"] for entry in captured]
+    assert "host_discovery_tokens_missing" not in events
 
 
 @respx.mock

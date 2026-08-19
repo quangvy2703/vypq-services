@@ -122,6 +122,9 @@ async def main() -> None:
         await consumer.stop()
         await producer.stop()
         await backend.aclose()
+        # worker.py là tiến trình chạy dài: không đóng thì client httpx bên
+        # trong DiscoveryHostRegistry rò tài nguyên suốt vòng đời tiến trình.
+        await registry.aclose()
 
 
 if __name__ == "__main__":
