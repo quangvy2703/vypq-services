@@ -17,6 +17,7 @@ dev = [
     "pytest-cov>=5.0",
     "respx>=0.21",
     "ruff>=0.7",
+    "mypy>=1.13",
     "vypq-contracts",
     "asgi-lifespan>=2.1",
     "vypq-core",
@@ -49,3 +50,14 @@ extend-exclude = ["services/_template"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B"]
+
+[tool.mypy]
+python_version = "3.12"
+
+# vypq-contracts chưa có py.typed marker nên mypy coi mọi import từ đó là
+# "missing stubs" dù bản thân nó type-annotated đầy đủ (pydantic models).
+# Chỉ tắt cảnh báo thiếu stub cho package nội bộ này, không tắt kiểm tra
+# chữ ký của host_registry.py.
+[[tool.mypy.overrides]]
+module = "vypq_contracts.*"
+ignore_missing_imports = true
