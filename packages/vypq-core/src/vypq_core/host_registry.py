@@ -138,12 +138,17 @@ class DiscoveryHostRegistry:
         self,
         url: str,
         *,
+        token: str | None = None,
         refresh_s: float = 15.0,
         fallback: list[HostRef] | None = None,
         client: httpx.AsyncClient | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._url = url
+        # /v1/discovery/hosts giờ đòi bearer token giống mọi route /v1 khác của
+        # gateway — không gửi header này thì mọi lần refresh đều 401 và service
+        # tự khoá mình vào danh sách fallback tĩnh (hoặc rỗng) mãi mãi.
+        self._token = token
         self._refresh_s = refresh_s
         self._clock = clock
         self._client = client or httpx.AsyncClient(timeout=10.0)
@@ -154,8 +159,9 @@ class DiscoveryHostRegistry:
         now = self._clock()
         if self._fetched_at is not None and now - self._fetched_at < self._refresh_s:
             return self._cached
+        headers = {"Authorization": f"Bearer {self._token}"} if self._token else {}
         try:
-            response = await self._client.get(self._url)
+            response = await self._client.get(self._url, headers=headers)
             response.raise_for_status()
             fresh = DiscoveryResponse.model_validate(response.json()).hosts
             # `GET /v1/hosts` (dashboard, không token) parse THÀNH CÔNG vào cùng

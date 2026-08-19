@@ -8,6 +8,8 @@ from gateway.settings import GatewaySettings
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from vypq_contracts.gateway import InvokeMode, RunStatus
 
+TOKEN = "sekret"
+
 
 @pytest.fixture
 async def ctx():
@@ -15,10 +17,12 @@ async def ctx():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    app = build_app(factory, GatewaySettings(service_name="gateway"),
-                    routers=[build_runs_router(factory)])
+    settings = GatewaySettings(service_name="gateway", token=TOKEN)
+    app = build_app(factory, settings, routers=[build_runs_router(factory, settings)])
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://t"
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://t",
+        headers={"Authorization": f"Bearer {TOKEN}"},
     ) as c:
         yield c, factory
     await engine.dispose()

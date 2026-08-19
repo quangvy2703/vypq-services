@@ -23,7 +23,11 @@ def build_app(
     readiness: Mapping[str, HealthCheck] | None = None,
 ) -> FastAPI:
     return create_app(
-        settings, routers=list(routers), lifespan=lifespan, readiness=readiness
+        settings,
+        routers=list(routers),
+        lifespan=lifespan,
+        readiness=readiness,
+        expose_docs=settings.expose_docs,
     )
 
 
@@ -157,9 +161,9 @@ def create_gateway() -> FastAPI:
         routers=[
             build_hosts_router(factory, settings),
             build_discovery_router(factory, settings),
-            build_services_router(service_registry),
-            build_invoke_router(proxy, dispatcher),
-            build_runs_router(factory),
+            build_services_router(service_registry, settings),
+            build_invoke_router(proxy, settings, dispatcher),
+            build_runs_router(factory, settings),
             build_metrics_router(),
         ],
         readiness={

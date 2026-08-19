@@ -1,15 +1,20 @@
 import uuid
 
-from fastapi import APIRouter, File, Form, Request, UploadFile
+from fastapi import APIRouter, Depends, File, Form, Request, UploadFile
 from vypq_contracts.common import ErrorCode
 from vypq_contracts.gateway import InvokeMode, InvokeRequest, InvokeResponse
 from vypq_core.errors import ServiceError
 
+from gateway.auth import make_token_dependency
 from gateway.proxy import SyncProxy
+from gateway.settings import GatewaySettings
 
 
-def build_invoke_router(proxy: SyncProxy, dispatcher=None) -> APIRouter:
-    router = APIRouter(prefix="/v1")
+def build_invoke_router(
+    proxy: SyncProxy, settings: GatewaySettings, dispatcher=None
+) -> APIRouter:
+    guard = Depends(make_token_dependency(settings.token))
+    router = APIRouter(prefix="/v1", dependencies=[guard])
 
     @router.post("/invoke/upload", response_model=InvokeResponse)
     async def invoke_upload(

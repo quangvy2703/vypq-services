@@ -1,6 +1,7 @@
 host_discovery:
   source: gateway
   url: http://gateway:8080/v1/discovery/hosts
+  token: ${VYPQ_GATEWAY_TOKEN}
   refresh_s: 15
   # Giữ lại để service vẫn chạy được khi gateway chưa lên. Bỏ trống cũng được.
   fallback_static:

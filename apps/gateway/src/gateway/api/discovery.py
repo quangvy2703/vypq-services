@@ -1,14 +1,16 @@
 from datetime import UTC, datetime
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 from vypq_core.host_registry import DiscoveryResponse
 
+from gateway.auth import make_token_dependency
 from gateway.db.repo import HostRepo
 from gateway.settings import GatewaySettings
 
 
 def build_discovery_router(session_factory, settings: GatewaySettings) -> APIRouter:
-    router = APIRouter(prefix="/v1/discovery")
+    guard = Depends(make_token_dependency(settings.token))
+    router = APIRouter(prefix="/v1/discovery", dependencies=[guard])
 
     @router.get("/hosts", response_model=DiscoveryResponse)
     async def hosts() -> DiscoveryResponse:

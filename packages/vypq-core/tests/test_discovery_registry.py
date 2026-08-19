@@ -230,6 +230,35 @@ async def test_no_warning_when_at_least_one_host_has_a_token():
 
 
 @respx.mock
+async def test_sends_bearer_token_when_configured():
+    # /v1/discovery/hosts giờ đòi auth như mọi route /v1 khác của gateway.
+    # Không gửi header này thì mọi refresh sẽ 401 và service tự khoá mình vào
+    # fallback tĩnh (hoặc danh sách rỗng) vĩnh viễn.
+    route = respx.get(URL, headers={"authorization": "Bearer bi-mat"}).mock(
+        return_value=httpx.Response(200, json=_body(_host("a")))
+    )
+    reg = DiscoveryHostRegistry(URL, token="bi-mat")
+    assert [h.name for h in await reg.hosts()] == ["a"]
+    assert route.called
+    await reg.aclose()
+
+
+@respx.mock
+async def test_no_authorization_header_sent_when_token_not_configured():
+    captured: dict[str, bool] = {}
+
+    def _capture(request: httpx.Request) -> httpx.Response:
+        captured["has_auth"] = "authorization" in request.headers
+        return httpx.Response(200, json=_body(_host("a")))
+
+    respx.get(URL).mock(side_effect=_capture)
+    reg = DiscoveryHostRegistry(URL)
+    await reg.hosts()
+    await reg.aclose()
+    assert captured["has_auth"] is False
+
+
+@respx.mock
 async def test_first_fetch_failing_without_fallback_raises_domain_error():
     # Không cấu hình fallback mà để lộ thẳng ConnectError của httpx ra ngoài
     # thì caller không phân biệt được "model này hiện không có host nào phục

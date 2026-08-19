@@ -1,13 +1,16 @@
-from fastapi import APIRouter, Query
+from fastapi import APIRouter, Depends, Query
 from vypq_contracts.common import ErrorCode
 from vypq_contracts.gateway import RunRecord, RunsResponse, RunStatus
 from vypq_core.errors import ServiceError
 
+from gateway.auth import make_token_dependency
 from gateway.db.repo import RunRepo
+from gateway.settings import GatewaySettings
 
 
-def build_runs_router(session_factory) -> APIRouter:
-    router = APIRouter(prefix="/v1")
+def build_runs_router(session_factory, settings: GatewaySettings) -> APIRouter:
+    guard = Depends(make_token_dependency(settings.token))
+    router = APIRouter(prefix="/v1", dependencies=[guard])
 
     @router.get("/runs", response_model=RunsResponse)
     async def list_runs(

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import httpx
+import respx
 import structlog.testing
 from ocr_service.settings import OcrSettings, build_host_registry
 from vypq_core.host_registry import DiscoveryHostRegistry, StaticHostRegistry
@@ -70,3 +72,25 @@ def test_missing_config_file_gives_an_empty_static_registry(tmp_path):
     settings = OcrSettings(service_name="ocr", hosts_path=tmp_path / "khong-co.yaml")
     registry = build_host_registry(settings)
     assert isinstance(registry, StaticHostRegistry)
+
+
+@respx.mock
+async def test_gateway_source_token_is_read_from_the_environment_and_sent_as_bearer(
+    tmp_path, monkeypatch
+):
+    # /v1/discovery/hosts giờ đòi auth như mọi route /v1 khác của gateway.
+    # `host_discovery.token` trong config.yaml phải là ${TEN_BIEN}, được thay
+    # bằng giá trị môi trường lúc đọc (không hardcode bí mật vào file commit
+    # git) — và giá trị đó phải đi ra ngoài đúng như header Authorization.
+    monkeypatch.setenv("VYPQ_GATEWAY_TOKEN_TEST", "tu-moi-truong")
+    body = GATEWAY.replace(
+        "  refresh_s: 15\n", "  token: ${VYPQ_GATEWAY_TOKEN_TEST}\n  refresh_s: 15\n"
+    )
+    route = respx.get(
+        "http://gateway:8080/v1/discovery/hosts",
+        headers={"authorization": "Bearer tu-moi-truong"},
+    ).mock(return_value=httpx.Response(200, json={"hosts": []}))
+    registry = build_host_registry(_settings(tmp_path, body))
+    await registry.hosts()
+    assert route.called
+    await registry.aclose()

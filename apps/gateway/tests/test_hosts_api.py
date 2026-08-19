@@ -13,6 +13,9 @@ from vypq_contracts.common import ModelKind, Task
 from vypq_contracts.gateway import HostRegistration
 from vypq_contracts.hosting import ModelInfo
 
+TOKEN = "sekret"
+AUTH = {"Authorization": f"Bearer {TOKEN}"}
+
 
 @pytest.fixture
 async def client():
@@ -20,10 +23,10 @@ async def client():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    settings = GatewaySettings(service_name="gateway")
+    settings = GatewaySettings(service_name="gateway", token=TOKEN)
     app = build_app(factory, settings, routers=[build_hosts_router(factory, settings)])
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://t"
+        transport=httpx.ASGITransport(app=app), base_url="http://t", headers=AUTH
     ) as c:
         yield c
     await engine.dispose()
@@ -84,7 +87,7 @@ async def test_stale_host_reports_unhealthy_the_same_as_discovery():
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, expire_on_commit=False)
-    settings = GatewaySettings(service_name="gateway", host_ttl_s=45.0)
+    settings = GatewaySettings(service_name="gateway", host_ttl_s=45.0, token=TOKEN)
     app = build_app(
         factory,
         settings,
@@ -109,7 +112,7 @@ async def test_stale_host_reports_unhealthy_the_same_as_discovery():
         await s.commit()
 
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://t"
+        transport=httpx.ASGITransport(app=app), base_url="http://t", headers=AUTH
     ) as c:
         dashboard = (await c.get("/v1/hosts")).json()["hosts"]
         discovery = (await c.get("/v1/discovery/hosts")).json()["hosts"]

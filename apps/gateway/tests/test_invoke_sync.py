@@ -17,6 +17,8 @@ OCR_RESULT = {
     "result": {"full_text": "xin chào", "boxes": []},
 }
 
+TOKEN = "sekret"
+
 
 def _state(status=HealthStatus.OK) -> ServiceState:
     return ServiceState(
@@ -39,10 +41,12 @@ async def ctx():
     registry = ServiceRegistry([ServiceEntry(name="ocr", base_url="http://ocr:8001")])
     registry._states["ocr"] = _state()
     proxy = SyncProxy(registry, factory)
-    app = build_app(factory, GatewaySettings(service_name="gateway"),
-                    routers=[build_invoke_router(proxy)])
+    settings = GatewaySettings(service_name="gateway", token=TOKEN)
+    app = build_app(factory, settings, routers=[build_invoke_router(proxy, settings)])
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://t"
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://t",
+        headers={"Authorization": f"Bearer {TOKEN}"},
     ) as c:
         yield c, factory, registry
     await registry.aclose()

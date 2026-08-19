@@ -13,7 +13,8 @@ from vypq_contracts.common import ModelKind, Task
 from vypq_contracts.gateway import HostRegistration
 from vypq_contracts.hosting import ModelInfo
 
-SETTINGS = GatewaySettings(service_name="gateway", host_ttl_s=45.0)
+TOKEN = "sekret"
+SETTINGS = GatewaySettings(service_name="gateway", host_ttl_s=45.0, token=TOKEN)
 
 
 @pytest.fixture
@@ -24,7 +25,9 @@ async def ctx():
     factory = async_sessionmaker(engine, expire_on_commit=False)
     app = build_app(factory, SETTINGS, routers=[build_discovery_router(factory, SETTINGS)])
     async with httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=app), base_url="http://t"
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://t",
+        headers={"Authorization": f"Bearer {TOKEN}"},
     ) as c:
         yield c, factory
     await engine.dispose()

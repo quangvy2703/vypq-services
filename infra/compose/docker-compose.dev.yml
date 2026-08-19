@@ -38,6 +38,9 @@ services:
     environment:
       VYPQ_DATABASE_URL: postgresql+asyncpg://vypq:vypq@postgres:5432/vypq
       VYPQ_BROKERS: redpanda:9092
+      # Bắt buộc, giống model-host: gateway từ chối khởi động nếu thiếu — xem
+      # GatewaySettings._token_must_not_be_empty.
+      VYPQ_TOKEN: ${VYPQ_TOKEN:?bat buoc dat VYPQ_TOKEN}
     ports: ["8080:8080"]
     depends_on:
       postgres: {condition: service_healthy}
