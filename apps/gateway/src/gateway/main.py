@@ -128,7 +128,11 @@ def create_gateway() -> FastAPI:
     service_registry = ServiceRegistry(load_services(settings.services_path))
     poller = HostPoller(factory, settings)
     producer = EventProducer(settings.brokers)
-    proxy = SyncProxy(service_registry, factory)
+    proxy = SyncProxy(
+        service_registry, factory,
+        max_download_mb=settings.max_download_mb,
+        fetch_deadline_s=settings.fetch_deadline_s,
+    )
     dispatcher = Dispatcher(service_registry, producer)
     consumers = build_result_consumers(factory, settings, producer, service_registry)
 

@@ -92,6 +92,21 @@ export const gateway = {
     return call<InvokeResponse>("/v1/invoke/upload", { method: "POST", body: form });
   },
 
+  invokeUri(service: string, inputUri: string, modelVersion: string | null): Promise<InvokeResponse> {
+    // Đường JSON của gateway, KHÁC /v1/invoke/upload: ở đây gateway tự tải URL
+    // rồi mới chuyển bytes sang service. Hạn mức kích thước nằm ở gateway
+    // (VYPQ_MAX_DOWNLOAD_MB) chứ không ở đây, vì dashboard không cầm nội dung.
+    const body: Record<string, string> = { service, mode: "sync", input_uri: inputUri };
+    // Chuỗi rỗng thì gateway coi là đã chọn model tên "" và bỏ qua
+    // default_model của service — phải bỏ hẳn field, giống invokeUpload.
+    if (modelVersion) body.model_version = modelVersion;
+    return call<InvokeResponse>("/v1/invoke", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body),
+    });
+  },
+
   listRuns(query: RunsQuery): Promise<RunsResponse> {
     return call<RunsResponse>(`/v1/runs${runsQueryString(query)}`);
   },

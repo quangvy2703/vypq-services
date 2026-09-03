@@ -264,3 +264,82 @@ describe("Playground", () => {
     expect(screen.queryByText("t1")).not.toBeInTheDocument();
   });
 });
+
+describe("Playground — nhập bằng URL", () => {
+  async function typeUrl(user: ReturnType<typeof userEvent.setup>, url: string) {
+    await user.type(screen.getByLabelText(/URL đầu vào/i), url);
+  }
+
+  it("gửi input_uri thay vì file khi dán URL", async () => {
+    const user = userEvent.setup();
+    render(<Playground services={[ocrService]} hosts={hosts} />);
+    await typeUrl(user, "https://kho/anh.png");
+    await user.click(screen.getByRole("button", { name: /chạy thử/i }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const body = fetchMock.mock.calls.find((c) => c[0] === "/api/invoke")?.[1].body as FormData;
+    expect(body.get("input_uri")).toBe("https://kho/anh.png");
+    expect(body.has("file")).toBe(false);
+  });
+
+  it("nút Chạy thử mở khoá khi chỉ có URL, không cần tệp", async () => {
+    const user = userEvent.setup();
+    render(<Playground services={[ocrService]} hosts={hosts} />);
+    expect(screen.getByRole("button", { name: /chạy thử/i })).toBeDisabled();
+    await typeUrl(user, "https://kho/anh.png");
+    expect(screen.getByRole("button", { name: /chạy thử/i })).toBeEnabled();
+  });
+
+  it("chọn tệp thì xoá URL đang có — hai nguồn input loại trừ nhau", async () => {
+    // Để cả hai thì request mơ hồ và /api/invoke từ chối 422. Ràng buộc phải
+    // hiện ra ở UI, không để người dùng chạm vào lỗi đó mới biết.
+    const user = userEvent.setup();
+    render(<Playground services={[ocrService]} hosts={hosts} />);
+    await typeUrl(user, "https://kho/anh.png");
+    await pickFile(user);
+    expect(screen.getByLabelText(/URL đầu vào/i)).toHaveValue("");
+  });
+
+  it("dán URL thì bỏ tệp đang chọn", async () => {
+    const user = userEvent.setup();
+    render(<Playground services={[ocrService]} hosts={hosts} />);
+    await pickFile(user);
+    await typeUrl(user, "https://kho/anh.png");
+    await user.click(screen.getByRole("button", { name: /chạy thử/i }));
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    const body = fetchMock.mock.calls.find((c) => c[0] === "/api/invoke")?.[1].body as FormData;
+    expect(body.has("file")).toBe(false);
+    expect(body.get("input_uri")).toBe("https://kho/anh.png");
+  });
+
+  it("đổi service thì xoá URL cũ — input cũ không thuộc về service mới", async () => {
+    const user = userEvent.setup();
+    render(<Playground services={[ocrService, asrService]} hosts={hosts} />);
+    await typeUrl(user, "https://kho/anh.png");
+    await user.selectOptions(screen.getByLabelText("Service"), "asr");
+    expect(screen.getByLabelText(/URL đầu vào/i)).toHaveValue("");
+  });
+});
+
+describe("Playground — ảnh của đầu vào URL", () => {
+  it("vẽ bbox lên chính ảnh ở URL, không phải lên khung trống", async () => {
+    // Ca đã lọt lưới: viewer chỉ nhận được objectUrl của tệp, mà chạy bằng URL
+    // thì không có tệp nào — nên imageUrl=null và OcrViewer vẽ bbox lên một ô
+    // xám. Kết quả trông như model đọc được chữ từ hư không.
+    const user = userEvent.setup();
+    render(<Playground services={[ocrService]} hosts={hosts} />);
+    await user.type(screen.getByLabelText(/URL đầu vào/i), "https://kho/anh.png");
+    await user.click(screen.getByRole("button", { name: /chạy thử/i }));
+
+    const anh = await screen.findByRole("img", { name: /ảnh đầu vào/i });
+    expect(anh).toHaveAttribute("src", "https://kho/anh.png");
+  });
+
+  it("trình phát audio dùng URL khi service nhận âm thanh", async () => {
+    // Cùng gốc với ca trên, nhánh audio: không có src thì nút "nghe từ" của
+    // AsrViewer tua một phần tử rỗng.
+    const user = userEvent.setup();
+    const { container } = render(<Playground services={[asrService]} hosts={hosts} />);
+    await user.type(screen.getByLabelText(/URL đầu vào/i), "https://kho/tieng.mp3");
+    expect(container.querySelector("audio")).toHaveAttribute("src", "https://kho/tieng.mp3");
+  });
+});

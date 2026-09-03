@@ -1,11 +1,27 @@
 host_name: gpu-1
 vram_budget_mb: 20000
 models:
-  - id: paddleocr-v4-vi
+  - id: ppocr-v6
     task: ocr
     kind: opensource
     runner: paddle
     vram_mb: 2500
     pinned: true
-    source: {type: hf, repo: PaddlePaddle/PP-OCRv4}
-    params: {lang: vi, use_angle_cls: true}
+    # PP-OCRv6_medium_det + PP-OCRv6_medium_rec, paddle tự tải về ~/.paddlex.
+    # rec là một model đa ngữ duy nhất (50 thứ tiếng) nên KHÔNG khai `lang`:
+    # đặt lang=vi cho ra đúng cùng một kết quả, chỉ thêm một chỗ để sai.
+    source: {ocr_version: PP-OCRv6}
+    params: {}
+
+  # KHÔNG phải "-vi", dù entry này trước đây tên là paddleocr-v4-vi. PP-OCRv4
+  # không có model tiếng Việt: bản 2.x xếp "vi" vào nhóm latin và im lặng nạp
+  # latin_dict.txt (thiếu ế ộ ổ ủ ă ơ ư), còn 3.x thì ném thẳng ValueError cho
+  # cặp (vi, PP-OCRv4). Cái tên cũ hứa một thứ chưa bao giờ có. Giữ lại đây để
+  # so cạnh nhau với v6 ở Playground; xoá đi cũng không mất gì.
+  - id: ppocr-v4-en
+    task: ocr
+    kind: opensource
+    runner: paddle
+    vram_mb: 2000
+    source: {ocr_version: PP-OCRv4}
+    params: {lang: en}

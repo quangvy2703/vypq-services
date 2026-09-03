@@ -6,14 +6,62 @@
   --color-brand-50: oklch(0.97 0.02 275);
   --color-brand-100: oklch(0.94 0.04 275);
   --color-brand-200: oklch(0.88 0.07 275);
+  --color-brand-300: oklch(0.8 0.12 275);
+  --color-brand-400: oklch(0.69 0.16 275);
   --color-brand-500: oklch(0.58 0.19 275);
   --color-brand-600: oklch(0.51 0.2 275);
   --color-brand-700: oklch(0.44 0.18 275);
+  --color-brand-800: oklch(0.37 0.14 275);
+  --color-brand-900: oklch(0.31 0.11 275);
   --color-brand-950: oklch(0.24 0.08 275);
 
   --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
     "Helvetica Neue", sans-serif;
   --font-mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+
+  /* Bóng đổ pha sắc slate chứ không phải đen thuần. Trên nền ngả lạnh, bóng đen
+     làm mép thẻ trông như vết bẩn; bóng cùng tông thì thẻ nổi lên tự nhiên. */
+  --shadow-thap: 0 1px 2px -1px oklch(0.36 0.05 265 / 0.09),
+    0 1px 3px 0 oklch(0.36 0.05 265 / 0.05);
+  --shadow-the: 0 1px 2px -1px oklch(0.36 0.05 265 / 0.08),
+    0 6px 16px -6px oklch(0.36 0.05 265 / 0.12);
+  --shadow-noi: 0 2px 4px -2px oklch(0.36 0.05 265 / 0.1),
+    0 14px 32px -12px oklch(0.36 0.05 265 / 0.2);
+
+  /* Bóng của nút đặc, gộp luôn vạch sáng inset ở mép trên. Phải là MỘT token
+     chứ không phải hai utility chồng lên nhau: `shadow-*` nào cũng ghi vào cùng
+     một biến của Tailwind, đặt cạnh nhau thì cái sau xoá cái trước. */
+  --shadow-nut: inset 0 1px 0 0 oklch(1 0 0 / 0.18),
+    0 1px 2px 0 oklch(0.36 0.05 265 / 0.16);
+
+  /* Một đường cong duy nhất cho mọi chuyển động: vào nhanh, dừng mềm. Trộn
+     nhiều kiểu easing làm các thành phần trông như của hai sản phẩm khác nhau. */
+  --ease-mem: cubic-bezier(0.16, 1, 0.3, 1);
+
+  --animate-hien-len: hien-len 0.4s cubic-bezier(0.16, 1, 0.3, 1) both;
+  @keyframes hien-len {
+    from {
+      opacity: 0;
+      transform: translateY(0.5rem);
+    }
+    to {
+      opacity: 1;
+      transform: none;
+    }
+  }
+
+  /* Nhịp thở cho khối chờ. Không dùng animate-pulse mặc định: nó nháy tới 0.5
+     alpha rất gắt, nhìn lâu thì mỏi. */
+  --animate-tho: tho 1.8s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  @keyframes tho {
+    0%,
+    100% {
+      opacity: 1;
+    }
+    50% {
+      opacity: 0.55;
+    }
+  }
 }
 
 :root {
@@ -21,9 +69,20 @@
 }
 
 body {
-  /* Nền hơi ngả lạnh thay vì trắng phẳng: các thẻ trắng nổi lên mà không cần
-     viền đậm. */
-  @apply bg-slate-100/70 font-sans text-slate-900 antialiased;
+  @apply min-h-screen font-sans text-slate-900 antialiased;
+  /* Ba lớp: quầng sáng brand rất nhạt sau thanh nav, một chuyển trắng → slate
+     theo chiều dọc, và màu nền chốt. `fixed` để nền không trôi theo nội dung —
+     trang dài mà nền cuộn theo thì cái quầng sáng biến thành vệt loang. */
+  background-color: var(--color-slate-100);
+  background-image:
+    radial-gradient(
+      60rem 26rem at 50% -14rem,
+      color-mix(in oklab, var(--color-brand-200) 85%, transparent),
+      transparent 72%
+    ),
+    linear-gradient(to bottom, #fff 0%, var(--color-slate-100) 34rem);
+  background-attachment: fixed;
+  background-repeat: no-repeat;
 }
 
 /* Số trong bảng phải thẳng cột. Không có dòng này thì "1.50 s" và "842 ms"
@@ -42,8 +101,64 @@ table {
   @apply outline-2 outline-offset-2 outline-brand-500;
 }
 
+/* Mũi tên của <select> do trình duyệt vẽ mỗi nơi một kiểu và không đổi màu
+   theo được. Tự vẽ bằng nền SVG thì ô chọn khớp với ô nhập bên cạnh nó. */
+.chon {
+  appearance: none;
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 20 20' fill='none' stroke='%2394a3b8' stroke-width='1.75' stroke-linecap='round' stroke-linejoin='round'><path d='M6 8.25L10 12.25L14 8.25'/></svg>");
+  background-repeat: no-repeat;
+  background-position: right 0.6rem center;
+  background-size: 1.15rem 1.15rem;
+  padding-right: 2.1rem;
+}
+
+/* Ô tick tự vẽ. Checkbox mặc định của hệ điều hành không nhận màu brand và to
+   nhỏ khác nhau giữa macOS với Windows — cùng một danh sách model mà mỗi máy
+   một kiểu căn hàng. */
+.tick {
+  appearance: none;
+  flex: none;
+  width: 1.0625rem;
+  height: 1.0625rem;
+  border-radius: 0.3125rem;
+  border: 1.5px solid var(--color-slate-300);
+  background-color: #fff;
+  background-position: center;
+  background-repeat: no-repeat;
+  background-size: 0.7rem 0.7rem;
+  transition:
+    background-color 0.15s var(--ease-mem),
+    border-color 0.15s var(--ease-mem),
+    box-shadow 0.15s var(--ease-mem);
+}
+
+.tick:not(:disabled):hover {
+  border-color: var(--color-brand-400);
+}
+
+.tick:checked {
+  border-color: var(--color-brand-600);
+  background-color: var(--color-brand-600);
+  background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16' fill='none' stroke='white' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'><path d='M3.25 8.5L6.5 11.75L12.75 4.75'/></svg>");
+}
+
+.tick:disabled {
+  background-color: var(--color-slate-100);
+  border-color: var(--color-slate-200);
+}
+
 /* Thanh cuộn mảnh cho vùng bảng tràn ngang. */
 .cuon-manh {
   scrollbar-width: thin;
   scrollbar-color: var(--color-slate-300) transparent;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
 }

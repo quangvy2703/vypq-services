@@ -15,8 +15,8 @@ class ModelHostSettings(BaseServiceSettings):
     # chạy được inference.
     allow_file_uri: bool = False
     expose_docs: bool = False
-    max_download_mb: int = 100
-    fetch_deadline_s: float = 60.0
+    # max_download_mb / fetch_deadline_s nằm ở BaseServiceSettings — cùng hai
+    # chốt đó giờ cũng canh đường tải của gateway và của worker.
 
     @field_validator("token")
     @classmethod

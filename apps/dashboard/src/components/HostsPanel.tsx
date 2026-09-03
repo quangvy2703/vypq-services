@@ -95,7 +95,7 @@ export function HostsPanel({ hosts }: { hosts: HostState[] }) {
         {hosts.length === 0 ? (
           <div className="p-5"><EmptyState>Chưa cắm máy GPU nào. Thuê máy, chạy model-host, mở ngrok rồi dán URL vào ô trên.</EmptyState></div>
         ) : (
-          <DataTable headers={["Host", "Trạng thái", "Model", "Thấy lần cuối", ""]}>
+          <DataTable headers={["Host", "Trạng thái", "Model", "Thấy lần cuối", ""]} dense>
             {hosts.map((host) => (
               <tr key={host.name}>
                 <td className="px-3 py-2 align-top">

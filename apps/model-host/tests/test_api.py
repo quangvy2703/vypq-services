@@ -154,3 +154,21 @@ async def test_infer_by_uri_rejects_unsupported_scheme():
 def test_settings_refuse_empty_token():
     with pytest.raises(ValueError):
         ModelHostSettings(service_name="model-host", token="", host_name="gpu-1")
+
+
+async def test_infer_by_uri_chan_input_vuot_han(monkeypatch):
+    # Hạn mức này là thứ duy nhất chặn một URI trỏ file khổng lồ hạ cả máy GPU,
+    # mà trước đây không có test nào canh nó.
+    import httpx as _httpx
+    import respx
+
+    with respx.mock:
+        respx.get("http://kho/to.bin").mock(
+            return_value=_httpx.Response(200, content=b"x" * (3 * 1024 * 1024))
+        )
+        async with _client(max_download_mb=1) as c:
+            resp = await c.post(
+                "/v1/infer", json={"model_id": "m1", "input_uri": "http://kho/to.bin"}
+            )
+    assert resp.status_code == 413
+    assert "1MB" in resp.json()["message"]

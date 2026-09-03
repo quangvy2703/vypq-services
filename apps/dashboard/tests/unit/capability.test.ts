@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { acceptForInput, capabilityOutputFor, isUsable, statusTone, viewerFor } from "@/lib/capability";
+import { acceptForInput, capabilityInputFor, capabilityOutputFor, isUsable, statusTone, viewerFor } from "@/lib/capability";
 import type { ServiceState } from "@/lib/types";
 
 describe("acceptForInput", () => {
@@ -128,5 +128,34 @@ describe("capabilityOutputFor", () => {
 
   it("rơi về json khi danh sách service rỗng", () => {
     expect(capabilityOutputFor([], "ocr")).toBe("json");
+  });
+});
+
+describe("capabilityInputFor", () => {
+  it("đọc capability_input của service đã chạy run", () => {
+    // Đây là thứ quyết định input_uri của một run được đưa vào viewer ảnh hay
+    // viewer âm thanh. Đoán sai là vẽ bbox lên một thẻ <audio>.
+    expect(capabilityInputFor([usable], "ocr")).toBe("image");
+  });
+
+  it("khớp theo KHOÁ ĐỊNH TUYẾN, không phải tên service tự khai", () => {
+    const lechTen: ServiceState = {
+      ...usable,
+      name: "docsvc",
+      info: { ...usable.info!, name: "docreader" },
+    };
+    expect(capabilityInputFor([lechTen], "docsvc")).toBe("image");
+    expect(capabilityInputFor([lechTen], "docreader")).toBe("");
+  });
+
+  it("trả rỗng khi không khớp service nào — KHÔNG đoán", () => {
+    // Rỗng là nhánh an toàn: nó không bằng "image" cũng không bằng "audio", nên
+    // chỗ gọi tự động không đưa URI cho viewer nào cả.
+    expect(capabilityInputFor([usable], "khong-ton-tai")).toBe("");
+  });
+
+  it("trả rỗng khi service chưa từng được poll (info=null)", () => {
+    const chuaBiet: ServiceState = { name: "ner", info: null, base_url: "http://ner:8000", status: "down", last_seen_at: null };
+    expect(capabilityInputFor([chuaBiet], "ner")).toBe("");
   });
 });

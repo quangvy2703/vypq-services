@@ -4,7 +4,7 @@ import { notFound } from "next/navigation";
 import { Badge, Card } from "@/components/ui";
 import { ResultViewer } from "@/components/viewers/ResultViewer";
 import { GatewayError } from "@/lib/errors";
-import { capabilityOutputFor } from "@/lib/capability";
+import { capabilityInputFor, capabilityOutputFor } from "@/lib/capability";
 import { formatMs, formatTimestamp } from "@/lib/format";
 import { gateway } from "@/lib/gateway";
 import type { RunRecord } from "@/lib/types";
@@ -21,6 +21,10 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
     throw error;
   }
   const { services } = await gateway.listServices();
+  // Run gửi bằng file không lưu lại bytes, nhưng run gửi bằng input_uri thì URI
+  // đó vẫn trỏ tới đúng đầu vào — đủ để vẽ lại bbox lên chính cái ảnh gốc thay
+  // vì lên một khung trống.
+  const capabilityInput = capabilityInputFor(services, run.service);
 
   return (
     <div className="space-y-4">
@@ -38,9 +42,23 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
           </div>
           <div className="md:col-span-4">
             <dt className="text-xs text-slate-500">Input</dt>
-            {/* Run sync ghi input_uri=null (SyncProxy.invoke) — chỉ run async đi
-                qua Kafka mới có URI. Nói thẳng ra thay vì để ô trống khó hiểu. */}
-            <dd className="text-xs">{run.input_uri ?? "không lưu (chạy sync, file gửi trực tiếp)"}</dd>
+            {/* File gửi trực tiếp thì không có gì để lưu lại; chỉ lần chạy khai
+                bằng input_uri (hoặc run async đi qua Kafka) mới có URI. Nói
+                thẳng ra thay vì để ô trống khó hiểu. */}
+            <dd className="text-xs">
+              {run.input_uri ? (
+                <a
+                  href={run.input_uri}
+                  target="_blank"
+                  rel="noreferrer noopener"
+                  className="break-all text-brand-700 underline"
+                >
+                  {run.input_uri}
+                </a>
+              ) : (
+                "không lưu (file gửi trực tiếp)"
+              )}
+            </dd>
           </div>
         </dl>
         {run.error ? <p role="alert" className="mt-3 rounded bg-red-50 p-3 text-sm text-red-700">{run.error}</p> : null}
@@ -50,8 +68,8 @@ export default async function RunDetailPage({ params }: { params: Promise<{ runI
         <ResultViewer
           capabilityOutput={capabilityOutputFor(services, run.service)}
           output={run.output}
-          imageUrl={null}
-          audioUrl={null}
+          imageUrl={capabilityInput === "image" ? run.input_uri : null}
+          audioUrl={capabilityInput === "audio" ? run.input_uri : null}
         />
       </Card>
     </div>

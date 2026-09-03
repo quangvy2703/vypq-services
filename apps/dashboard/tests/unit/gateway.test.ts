@@ -145,3 +145,28 @@ describe("ánh xạ lỗi", () => {
     expect(JSON.stringify(error, Object.getOwnPropertyNames(error))).not.toContain("token-gateway");
   });
 });
+
+describe("gateway.invokeUri", () => {
+  it("gọi POST /v1/invoke dạng JSON với input_uri", async () => {
+    fetchMock.mockResolvedValue(jsonResponse({ trace_id: "t1", mode: "sync", run_id: "r1" }));
+    await gateway.invokeUri("ocr", "https://kho/anh.png", "paddleocr-v4-vi");
+    const [url, init] = lastCall();
+    expect(url).toBe("http://gateway:8080/v1/invoke");
+    expect(init.method).toBe("POST");
+    expect(JSON.parse(String(init.body))).toEqual({
+      service: "ocr",
+      mode: "sync",
+      input_uri: "https://kho/anh.png",
+      model_version: "paddleocr-v4-vi",
+    });
+  });
+
+  it("không gửi model_version khi để mặc định", async () => {
+    // Gửi chuỗi rỗng thì gateway coi là đã chọn model tên "" và bỏ qua
+    // default_model của service — giống hệt lý do ở invokeUpload.
+    fetchMock.mockResolvedValue(jsonResponse({ trace_id: "t1", mode: "sync", run_id: "r1" }));
+    await gateway.invokeUri("ocr", "https://kho/anh.png", null);
+    const [, init] = lastCall();
+    expect(JSON.parse(String(init.body))).not.toHaveProperty("model_version");
+  });
+});

@@ -51,6 +51,40 @@ describe("OcrViewer", () => {
     expect(container.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 1240 1754");
   });
 
+  it("đo được ảnh đã nằm sẵn trong cache — load không bắn lại lần nữa", () => {
+    // Ca thật đã lọt ra sản phẩm: playground tải đúng URL đó cho khung xem
+    // trước, nên lúc panel kết quả dựng lên thì ảnh đã complete và KHÔNG có
+    // sự kiện load nào nữa. Chỉ trông vào onLoad thì khung toạ độ rơi về
+    // boundingExtent (nhỏ hơn ảnh thật) và mọi bbox lệch chỗ.
+    const w = vi
+      .spyOn(window.HTMLImageElement.prototype, "naturalWidth", "get")
+      .mockReturnValue(1240);
+    const h = vi
+      .spyOn(window.HTMLImageElement.prototype, "naturalHeight", "get")
+      .mockReturnValue(1754);
+    try {
+      const { container } = render(<OcrViewer result={ocr} imageUrl="https://kho/da-cache.png" />);
+      expect(container.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 1240 1754");
+    } finally {
+      w.mockRestore();
+      h.mockRestore();
+    }
+  });
+
+  it("không dùng số đo của ảnh cũ cho ảnh mới", () => {
+    // Kích thước đo được phải đi kèm chính src đã đo. Giữ số đo trần thì đổi
+    // sang ảnh khác tỉ lệ là bbox nằm sai cho tới khi ảnh mới tải xong.
+    const { container, rerender } = render(<OcrViewer result={ocr} imageUrl="blob:cu" />);
+    const image = screen.getByRole("img", { name: /ảnh đầu vào/i });
+    Object.defineProperty(image, "naturalWidth", { value: 1240, configurable: true });
+    Object.defineProperty(image, "naturalHeight", { value: 1754, configurable: true });
+    fireEvent.load(image);
+    expect(container.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 1240 1754");
+
+    rerender(<OcrViewer result={ocr} imageUrl="blob:moi" />);
+    expect(container.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 200 100");
+  });
+
   it("liệt kê text của từng box kèm độ tin cậy", () => {
     render(<OcrViewer result={ocr} imageUrl={null} />);
     const row = screen.getByRole("row", { name: /HOÁ ĐƠN/ });
@@ -87,6 +121,17 @@ describe("OcrViewer", () => {
     // có ảnh gốc) rơi vào đúng nhánh này mỗi khi model trả rỗng.
     const { container } = render(<OcrViewer result={{ full_text: "", boxes: [] }} imageUrl={null} />);
     expect(container.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 1 1");
+  });
+
+  it("ảnh ở URL tải không được thì vẫn giữ khung tỉ lệ — bbox không biến mất", () => {
+    // <img> hỏng co về cao 0. Lớp svg phủ tuyệt đối lên nó co theo, và mọi
+    // polygon biến mất dù dữ liệu vẫn nguyên vẹn.
+    const { container } = render(<OcrViewer result={ocr} imageUrl="https://kho/404.png" />);
+    fireEvent.error(screen.getByRole("img", { name: /ảnh đầu vào/i }));
+
+    expect(screen.queryByRole("img", { name: /ảnh đầu vào/i })).not.toBeInTheDocument();
+    expect(container.querySelector("svg")?.getAttribute("viewBox")).toBe("0 0 200 100");
+    expect(container.querySelectorAll("svg polygon")).toHaveLength(3);
   });
 
   it("nói rõ khi model không tìm thấy chữ nào", () => {

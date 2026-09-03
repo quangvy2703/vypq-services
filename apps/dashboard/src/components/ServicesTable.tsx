@@ -11,7 +11,7 @@ export function ServicesTable({ services }: { services: ServiceState[] }) {
       {services.length === 0 ? (
         <div className="p-5"><EmptyState>Gateway chưa khai service nào — kiểm tra `config/services.yaml`.</EmptyState></div>
       ) : (
-        <DataTable headers={["Service", "Task", "Capability", "Model mặc định", "Trạng thái", "Thấy lần cuối"]}>
+        <DataTable headers={["Service", "Task", "Capability", "Model mặc định", "Trạng thái", "Thấy lần cuối"]} dense>
           {services.map((state) => (
             <tr key={state.base_url}>
               <td className="px-3 py-2 align-top">

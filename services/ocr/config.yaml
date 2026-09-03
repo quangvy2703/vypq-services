@@ -9,4 +9,4 @@ host_discovery:
       url: https://doi-url-ngrok-tai-day.ngrok.app
       token: ${VYPQ_MODEL_HOST_TOKEN}
       models:
-        - {id: paddleocr-v4-vi, task: ocr, kind: opensource, runner: paddle}
+        - {id: ppocr-v6, task: ocr, kind: opensource, runner: paddle}

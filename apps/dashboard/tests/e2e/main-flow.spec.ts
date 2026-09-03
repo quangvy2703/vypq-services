@@ -63,9 +63,12 @@ test("luồng chính: cắm host → thấy service → chạy thử → xem l�
   await page.getByRole("link", { name: "Lịch sử" }).click();
   await expect(page.getByRole("row", { name: /paddleocr-v4-vi/ }).first()).toContainText("ok");
 
-  // 5. Trang chi tiết vẽ lại bbox dù không có ảnh gốc (run sync ghi input_uri=null).
+  // 5. Trang chi tiết vẽ lại bbox dù không có ảnh gốc — lần chạy này gửi file
+  //    trực tiếp nên không có gì để lưu lại làm nền.
   await page.getByRole("link", { name: "Chi tiết" }).first().click();
-  await expect(page.getByText(/không lưu \(chạy sync/)).toBeVisible();
+  // Không còn nhắc "chạy sync": run sync gửi bằng input_uri VẪN lưu URI đó.
+  // Thứ quyết định ô này trống là file gửi trực tiếp, không phải chế độ chạy.
+  await expect(page.getByText(/không lưu \(file gửi trực tiếp/)).toBeVisible();
   await expect(page.locator("svg polygon")).toHaveCount(2);
 });
 
@@ -88,6 +91,35 @@ test("so sánh hai model trên cùng một ảnh", async ({ page }) => {
 
   await expect(page.getByTestId("ket-qua")).toHaveCount(2);
   await expect(page.getByText("Số vùng chữ").first()).toBeVisible();
+});
+
+test("chạy bằng URL: bbox vẽ lên chính ảnh ở URL đó, cả ở playground lẫn trang run", async ({ page }) => {
+  // Nhánh này từng đi thẳng ra sản phẩm với một khung xám: viewer chỉ nhận được
+  // objectUrl của tệp, mà chạy bằng URL thì không có tệp nào. jsdom không phân
+  // biệt được "ảnh tải được" với "thẻ img rỗng", nên chỗ chứng minh là ở đây.
+  await login(page);
+  await page.getByLabel("Tên").fill("a100-dan-link");
+  await page.getByLabel("URL").fill("https://a100-dan-link.ngrok.app");
+  await page.getByRole("button", { name: "Cắm host" }).click();
+  await expect(page.getByRole("row", { name: /a100-dan-link/ })).toBeVisible();
+
+  const anhUrl = "http://127.0.0.1:8099/anh-cong-khai.png";
+  await page.getByRole("link", { name: "Playground" }).click();
+  await page.getByLabel(/URL đầu vào/i).fill(anhUrl);
+  await page.getByRole("button", { name: "Chạy thử" }).click();
+
+  const anh = page.getByRole("img", { name: /ảnh đầu vào/i });
+  await expect(anh).toHaveAttribute("src", anhUrl);
+  // OcrViewer GỠ <img> ra khỏi DOM khi onError, nên còn thấy nó là chưa đủ —
+  // naturalWidth > 0 mới chứng minh trình duyệt lấy được bytes thật.
+  await expect.poll(() => anh.evaluate((el) => (el as HTMLImageElement).naturalWidth)).toBeGreaterThan(0);
+  await expect(page.locator("svg polygon")).toHaveCount(2);
+
+  // Và run đó xem lại được: input_uri đã lưu nên trang chi tiết dựng lại đúng
+  // cái nền ảnh, thay vì vẽ bbox trên khung trống như trước.
+  await page.getByRole("link", { name: /xem run/i }).click();
+  await expect(page.getByRole("link", { name: anhUrl })).toBeVisible();
+  await expect(page.getByRole("img", { name: /ảnh đầu vào/i })).toHaveAttribute("src", anhUrl);
 });
 
 test("gỡ host đi qua được route có params bất đồng bộ của Next 15", async ({ page }) => {

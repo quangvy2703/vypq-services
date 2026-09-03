@@ -23,7 +23,7 @@ def _load_yaml(path: Path) -> dict:
 class OcrSettings(BaseServiceSettings):
     service_name: str = "ocr"
     port: int = 8001
-    default_model: str = "paddleocr-v4-vi"
+    default_model: str = "ppocr-v6"
     max_side: int = 2000
     timeout_s: float = 60.0
     hosts_path: Path = Path("config.yaml")

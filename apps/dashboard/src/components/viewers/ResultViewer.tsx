@@ -8,7 +8,7 @@ import { asAsrResult, asOcrResult } from "@/lib/results";
 
 function RawJson({ output }: { output: unknown }) {
   return (
-    <pre className="overflow-x-auto rounded border border-slate-200 bg-white p-3 text-xs">
+    <pre className="cuon-manh overflow-x-auto rounded-xl border border-slate-200 bg-slate-50/60 p-4 font-mono text-xs leading-relaxed text-slate-700">
       {JSON.stringify(output, null, 2)}
     </pre>
   );

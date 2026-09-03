@@ -11,7 +11,7 @@ export default async function PlaygroundPage() {
     <>
       <PageHeader
         title="Playground"
-        description="Thả một tệp vào, chọn model, xem model đọc ra gì. Tick nhiều model để so cạnh nhau."
+        description="Thả một tệp vào hoặc dán URL, chọn model, xem model đọc ra gì. Tick nhiều model để so cạnh nhau."
       />
       <Playground services={services.services} hosts={hosts.hosts} />
     </>

@@ -12,7 +12,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { GatewayError } from "@/lib/errors";
 
 vi.mock("@/lib/gateway", () => ({
-  gateway: { invokeUpload: vi.fn(), listRuns: vi.fn(), getRun: vi.fn() },
+  gateway: { invokeUpload: vi.fn(), invokeUri: vi.fn(), listRuns: vi.fn(), getRun: vi.fn() },
 }));
 
 const { gateway } = await import("@/lib/gateway");
@@ -26,6 +26,7 @@ const { GET: getRun } = await import("@/app/api/runs/[runId]/route");
 // đổi giá trị mock nào so với brief.
 interface MockedGateway {
   invokeUpload: ReturnType<typeof vi.fn>;
+  invokeUri: ReturnType<typeof vi.fn>;
   listRuns: ReturnType<typeof vi.fn>;
   getRun: ReturnType<typeof vi.fn>;
 }
@@ -178,5 +179,51 @@ describe("GET /api/runs/[runId]", () => {
       params: Promise.resolve({ runId: "x" }),
     });
     expect(response.status).toBe(404);
+  });
+});
+
+describe("POST /api/invoke với input_uri", () => {
+  function uriRequest(fields: Record<string, string>): Request {
+    const form = new FormData();
+    for (const [key, value] of Object.entries(fields)) form.set(key, value);
+    return new Request("http://localhost:3001/api/invoke", { method: "POST", body: form });
+  }
+
+  it("chuyển tiếp URL xuống gateway thay vì đòi file", async () => {
+    mocked.invokeUri.mockResolvedValue({ trace_id: "t1", mode: "sync", run_id: "r1", result: {} });
+    const response = await POST(
+      uriRequest({ service: "ocr", input_uri: "https://kho/anh.png", model_version: "m1" }),
+    );
+    expect(response.status).toBe(200);
+    expect(mocked.invokeUri).toHaveBeenCalledWith("ocr", "https://kho/anh.png", "m1");
+    expect(mocked.invokeUpload).not.toHaveBeenCalled();
+  });
+
+  it("từ chối khi vừa có file vừa có URL", async () => {
+    // Hai nguồn input trong một request là mơ hồ: chọn bừa một cái nghĩa là
+    // người dùng thấy kết quả của thứ mình KHÔNG chọn mà không hề biết.
+    const form = new FormData();
+    form.set("service", "ocr");
+    form.set("input_uri", "https://kho/anh.png");
+    form.set("file", smallFile(), "hoadon.png");
+    const response = await POST(
+      new Request("http://localhost:3001/api/invoke", { method: "POST", body: form }),
+    );
+    expect(response.status).toBe(422);
+    expect(mocked.invokeUri).not.toHaveBeenCalled();
+    expect(mocked.invokeUpload).not.toHaveBeenCalled();
+  });
+
+  it("từ chối scheme không phải http(s)", async () => {
+    // Dashboard là cửa công khai; chặn ở đây cho ra thông báo đúng chỗ hỏng,
+    // thay vì để nó thành một lỗi 422 khó hiểu vọng về từ gateway.
+    const response = await POST(uriRequest({ service: "ocr", input_uri: "file:///etc/passwd" }));
+    expect(response.status).toBe(422);
+    expect(mocked.invokeUri).not.toHaveBeenCalled();
+  });
+
+  it("vẫn đòi phải có một trong hai", async () => {
+    const response = await POST(uriRequest({ service: "ocr" }));
+    expect(response.status).toBe(422);
   });
 });

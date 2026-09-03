@@ -166,3 +166,23 @@ async def test_nothing_is_published_when_inference_fails():
     with pytest.raises(UpstreamError):
         await worker(_envelope())
     assert producer.published == []
+
+
+async def test_input_qua_lon_la_du_lieu_hong_chu_khong_phai_su_co_ha_tang():
+    # Worker TỰ tải input_uri. Không hạn mức thì một URI trỏ file khổng lồ nạp
+    # nguyên vào RAM của service. Và nó phải đi DLQ chứ không pause: retry một
+    # URI quá cỡ thì lần nào cũng quá cỡ, pause chỉ để kẹt partition.
+    with respx.mock:
+        respx.get("http://minio/a.png").mock(
+            return_value=httpx.Response(200, content=b"x" * (3 * 1024 * 1024))
+        )
+        with pytest.raises(ServiceError) as exc:
+            await fetch_bytes("http://minio/a.png", max_download_mb=1)
+    assert not isinstance(exc.value, UpstreamError)
+    assert exc.value.http_status == 413
+
+
+async def test_input_duoi_han_van_tai_binh_thuong():
+    with respx.mock:
+        respx.get("http://minio/a.png").mock(return_value=httpx.Response(200, content=b"anh"))
+        assert await fetch_bytes("http://minio/a.png", max_download_mb=1) == b"anh"

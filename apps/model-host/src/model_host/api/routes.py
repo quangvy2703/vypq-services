@@ -1,4 +1,3 @@
-import asyncio
 import time
 from pathlib import Path
 from urllib.parse import urlparse
@@ -8,6 +7,7 @@ from fastapi import APIRouter, Depends, File, Form, UploadFile
 from vypq_contracts.common import ErrorCode
 from vypq_contracts.hosting import InferRequest, InferResponse, InferTiming, ModelsResponse
 from vypq_core.errors import ServiceError
+from vypq_core.fetch import DownloadTooLarge, fetch_capped
 
 from model_host.auth import make_token_dependency
 from model_host.registry import ModelRegistry
@@ -36,31 +36,16 @@ async def _fetch(uri: str, *, allow_file: bool, max_bytes: int, deadline_s: floa
             raise ServiceError(ErrorCode.BAD_INPUT, f"không thấy file {path}", 400)
         return path.read_bytes()
 
-    # timeout của httpx tính theo từng lần đọc, không phải toàn bộ request: một
-    # server nhỏ giọt dưới ngưỡng max_bytes có thể giữ connection vô hạn.
-    async with asyncio.timeout(deadline_s):
-        return await _stream(uri, max_bytes)
-
-
-async def _stream(uri: str, max_bytes: int) -> bytes:
-    # Đọc theo luồng và cắt khi vượt hạn: `response.content` nạp nguyên body vào
-    # RAM, nên một URI trỏ tới file khổng lồ đủ để hạ cả máy GPU.
-    chunks: list[bytes] = []
-    total = 0
     async with httpx.AsyncClient(timeout=30.0) as client:
-        async with client.stream("GET", uri) as response:
-            if response.status_code >= 400:
-                raise ServiceError(ErrorCode.BAD_INPUT, f"tải {uri} thất bại", 400)
-            async for chunk in response.aiter_bytes():
-                total += len(chunk)
-                if total > max_bytes:
-                    raise ServiceError(
-                        ErrorCode.BAD_INPUT,
-                        f"input vượt quá {max_bytes // 1024 // 1024}MB",
-                        http_status=413,
-                    )
-                chunks.append(chunk)
-    return b"".join(chunks)
+        try:
+            status, body = await fetch_capped(
+                client, uri, max_bytes=max_bytes, deadline_s=deadline_s
+            )
+        except DownloadTooLarge as exc:
+            raise ServiceError(ErrorCode.BAD_INPUT, str(exc), http_status=413) from exc
+    if status >= 400:
+        raise ServiceError(ErrorCode.BAD_INPUT, f"tải {uri} thất bại", 400)
+    return body
 
 
 def build_router(registry: ModelRegistry, settings: ModelHostSettings) -> APIRouter:

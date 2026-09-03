@@ -2,6 +2,8 @@
 
 import { useState } from "react";
 
+import { Button, TextField } from "@/components/ui";
+
 export function LoginForm() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -35,29 +37,30 @@ export function LoginForm() {
   return (
     <form
       onSubmit={submit}
-      className="w-full max-w-sm space-y-5 rounded-2xl bg-white p-7 shadow-lg ring-1 ring-slate-900/5"
+      className="w-full max-w-sm space-y-5 rounded-2xl bg-white p-7 shadow-noi ring-1 ring-slate-900/[0.06]"
     >
       <div className="space-y-1">
+        {/* Cùng dấu hiệu với thanh nav sau khi đăng nhập: vào rồi thì nhận ra
+            ngay mình vẫn ở đúng chỗ vừa gõ mật khẩu. */}
         <span
           aria-hidden
-          className="mb-3 grid size-9 place-items-center rounded-lg bg-brand-600 text-sm font-bold text-white"
+          className="mb-3 grid size-9 place-items-center rounded-[0.7rem] bg-linear-to-b from-brand-500 to-brand-700 text-sm font-bold text-white shadow-nut"
         >
           V
         </span>
-        <h1 className="text-lg font-semibold tracking-tight text-slate-900">vypq services</h1>
+        <h1 className="text-lg font-semibold tracking-[-0.01em] text-slate-900">vypq services</h1>
         <p className="text-sm text-slate-500">Bảng điều khiển các model service.</p>
       </div>
 
-      <label className="block space-y-1.5">
-        <span className="block text-xs font-medium text-slate-600">Mật khẩu</span>
-        <input
-          type="password"
-          autoComplete="current-password"
-          value={password}
-          onChange={(event) => setPassword(event.target.value)}
-          className="w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm shadow-xs transition-colors hover:border-slate-300 focus:border-brand-500"
-        />
-      </label>
+      {/* Không truyền `hint`: TextField đặt gợi ý BÊN TRONG <label>, nên nó sẽ
+          chui vào tên khả truy cập của ô — mà tên đó phải đúng bằng "Mật khẩu". */}
+      <TextField
+        label="Mật khẩu"
+        type="password"
+        autoComplete="current-password"
+        value={password}
+        onChange={(event) => setPassword(event.target.value)}
+      />
 
       {error ? (
         <p
@@ -68,13 +71,9 @@ export function LoginForm() {
         </p>
       ) : null}
 
-      <button
-        type="submit"
-        disabled={pending || password.length === 0}
-        className="w-full rounded-lg bg-brand-600 px-3 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-brand-700 disabled:cursor-not-allowed disabled:opacity-45"
-      >
+      <Button type="submit" size="lg" className="w-full" disabled={pending || password.length === 0}>
         {pending ? "Đang kiểm tra…" : "Đăng nhập"}
-      </button>
+      </Button>
     </form>
   );
 }

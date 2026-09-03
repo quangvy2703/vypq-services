@@ -14,6 +14,17 @@ function tooLarge(bytes: number, limit: number): ApiError {
   );
 }
 
+/** Chỉ http(s). Chặn ở đây để thông báo chỉ đúng chỗ hỏng — dashboard là cửa
+ *  công khai, không phải nơi để một scheme lạ đi tiếp rồi vọng lỗi khó hiểu về. */
+function laHttpUrl(value: string): boolean {
+  try {
+    const parsed = new URL(value);
+    return parsed.protocol === "http:" || parsed.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
 export function POST(request: Request): Promise<NextResponse> {
   return respond(async () => {
     // Chặn theo Content-Length TRƯỚC khi parse. request.formData() của Next ném
@@ -33,13 +44,31 @@ export function POST(request: Request): Promise<NextResponse> {
     if (!service) throw new ApiError(422, "bad_input", "thiếu service");
 
     const file = form.get("file");
-    if (!(file instanceof File) || file.size === 0) {
-      throw new ApiError(422, "bad_input", "thiếu file để chạy thử");
+    const coTep = file instanceof File && file.size > 0;
+    const inputUri = String(form.get("input_uri") ?? "").trim();
+    const modelVersion = String(form.get("model_version") ?? "").trim();
+
+    // Hai nguồn input trong một request là mơ hồ: chọn bừa một cái nghĩa là
+    // người dùng nhìn kết quả của thứ mình KHÔNG chọn mà không hề biết.
+    if (coTep && inputUri) {
+      throw new ApiError(422, "bad_input", "chỉ chọn một: tải tệp lên HOẶC dán URL");
+    }
+    if (!coTep && !inputUri) {
+      throw new ApiError(422, "bad_input", "thiếu file hoặc URL để chạy thử");
     }
 
-    if (file.size > maxUploadBytes) throw tooLarge(file.size, maxUploadBytes);
+    if (inputUri) {
+      if (!laHttpUrl(inputUri)) {
+        throw new ApiError(422, "bad_input", "URL phải bắt đầu bằng http:// hoặc https://");
+      }
+      // Không có maxUploadBytes ở nhánh này: dashboard không tải nội dung, nên
+      // không có gì để đo. Chốt kích thước là VYPQ_MAX_DOWNLOAD_MB của gateway,
+      // nơi thật sự cầm bytes — xem gateway/proxy.py::fetch.
+      return gateway.invokeUri(service, inputUri, modelVersion || null);
+    }
 
-    const modelVersion = String(form.get("model_version") ?? "").trim();
-    return gateway.invokeUpload(service, file, modelVersion || null);
+    const tep = file as File;
+    if (tep.size > maxUploadBytes) throw tooLarge(tep.size, maxUploadBytes);
+    return gateway.invokeUpload(service, tep, modelVersion || null);
   });
 }

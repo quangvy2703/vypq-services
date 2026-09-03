@@ -13,10 +13,22 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-# Chặn trần paddleocr ở 3.0: bản 3.x đổi .ocr() thành .predict() với shape kết quả
-# khác hẳn, `uv lock --upgrade` sẽ âm thầm làm hỏng predict() nếu không khoá.
+# Khoá trong khoảng 3.x: PP-OCRv6 chỉ có từ đây. Bản 2.x dùng .ocr() với shape
+# kết quả và bộ kwargs constructor khác hẳn, nên hạ xuống <3 là hỏng runner
+# paddle chứ không chỉ mất v6. Trần <4 giữ nguyên tinh thần khoá cũ: một lần
+# nhảy major nữa cũng sẽ đổi API y như lần này.
 gpu = [
-    "paddleocr>=2.9,<3", "paddlepaddle-gpu>=2.6", "pillow>=10.4", "numpy>=1.26",
+    "paddleocr>=3.7,<4",
+    # Backend CPU: có wheel cho cả macOS/Linux/Windows nên `uv lock` giải được ở
+    # mọi nền tảng, và máy dev không CUDA vẫn chạy được model thật.
+    #
+    # TRÊN MÁY CUDA phải thay bằng paddlepaddle-gpu 3.x, cài riêng theo hướng dẫn
+    # chính thức của PaddlePaddle. KHÔNG khai nó ở đây: PyPI chỉ có
+    # paddlepaddle-gpu tới 2.6.2 (tức paddle 2.x, không chạy nổi paddleocr 3.x),
+    # còn bản 3.x phát hành qua index riêng của PaddlePaddle. Ghim `>=3.0` vào
+    # đây là làm `uv lock` chết hẳn trên win32 — không có bản nào thoả.
+    "paddlepaddle>=3.3,<4",
+    "pillow>=10.4", "numpy>=1.26",
     "faster-whisper>=1.0",
 ]
 

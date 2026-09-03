@@ -275,3 +275,20 @@ async def test_input_uri_is_fetched_then_forwarded_as_multipart(ctx):
     )
     assert resp.status_code == 200
     assert route.called
+
+
+@respx.mock
+async def test_chay_sync_bang_url_thi_luu_lai_url_do_trong_runs(ctx):
+    # Chạy bằng file thì không có gì để lưu, nhưng chạy bằng URL thì CÓ — và
+    # thiếu nó thì trang chi tiết run không dựng lại được ảnh gốc để vẽ bbox
+    # đè lên, phải rơi về khung trống theo tỉ lệ.
+    client, factory, _reg = ctx
+    respx.get("http://kho/anh.png").mock(return_value=httpx.Response(200, content=b"anh"))
+    respx.post("http://ocr:8001/v1/ocr").mock(return_value=httpx.Response(200, json=OCR_RESULT))
+    resp = await client.post(
+        "/v1/invoke", json={"service": "ocr", "mode": "sync", "input_uri": "http://kho/anh.png"}
+    )
+    assert resp.status_code == 200
+    async with factory() as session:
+        runs, _total = await RunRepo(session).list_runs(limit=1)
+    assert runs[0].input_uri == "http://kho/anh.png"

@@ -5,6 +5,7 @@ import httpx
 from vypq_contracts.common import ErrorCode, HealthStatus
 from vypq_contracts.gateway import InvokeMode, RunRecord, RunStatus
 from vypq_core.errors import ServiceError
+from vypq_core.fetch import DownloadTooLarge, fetch_capped
 from vypq_core.logging import get_logger
 
 from gateway.db.repo import RunRepo
@@ -16,14 +17,34 @@ log = get_logger(__name__)
 class SyncProxy:
     """Chuyển tiếp request tới service và ghi lại mọi lần chạy."""
 
-    def __init__(self, registry: ServiceRegistry, session_factory, timeout_s: float = 120.0):
+    def __init__(
+        self,
+        registry: ServiceRegistry,
+        session_factory,
+        timeout_s: float = 120.0,
+        *,
+        max_download_mb: int = 100,
+        fetch_deadline_s: float = 60.0,
+    ):
         self._registry = registry
         self._factory = session_factory
         self._client = httpx.AsyncClient(timeout=timeout_s)
+        self._max_bytes = max_download_mb * 1024 * 1024
+        self._fetch_deadline_s = fetch_deadline_s
 
     async def fetch(self, uri: str) -> bytes:
+        # Gateway TỰ tải input_uri rồi mới chuyển tiếp bytes sang service, nên
+        # hạn mức phải nằm ở đây. Cái van 100MB của model-host không che được
+        # đường này: trong kiến trúc hiện tại URL không bao giờ tới model-host.
         try:
-            response = await self._client.get(uri)
+            status, body = await fetch_capped(
+                self._client, uri,
+                max_bytes=self._max_bytes, deadline_s=self._fetch_deadline_s,
+            )
+        except DownloadTooLarge as exc:
+            # 413 chứ không 422: chỗ hỏng là kích thước, và người gọi cần phân
+            # biệt "URI hỏng" với "input quá lớn" để biết phải sửa cái gì.
+            raise ServiceError(ErrorCode.BAD_INPUT, str(exc), 413) from exc
         except (httpx.UnsupportedProtocol, httpx.InvalidURL) as exc:
             # PHẢI bắt TRƯỚC TransportError: UnsupportedProtocol kế thừa từ nó.
             # URI sai scheme hay sai định dạng thì thử lại bao nhiêu lần cũng
@@ -32,15 +53,16 @@ class SyncProxy:
             raise ServiceError(
                 ErrorCode.BAD_INPUT, f"URI không dùng được: {uri} ({exc})", 422
             ) from exc
-        if response.status_code >= 400:
+        if status >= 400:
             raise ServiceError(
-                ErrorCode.BAD_INPUT, f"tải {uri} thất bại ({response.status_code})", 422
+                ErrorCode.BAD_INPUT, f"tải {uri} thất bại ({status})", 422
             )
-        return response.content
+        return body
 
     async def invoke(
         self, service: str, data: bytes, filename: str,
         model_version: str | None, trace_id: str | None = None,
+        input_uri: str | None = None,
     ) -> RunRecord:
         # Ranh giới ghi `runs`: những lần TỪ CHỐI phía gateway (không có service,
         # chưa từng poll được, đã biết là DOWN) KHÔNG tạo dòng nào — chưa có gì
@@ -91,7 +113,7 @@ class SyncProxy:
             async with self._factory() as session:
                 record = await RunRepo(session).record(
                     trace_id=trace, service=service, model_version=resolved,
-                    mode=InvokeMode.SYNC, status=status, input_uri=None,
+                    mode=InvokeMode.SYNC, status=status, input_uri=input_uri,
                     output=output, latency_ms=latency_ms, error=error,
                     # Đường sync tôn trọng x-trace-id do CALLER chọn. Dedup
                     # theo (trace_id, model_version) là đúng khi trace_id do

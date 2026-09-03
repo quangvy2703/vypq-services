@@ -49,3 +49,15 @@ export function capabilityOutputFor(services: ServiceState[], serviceName: strin
   // tiết run hiện JSON thô thay vì viewer đúng, ngay khi hai tên lệch nhau.
   return services.find((state) => state.name === serviceName)?.info?.capability_output ?? "json";
 }
+
+/**
+ * Capability input của service đã chạy một run — dùng để biết `input_uri` của
+ * run đó là ảnh hay âm thanh, tức viewer nào được phép nhận nó.
+ *
+ * Cùng lập trường với capabilityOutputFor: khớp theo KHOÁ ĐỊNH TUYẾN, và không
+ * khớp được thì trả "" chứ không đoán. "" không bằng "image" cũng không bằng
+ * "audio", nên nhánh an toàn (không hiện media) là nhánh mặc định.
+ */
+export function capabilityInputFor(services: ServiceState[], serviceName: string): string {
+  return services.find((state) => state.name === serviceName)?.info?.capability_input ?? "";
+}

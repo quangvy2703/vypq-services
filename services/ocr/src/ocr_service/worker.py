@@ -1,9 +1,11 @@
 import asyncio
+import functools
 from collections.abc import Awaitable, Callable
 
 import httpx
 from vypq_contracts.common import ErrorCode, Task
 from vypq_core.errors import ServiceError
+from vypq_core.fetch import DownloadTooLarge, fetch_capped
 from vypq_core.http_client import UpstreamError
 from vypq_core.logging import get_logger, setup_logging
 from vypq_events.consumer import EventConsumer
@@ -25,7 +27,9 @@ def group_id(prefix: str, model_version: str | None) -> str:
     return f"{prefix}-{model_version}" if model_version else f"{prefix}-default"
 
 
-async def fetch_bytes(uri: str) -> bytes:
+async def fetch_bytes(
+    uri: str, *, max_download_mb: int = 100, fetch_deadline_s: float = 60.0
+) -> bytes:
     """Tải input, PHÂN LOẠI ĐÚNG lỗi tải.
 
     httpx trần ném ConnectError/TimeoutException — những lỗi này không phải
@@ -36,7 +40,19 @@ async def fetch_bytes(uri: str) -> bytes:
     """
     try:
         async with httpx.AsyncClient(timeout=30.0) as client:
-            response = await client.get(uri)
+            status, body = await fetch_capped(
+                client, uri,
+                max_bytes=max_download_mb * 1024 * 1024,
+                deadline_s=fetch_deadline_s,
+            )
+    except DownloadTooLarge as exc:
+        # Dữ liệu hỏng, KHÔNG phải sự cố hạ tầng: một URI quá cỡ thì retry lần
+        # nào cũng quá cỡ. Xếp vào UpstreamError sẽ pause và kẹt cả partition.
+        raise ServiceError(ErrorCode.BAD_INPUT, str(exc), http_status=413) from exc
+    except TimeoutError as exc:
+        # Hết deadline tổng: kho đối tượng nhỏ giọt là sự cố hạ tầng, phải chờ
+        # chứ không dead-letter.
+        raise UpstreamError(f"quá hạn {fetch_deadline_s}s khi tải {uri}") from exc
     except (httpx.UnsupportedProtocol, httpx.InvalidURL) as exc:
         # PHẢI bắt TRƯỚC TransportError: UnsupportedProtocol kế thừa từ nó.
         # URI sai scheme hay sai định dạng thì thử lại bao nhiêu lần cũng hỏng
@@ -47,13 +63,11 @@ async def fetch_bytes(uri: str) -> bytes:
         ) from exc
     except (httpx.TimeoutException, httpx.TransportError) as exc:
         raise UpstreamError(f"không tải được {uri}: {exc}") from exc
-    if response.status_code >= 500:
-        raise UpstreamError(f"{uri} trả {response.status_code}")
-    if response.status_code >= 400:
-        raise ServiceError(
-            ErrorCode.BAD_INPUT, f"{uri} trả {response.status_code}", http_status=422
-        )
-    return response.content
+    if status >= 500:
+        raise UpstreamError(f"{uri} trả {status}")
+    if status >= 400:
+        raise ServiceError(ErrorCode.BAD_INPUT, f"{uri} trả {status}", http_status=422)
+    return body
 
 
 class OcrWorkerHandler:
@@ -111,7 +125,14 @@ async def main() -> None:
     consumer = EventConsumer(
         topic=request_topic(Task.OCR),
         group_id=group_id(settings.group_prefix, settings.model_version),
-        handler=OcrWorkerHandler(handler, producer, forced_model=settings.model_version),
+        handler=OcrWorkerHandler(
+            handler, producer, forced_model=settings.model_version,
+            fetch=functools.partial(
+                fetch_bytes,
+                max_download_mb=settings.max_download_mb,
+                fetch_deadline_s=settings.fetch_deadline_s,
+            ),
+        ),
         dlq_topic=dlq_topic(Task.OCR),
         producer=producer,
         brokers=settings.brokers,

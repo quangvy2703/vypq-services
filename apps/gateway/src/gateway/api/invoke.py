@@ -54,6 +54,10 @@ def build_invoke_router(
         record = await proxy.invoke(
             request.service, data, "input", request.model_version,
             trace_id=inbound_trace_id,
+            # Ghi lại URL: chạy bằng file thì không có gì để lưu, nhưng chạy
+            # bằng URL thì có — và trang chi tiết run cần nó để dựng lại ảnh
+            # gốc mà vẽ bbox đè lên, thay vì khung trống theo tỉ lệ.
+            input_uri=request.input_uri,
         )
         return InvokeResponse(
             trace_id=record.trace_id, mode=InvokeMode.SYNC,

@@ -1,12 +1,18 @@
 // Gateway giả cho e2e: đủ 5 endpoint dashboard dùng, giữ trạng thái trong RAM.
 // KIỂM TOKEN thật sự — nếu dashboard quên gắn bearer, e2e phải đỏ.
 import { createServer } from "node:http";
+import { readFileSync } from "node:fs";
 
 const TOKEN = process.env.FAKE_GATEWAY_TOKEN ?? "token-e2e";
 const PORT = Number(process.env.FAKE_GATEWAY_PORT ?? 8099);
 
 const hosts = new Map();
 const runs = [];
+
+// Ảnh thật, phục vụ KHÔNG cần token: nó đóng vai "một URL ảnh ngoài internet"
+// để dashboard dán vào ô URL đầu vào. Thẻ <img> của trình duyệt không gắn được
+// bearer, nên route này phải nằm trước cửa kiểm token bên dưới.
+const ANH_CONG_KHAI = readFileSync(new URL("./fixtures/hoadon.png", import.meta.url));
 
 const OCR_RESULT = {
   full_text: "HOÁ ĐƠN\nTổng cộng 120000",
@@ -37,6 +43,11 @@ function send(res, status, body) {
 }
 
 createServer((req, res) => {
+  if (req.method === "GET" && (req.url ?? "").startsWith("/anh-cong-khai.png")) {
+    res.writeHead(200, { "content-type": "image/png", "content-length": ANH_CONG_KHAI.length });
+    return res.end(ANH_CONG_KHAI);
+  }
+
   if (req.headers.authorization !== `Bearer ${TOKEN}`) {
     return send(res, 401, { code: "bad_input", message: "token không hợp lệ", trace_id: null });
   }
@@ -82,6 +93,25 @@ createServer((req, res) => {
       const record = {
         id, trace_id: `t${runs.length + 1}`, service: "ocr", model_version: "paddleocr-v4-vi",
         mode: "sync", status: "ok", input_uri: null, output: OCR_RESULT,
+        latency_ms: 320, error: null, created_at: new Date().toISOString(),
+      };
+      runs.unshift(record);
+      send(res, 200, { trace_id: record.trace_id, mode: "sync", run_id: id, result: OCR_RESULT });
+    });
+  }
+
+  if (req.method === "POST" && pathname === "/v1/invoke") {
+    let raw = "";
+    req.on("data", (chunk) => {
+      raw += chunk;
+    });
+    return req.on("end", () => {
+      const body = JSON.parse(raw || "{}");
+      const id = `r${runs.length + 1}`;
+      const record = {
+        id, trace_id: `t${runs.length + 1}`, service: body.service ?? "ocr",
+        model_version: body.model_version ?? "paddleocr-v4-vi",
+        mode: "sync", status: "ok", input_uri: body.input_uri ?? null, output: OCR_RESULT,
         latency_ms: 320, error: null, created_at: new Date().toISOString(),
       };
       runs.unshift(record);
