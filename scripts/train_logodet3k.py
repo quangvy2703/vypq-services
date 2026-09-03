@@ -21,8 +21,8 @@ from io import BytesIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-DATA_DIR = ROOT / "data/dataset/logodet-3k"  # nơi chứa *.parquet tải từ HF
-OUT_ROOT = ROOT / "data/dataset/logodet-3k-yolo"  # dataset YOLO sinh ra
+DATA_DIR = ROOT / "data/dataset/logodet-3k"  # mặc định của --data-dir: *.parquet tải từ HF
+OUT_SUFFIX = "-yolo"  # --out mặc định = <data-dir><OUT_SUFFIX>, cạnh dataset nguồn
 RUNS_DIR = ROOT / "data/runs"
 
 # Ảnh giữ nguyên bytes gốc nếu format nằm trong đây, còn lại re-encode sang JPEG.
@@ -76,38 +76,38 @@ AUG_PRESETS = {
 # --------------------------------------------------------------------------- data
 
 
-def shard_files(split: str) -> list[Path]:
+def shard_files(data_dir: Path, split: str) -> list[Path]:
     """Các file parquet của một split, sắp xếp ổn định để index shard không đổi."""
-    return sorted(DATA_DIR.glob(f"{split}-*.parquet"))
+    return sorted(data_dir.glob(f"{split}-*.parquet"))
 
 
-def brand_names() -> list[str]:
+def brand_names(data_dir: Path) -> list[str]:
     """3000 tên brand lấy từ metadata HF nhúng trong schema parquet."""
     import pyarrow.parquet as pq
 
-    files = shard_files("train") or shard_files("test")
+    files = shard_files(data_dir, "train") or shard_files(data_dir, "test")
     meta = pq.ParquetFile(files[0]).schema_arrow.metadata[b"huggingface"]
     features = json.loads(meta.decode())["info"]["features"]
     return list(features["company_name"]["names"])
 
 
-def industry_names() -> list[str]:
+def industry_names(data_dir: Path) -> list[str]:
     """industry_name là string tự do nên phải quét cột để lấy tập nhãn."""
     import pyarrow.parquet as pq
 
     seen: set[str] = set()
     for split in ("train", "test"):
-        for path in shard_files(split):
+        for path in shard_files(data_dir, split):
             table = pq.read_table(path, columns=["industry_name"])
             seen.update(table.column("industry_name").to_pylist())
     return sorted(seen)
 
 
-def class_names(mode: str) -> list[str]:
+def class_names(data_dir: Path, mode: str) -> list[str]:
     if mode == "brand":
-        return brand_names()
+        return brand_names(data_dir)
     if mode == "industry":
-        return industry_names()
+        return industry_names(data_dir)
     return ["logo"]
 
 
@@ -208,11 +208,11 @@ def _export_result(job: dict, written: int, skipped_image: int, skipped_box: int
     }
 
 
-def export_fingerprint(mode: str, limit: int, val_from: str) -> str:
+def export_fingerprint(data_dir: Path, mode: str, limit: int, val_from: str) -> str:
     """Dấu vân tay của lần export: nguồn + cấu hình. Khớp thì bỏ qua export."""
-    parts = [mode, str(limit), val_from]
+    parts = [str(data_dir), mode, str(limit), val_from]
     for split in ("train", "test"):
-        for path in shard_files(split):
+        for path in shard_files(data_dir, split):
             stat = path.stat()
             parts.append(f"{path.name}:{stat.st_size}:{int(stat.st_mtime)}")
     return hashlib.sha256("|".join(parts).encode()).hexdigest()
@@ -234,9 +234,10 @@ def write_data_yaml(out_root: Path, names: list[str]) -> Path:
 
 def export_dataset(args) -> tuple[Path, list[str]]:
     """Parquet -> layout YOLO. Trả (đường dẫn data.yaml, danh sách tên lớp)."""
-    out_root = Path(args.out).resolve()
+    data_dir = Path(args.data_dir).expanduser().resolve()
+    out_root = Path(args.out).expanduser().resolve()
     manifest = out_root / "export.json"
-    fingerprint = export_fingerprint(args.classes, args.limit, args.val_from)
+    fingerprint = export_fingerprint(data_dir, args.classes, args.limit, args.val_from)
 
     if manifest.exists() and not args.force_export:
         cached = json.loads(manifest.read_text())
@@ -244,7 +245,7 @@ def export_dataset(args) -> tuple[Path, list[str]]:
             print(f"[export] dùng lại dataset đã có: {out_root} ({cached['counts']})")
             return out_root / "data.yaml", cached["names"]
 
-    names = class_names(args.classes)
+    names = class_names(data_dir, args.classes)
     industry_ids = {name: i for i, name in enumerate(names)} if args.classes == "industry" else {}
 
     print(f"[export] {len(names)} lớp ({args.classes}) -> {out_root}")
@@ -256,7 +257,7 @@ def export_dataset(args) -> tuple[Path, list[str]]:
 
     jobs = []
     for src_split, dst_split in (("train", "train"), (args.val_from, "val")):
-        for shard_idx, path in enumerate(shard_files(src_split)):
+        for shard_idx, path in enumerate(shard_files(data_dir, src_split)):
             jobs.append(
                 {
                     "path": str(path),
@@ -286,7 +287,7 @@ def export_dataset(args) -> tuple[Path, list[str]]:
             )
 
     if not counts["train"]:
-        sys.exit(f"[export] không ghi được ảnh train nào từ {DATA_DIR}")
+        sys.exit(f"[export] không ghi được ảnh train nào từ {data_dir}")
     print(f"[export] xong: {counts} — bỏ {skipped_image} ảnh hỏng, {skipped_box} box suy biến")
 
     yaml_path = write_data_yaml(out_root, names)
@@ -395,7 +396,16 @@ def parse_args():
         default="brand",
         help="nhãn để detect: 3000 brand / ~10 ngành hàng / 1 lớp 'logo' (mặc định: brand)",
     )
-    p.add_argument("--out", default=str(OUT_ROOT), help="thư mục dataset YOLO sinh ra")
+    p.add_argument(
+        "--data-dir",
+        default=str(DATA_DIR),
+        help=f"thư mục chứa parquet HF ({{train,test}}-*.parquet), mặc định: {DATA_DIR}",
+    )
+    p.add_argument(
+        "--out",
+        default=None,
+        help=f"thư mục dataset YOLO sinh ra, mặc định: <data-dir>{OUT_SUFFIX}",
+    )
     p.add_argument(
         "--val-from",
         choices=["test", "train"],
@@ -444,12 +454,16 @@ def parse_args():
             help=f"logo: {LOGO_AUG[key]} | ultralytics: {ULTRALYTICS_AUG[key]}"
             + (f" (brand/industry: {BRAND_SAFE_AUG[key]})" if key in BRAND_SAFE_AUG else ""),
         )
-    return p.parse_args()
+    args = p.parse_args()
+    data_dir = Path(args.data_dir).expanduser().resolve()
+    if args.out is None:  # bám theo --data-dir để 2 dataset khác nhau không ghi đè nhau
+        args.out = str(data_dir.parent / f"{data_dir.name}{OUT_SUFFIX}")
+    if not shard_files(data_dir, "train"):
+        p.error(f"không thấy file train-*.parquet nào trong {data_dir}")
+    return args
 
 
 def main() -> None:
-    if not shard_files("train"):
-        sys.exit(f"không thấy file parquet nào trong {DATA_DIR}")
     args = parse_args()
 
     missing = []
